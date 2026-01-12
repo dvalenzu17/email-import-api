@@ -41,7 +41,6 @@ function extractBodies(payload) {
 }
 
 function buildQuery(daysBack) {
-  // broad net: catches Uber receipts + Netflix welcome/plan confirmations, etc.
   return `newer_than:${daysBack}d (receipt OR invoice OR payment OR charged OR renewal OR subscription OR membership OR trial OR billed OR plan OR welcome OR confirmation OR "valid until")`;
 }
 
@@ -102,6 +101,7 @@ export async function scanGmail({ accessToken, options, context }) {
       html: bodies.html,
       directory: context?.directory,
       overrides: context?.overrides,
+      knownSubs: context?.knownSubs,
     });
 
     if (cand) candidates.push(cand);

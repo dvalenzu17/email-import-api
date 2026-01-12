@@ -3,21 +3,21 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
+
 import { supabaseAdmin } from "./lib/supabaseAdmin.js";
-
-
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
 import { scanGmail } from "./lib/gmail.js";
-import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
-
+import {
+  getMerchantDirectoryCached,
+  getUserOverrides,
+  getUserSubscriptionSignals,
+} from "./lib/merchantData.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
-if (!JWT_SECRET) {
-  throw new Error("Missing env SUPABASE_JWT_SECRET");
-}
+if (!JWT_SECRET) throw new Error("Missing env SUPABASE_JWT_SECRET");
 
 const server = Fastify({
   logger: {
@@ -43,7 +43,10 @@ await server.register(rateLimit, {
   keyGenerator: (req) => req.userId ?? req.ip,
 });
 
-// ---- Auth hook (required) ----
+// ---- Public health ----
+server.get("/health", async () => ({ ok: true }));
+
+// ---- Auth hook (required for everything else) ----
 server.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
 
@@ -61,8 +64,6 @@ server.addHook("preHandler", async (req, reply) => {
     return reply.code(401).send({ error: "invalid_token" });
   }
 });
-
-server.get("/health", async () => ({ ok: true }));
 
 /** --------------------------
  * IMAP: verify + scan
@@ -109,7 +110,6 @@ const ScanBodySchema = z.object({
   auth: AuthSchema,
   options: z
     .object({
-      // ⬆️ increased max to support older emails
       daysBack: z.number().int().min(1).max(3650).default(180),
       maxMessages: z.number().int().min(1).max(500).default(250),
       maxCandidates: z.number().int().min(1).max(200).default(60),
@@ -127,7 +127,18 @@ server.post("/v1/email/scan", async (req, reply) => {
   const { provider, imap, auth, options } = parsed.data;
 
   try {
-    const result = await scanImap({ provider, imap, auth, options });
+    const directory = await getMerchantDirectoryCached();
+    const overrides = await getUserOverrides(req.userId);
+    const knownSubs = await getUserSubscriptionSignals(req.userId);
+
+    const result = await scanImap({
+      provider,
+      imap,
+      auth,
+      options,
+      context: { directory, overrides, knownSubs },
+    });
+
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
     req.log.warn({ err: e, provider }, "imap_scan_failed");
@@ -144,7 +155,6 @@ const GmailScanBodySchema = z.object({
   }),
   options: z
     .object({
-      // allow old receipts too
       daysBack: z.number().int().min(1).max(3650).default(365),
       maxMessages: z.number().int().min(1).max(500).default(300),
       maxCandidates: z.number().int().min(1).max(200).default(80),
@@ -153,47 +163,38 @@ const GmailScanBodySchema = z.object({
     .default({}),
 });
 
-server.post("/v1/email/scan", async (req, reply) => {
-  const parsed = ScanBodySchema.safeParse(req.body);
+server.post("/v1/gmail/scan", async (req, reply) => {
+  const parsed = GmailScanBodySchema.safeParse(req.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
   }
 
-  const { provider, imap, auth, options } = parsed.data;
-
   try {
     const directory = await getMerchantDirectoryCached();
     const overrides = await getUserOverrides(req.userId);
+    const knownSubs = await getUserSubscriptionSignals(req.userId);
 
-    const result = await scanImap({ provider, imap, auth, options, context: { directory, overrides } });
+    const result = await scanGmail({
+      accessToken: parsed.data.auth.accessToken,
+      options: parsed.data.options,
+      context: { directory, overrides, knownSubs },
+    });
+
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
-    req.log.warn({ err: e, provider }, "imap_scan_failed");
-    return reply.code(400).send({ ok: false, error: mapImapError(e) });
+    req.log.warn({ err: e }, "gmail_scan_failed");
+    return reply.code(400).send({
+      ok: false,
+      error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
+    });
   }
 });
 
-function mapImapError(e) {
-  const msg = String(e?.message ?? e);
-
-  if (/AUTHENTICATIONFAILED|Invalid credentials|Login failed/i.test(msg)) {
-    return { code: "AUTH_FAILED", message: "Login failed. Check email + app password." };
-  }
-  if (/Application-specific password|app password|2-step|two-factor|2fa/i.test(msg)) {
-    return { code: "NEEDS_APP_PASSWORD", message: "Provider requires an app-specific password." };
-  }
-  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(msg)) {
-    return { code: "NETWORK_ERROR", message: "Network error connecting to mail server." };
-  }
-  return { code: "UNKNOWN", message: "Could not connect. Try again or check server settings." };
-}
-
-await server.listen({ port: PORT, host: "0.0.0.0" });
-server.log.info({ port: PORT }, "sublytics-email-import-api listening");
-
-
+/** --------------------------
+ * Confirm merchant override
+ * -------------------------- */
 const ConfirmMerchantSchema = z.object({
-  from: z.string().optional(),           // raw From header like: "WaterLlama <billing@waterllama.com>"
+  from: z.string().optional(), // raw From header like: "WaterLlama <billing@waterllama.com>"
   senderEmail: z.string().email().optional(),
   senderDomain: z.string().min(3).optional(),
   canonicalName: z.string().min(2).max(80),
@@ -226,30 +227,21 @@ server.post("/v1/merchant/confirm", async (req, reply) => {
   }
 
   if (!senderEmail && !senderDomain) {
-    return reply.code(400).send({
-      error: "missing_sender",
-      message: "Provide from OR senderEmail OR senderDomain",
-    });
+    return reply.code(400).send({ error: "missing_sender", message: "Provide from OR senderEmail OR senderDomain" });
   }
 
   // Your rule: gmail.com is NOT a company identity signal
   if (senderDomain === "gmail.com" || (senderEmail && senderEmail.endsWith("@gmail.com"))) {
-    return reply.code(400).send({
-      error: "consumer_sender_not_allowed",
-      message: "gmail.com senders cannot be used as merchant identity",
-    });
+    return reply.code(400).send({ error: "consumer_sender_not_allowed", message: "gmail.com senders cannot be used as merchant identity" });
   }
 
-  // Prefer email-level override when available; else domain-level.
   const row = senderEmail
     ? { user_id: req.userId, sender_email: senderEmail, sender_domain: null, canonical_name: canonicalName }
     : { user_id: req.userId, sender_email: null, sender_domain: senderDomain, canonical_name: canonicalName };
 
   const { data, error } = await supabaseAdmin
     .from("user_merchant_overrides")
-    .upsert(row, {
-      onConflict: senderEmail ? "user_id,sender_email" : "user_id,sender_domain",
-    })
+    .upsert(row, { onConflict: senderEmail ? "user_id,sender_email" : "user_id,sender_domain" })
     .select("id, user_id, sender_email, sender_domain, canonical_name")
     .single();
 
@@ -260,3 +252,21 @@ server.post("/v1/merchant/confirm", async (req, reply) => {
 
   return { ok: true, override: data };
 });
+
+function mapImapError(e) {
+  const msg = String(e?.message ?? e);
+
+  if (/AUTHENTICATIONFAILED|Invalid credentials|Login failed/i.test(msg)) {
+    return { code: "AUTH_FAILED", message: "Login failed. Check email + app password." };
+  }
+  if (/Application-specific password|app password|2-step|two-factor|2fa/i.test(msg)) {
+    return { code: "NEEDS_APP_PASSWORD", message: "Provider requires an app-specific password." };
+  }
+  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(msg)) {
+    return { code: "NETWORK_ERROR", message: "Network error connecting to mail server." };
+  }
+  return { code: "UNKNOWN", message: "Could not connect. Try again or check server settings." };
+}
+
+await server.listen({ port: PORT, host: "0.0.0.0" });
+server.log.info({ port: PORT }, "sublytics-email-import-api listening");
