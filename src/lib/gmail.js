@@ -45,7 +45,7 @@ function buildQuery(daysBack) {
   return `newer_than:${daysBack}d (receipt OR invoice OR payment OR charged OR renewal OR subscription OR membership OR trial OR billed OR plan OR welcome OR confirmation OR "valid until")`;
 }
 
-export async function scanGmail({ accessToken, options }) {
+export async function scanGmail({ accessToken, options, context }) {
   const q = buildQuery(options.daysBack);
   let pageToken = options.cursor;
   const ids = [];
@@ -100,6 +100,8 @@ export async function scanGmail({ accessToken, options }) {
       date: msgDate,
       text: bodies.text,
       html: bodies.html,
+      directory: context?.directory,
+      overrides: context?.overrides,
     });
 
     if (cand) candidates.push(cand);

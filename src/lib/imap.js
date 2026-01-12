@@ -2,7 +2,7 @@ import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
 import { buildCandidate } from "./detect.js";
 
-export async function verifyImapConnection({ provider, imap, auth }) {
+export async function verifyImapConnection({ imap, auth }) {
   const client = new ImapFlow({
     host: imap.host,
     port: imap.port,
@@ -13,20 +13,32 @@ export async function verifyImapConnection({ provider, imap, auth }) {
 
   await client.connect();
   try {
-    const lock = await client.getMailboxLock("INBOX");
-    try {
-      await client.mailboxOpen("INBOX", { readOnly: true });
-      const caps = Array.from(client.serverCapabilities ?? []);
-      return { mailbox: client.mailbox?.path ?? "INBOX", capabilities: caps };
-    } finally {
-      lock.release();
-    }
+    await client.getMailboxLock("INBOX");
+    return { ok: true };
   } finally {
-    await safeLogout(client);
+    try {
+      await client.logout();
+    } catch {}
   }
 }
 
-export async function scanImap({ provider, imap, auth, options }) {
+function encodeCursor(uid) {
+  if (!uid) return null;
+  return Buffer.from(String(uid)).toString("base64");
+}
+
+function decodeCursor(cursor) {
+  if (!cursor) return null;
+  try {
+    const s = Buffer.from(String(cursor), "base64").toString("utf8");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function scanImap({ provider, imap, auth, options, context }) {
   const client = new ImapFlow({
     host: imap.host,
     port: imap.port,
@@ -54,26 +66,17 @@ export async function scanImap({ provider, imap, auth, options }) {
 
       for (const uid of uids) {
         if (scanned >= options.maxMessages) break;
-        if (candidates.length >= options.maxCandidates) break;
+        scanned++;
+        lastProcessedUid = uid;
 
-        // Cheap header gate
-        const header = await client.fetchOne(uid, { envelope: true, internalDate: true, uid: true });
-        const subject = header.envelope?.subject ?? "";
-        const from = header.envelope?.from?.[0]
-          ? formatAddress(header.envelope.from[0].name, header.envelope.from[0].address)
-          : "";
+        // Fetch full source only when needed (keeps it fast + cheap)
+        const msg = await client.fetchOne(uid, { envelope: true, source: true });
+        if (!msg?.source) continue;
 
-        if (!looksPromising(subject, from)) {
-          scanned += 1;
-          lastProcessedUid = uid;
-          continue;
-        }
-
-        // Fetch full source only when needed
-        const full = await client.fetchOne(uid, { envelope: true, internalDate: true, uid: true, source: true });
-        const msgDate = full.internalDate instanceof Date ? full.internalDate : new Date();
-
-        const parsed = await simpleParser(full.source);
+        const parsed = await simpleParser(msg.source);
+        const from = parsed.from?.text || msg.envelope?.from?.[0]?.address || "";
+        const subject = parsed.subject || "";
+        const msgDate = parsed.date || new Date();
 
         const candidate = buildCandidate({
           from: from || parsed.from?.text || "",
@@ -81,67 +84,30 @@ export async function scanImap({ provider, imap, auth, options }) {
           date: msgDate,
           text: parsed.text,
           html: typeof parsed.html === "string" ? parsed.html : null,
+          directory: context?.directory,
+          overrides: context?.overrides,
         });
-
-        scanned += 1;
-        lastProcessedUid = uid;
 
         if (candidate) candidates.push(candidate);
       }
 
-      const nextCursor =
-        lastProcessedUid && lastProcessedUid < (uids.at(-1) ?? 0) ? encodeCursor(lastProcessedUid) : undefined;
+      const stats = {
+        provider,
+        scanned,
+        candidates: candidates.length,
+      };
 
       return {
+        stats,
         candidates,
-        stats: { scanned, matched: candidates.length },
-        nextCursor,
+        nextCursor: lastProcessedUid ? encodeCursor(lastProcessedUid) : null,
       };
     } finally {
       lock.release();
     }
   } finally {
-    await safeLogout(client);
-  }
-}
-
-function looksPromising(subject, from) {
-  const s = `${subject} ${from}`.toLowerCase();
-  return /receipt|invoice|payment|charged|subscription|renewal|trial|membership|billing|plan|welcome|confirmation|valid until/.test(s);
-}
-
-function formatAddress(name, address) {
-  const n = (name ?? "").trim();
-  const a = (address ?? "").trim();
-  if (n && a) return `${n} <${a}>`;
-  return n || a;
-}
-
-function encodeCursor(uid) {
-  const raw = JSON.stringify({ uid });
-  return Buffer.from(raw).toString("base64url");
-}
-
-function decodeCursor(cursor) {
-  if (!cursor) return undefined;
-  try {
-    const raw = Buffer.from(cursor, "base64url").toString("utf8");
-    const data = JSON.parse(raw);
-    const uid = Number(data.uid);
-    return Number.isFinite(uid) ? uid : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function safeLogout(client) {
-  try {
-    await client.logout();
-  } catch {
     try {
-      await client.close();
-    } catch {
-      // ignore
-    }
+      await client.logout();
+    } catch {}
   }
 }

@@ -10,6 +10,7 @@
     "dependencies": {
         "@fastify/cors": "^8.4.2",
         "@fastify/rate-limit": "^9.1.0",
+        "@supabase/supabase-js": "^2.90.1",
         "chrono-node": "^2.7.0",
         "dotenv": "^17.2.3",
         "fastify": "^4.26.2",

@@ -1,12 +1,16 @@
+import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
-import "dotenv/config";
+import { supabaseAdmin } from "./lib/supabaseAdmin.js";
+
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
 import { scanGmail } from "./lib/gmail.js";
+import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
+
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
@@ -149,25 +153,23 @@ const GmailScanBodySchema = z.object({
     .default({}),
 });
 
-server.post("/v1/gmail/scan", async (req, reply) => {
-  const parsed = GmailScanBodySchema.safeParse(req.body);
+server.post("/v1/email/scan", async (req, reply) => {
+  const parsed = ScanBodySchema.safeParse(req.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
   }
 
-  try {
-    const result = await scanGmail({
-      accessToken: parsed.data.auth.accessToken,
-      options: parsed.data.options,
-    });
+  const { provider, imap, auth, options } = parsed.data;
 
+  try {
+    const directory = await getMerchantDirectoryCached();
+    const overrides = await getUserOverrides(req.userId);
+
+    const result = await scanImap({ provider, imap, auth, options, context: { directory, overrides } });
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
-    req.log.warn({ err: e }, "gmail_scan_failed");
-    return reply.code(400).send({
-      ok: false,
-      error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
-    });
+    req.log.warn({ err: e, provider }, "imap_scan_failed");
+    return reply.code(400).send({ ok: false, error: mapImapError(e) });
   }
 });
 
@@ -188,3 +190,73 @@ function mapImapError(e) {
 
 await server.listen({ port: PORT, host: "0.0.0.0" });
 server.log.info({ port: PORT }, "sublytics-email-import-api listening");
+
+
+const ConfirmMerchantSchema = z.object({
+  from: z.string().optional(),           // raw From header like: "WaterLlama <billing@waterllama.com>"
+  senderEmail: z.string().email().optional(),
+  senderDomain: z.string().min(3).optional(),
+  canonicalName: z.string().min(2).max(80),
+});
+
+function extractSender(from) {
+  const s = String(from || "");
+  const m = s.match(/<([^>]+)>/);
+  const email = String(m?.[1] ?? s).trim().toLowerCase();
+  const at = email.lastIndexOf("@");
+  const domain = at === -1 ? null : email.slice(at + 1);
+  return { email: email || null, domain: domain || null };
+}
+
+server.post("/v1/merchant/confirm", async (req, reply) => {
+  const parsed = ConfirmMerchantSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+  }
+
+  const { canonicalName } = parsed.data;
+
+  let senderEmail = parsed.data.senderEmail?.toLowerCase() ?? null;
+  let senderDomain = parsed.data.senderDomain?.toLowerCase() ?? null;
+
+  if ((!senderEmail && !senderDomain) && parsed.data.from) {
+    const derived = extractSender(parsed.data.from);
+    senderEmail = derived.email;
+    senderDomain = derived.domain;
+  }
+
+  if (!senderEmail && !senderDomain) {
+    return reply.code(400).send({
+      error: "missing_sender",
+      message: "Provide from OR senderEmail OR senderDomain",
+    });
+  }
+
+  // Your rule: gmail.com is NOT a company identity signal
+  if (senderDomain === "gmail.com" || (senderEmail && senderEmail.endsWith("@gmail.com"))) {
+    return reply.code(400).send({
+      error: "consumer_sender_not_allowed",
+      message: "gmail.com senders cannot be used as merchant identity",
+    });
+  }
+
+  // Prefer email-level override when available; else domain-level.
+  const row = senderEmail
+    ? { user_id: req.userId, sender_email: senderEmail, sender_domain: null, canonical_name: canonicalName }
+    : { user_id: req.userId, sender_email: null, sender_domain: senderDomain, canonical_name: canonicalName };
+
+  const { data, error } = await supabaseAdmin
+    .from("user_merchant_overrides")
+    .upsert(row, {
+      onConflict: senderEmail ? "user_id,sender_email" : "user_id,sender_domain",
+    })
+    .select("id, user_id, sender_email, sender_domain, canonical_name")
+    .single();
+
+  if (error) {
+    req.log.warn({ err: error }, "confirm_merchant_failed");
+    return reply.code(500).send({ error: "confirm_failed" });
+  }
+
+  return { ok: true, override: data };
+});

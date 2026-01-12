@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { htmlToText } from "html-to-text";
 import * as chrono from "chrono-node";
+import { resolveMerchantFromSender } from "./merchantResolver.js";
 
 const MERCHANT_HINTS = [
   { name: "Netflix", domains: ["netflix.com"], keywords: ["netflix"] },
@@ -26,32 +27,84 @@ const SUBJECT_KEYWORDS = [
   "membership",
   "plan",
   "billing",
-  "confirmation",
 ];
 
 const BODY_KEYWORDS = [
-  "renews",
-  "renewal date",
+  "your subscription",
   "next billing date",
-  "monthly",
-  "per month",
-  "annual",
-  "yearly",
-  "per year",
-  "billed",
-  "trial ends",
-  "payment was successful",
-  "valid until",
-  "account information",
+  "will renew",
+  "renewal date",
+  "thanks for your payment",
+  "you have been charged",
+  "charged your",
+  "payment method",
+  "billing period",
 ];
 
-const WELCOME_KEYWORDS = ["welcome", "thanks for joining", "start watching", "your account information"];
+const WELCOME_KEYWORDS = [
+  "welcome",
+  "thanks for joining",
+  "your account information",
+];
 
-export function buildCandidate({ from, subject, date, text, html }) {
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findDirectoryKeywordHit(text, directory) {
+  const t = String(text || "").toLowerCase();
+  if (!t || !Array.isArray(directory) || directory.length === 0) return null;
+
+  let best = null; // { canonicalName, keyword, weight }
+
+  for (const m of directory) {
+    const name = m?.canonical_name;
+    const kws = Array.isArray(m?.keywords) ? m.keywords : [];
+    for (const raw of kws) {
+      const kw = String(raw || "").trim().toLowerCase();
+      if (!kw) continue;
+
+      // Avoid super-common noise keywords (too short)
+      if (kw.length < 4) continue;
+
+      let hit = false;
+      if (kw.includes(" ") || kw.includes("+") || kw.includes(".") || kw.includes("-")) {
+        hit = t.includes(kw);
+      } else {
+        const re = new RegExp(`\\b${escapeRegex(kw)}\\b`, "i");
+        hit = re.test(t);
+      }
+
+      if (!hit) continue;
+
+      const weight = Math.min(20, 8 + Math.floor(kw.length / 2)); // longer phrase == more convincing
+      if (!best || weight > best.weight) {
+        best = { canonicalName: name, keyword: kw, weight };
+      }
+    }
+  }
+
+  return best;
+}
+
+export function buildCandidate({ from, subject, date, text, html, directory, overrides }) {
   const plain = normalizeText(text ?? "") || normalizeText(htmlToTextSafe(html ?? ""));
   const haystack = `${subject}\n${from}\n${plain}`.toLowerCase();
 
-  const merchant = guessMerchant({ from, subject, text: plain }) ?? "Unknown merchant";
+  const senderHit = resolveMerchantFromSender({ from, directory, overrides });
+  const keywordHit = findDirectoryKeywordHit(haystack, directory);
+  const guessed = guessMerchant({ from, subject, text: plain });
+
+  const merchant =
+    senderHit.canonicalName ??
+    keywordHit?.canonicalName ??
+    guessed ??
+    "Unknown merchant";
+
+  const fingerprint = crypto
+    .createHash("sha256")
+    .update(`${compact(merchant)}|${compact(from)}|${compact(subject)}|${date.toISOString().slice(0, 10)}`)
+    .digest("hex");
 
   const isWelcomeLike =
     merchant !== "Unknown merchant" &&
@@ -68,9 +121,29 @@ export function buildCandidate({ from, subject, date, text, html }) {
   const cadence = guessCadence(haystack);
   const nextDate = guessNextDate({ haystack, messageDate: date });
 
+  // Deterministic confidence: sender → directory keywords → other signals.
   let confidence = 20;
-  if (merchant !== "Unknown merchant") confidence += 25;
 
+  // Sender-based signals (matches checklist intent)
+  if (senderHit.canonicalName) {
+    if (String(senderHit.reason).includes("email")) confidence += 40;
+    else if (String(senderHit.reason).includes("domain")) confidence += 25;
+    else confidence += 35; // overrides, etc.
+  }
+
+  // Directory keyword match (+20)
+  if (keywordHit?.canonicalName) confidence += 20;
+
+  // Penalize conflicting strong signals (keeps confidence honest)
+  if (
+    senderHit.canonicalName &&
+    keywordHit?.canonicalName &&
+    senderHit.canonicalName !== keywordHit.canonicalName
+  ) {
+    confidence -= 30;
+  }
+
+  // Existing heuristic signals
   confidence += Math.min(25, keywordScore(subject.toLowerCase(), SUBJECT_KEYWORDS));
   confidence += Math.min(20, keywordScore(haystack, BODY_KEYWORDS));
 
@@ -80,11 +153,10 @@ export function buildCandidate({ from, subject, date, text, html }) {
 
   confidence = clamp(confidence, 0, 100);
 
-  // welcome-like emails are allowed at a slightly lower floor
-  const floor = isWelcomeLike ? 30 : 40;
-  if (confidence < floor) return null;
-
-  const fingerprint = makeFingerprint({ from, subject, amount: amountInfo?.amount, merchant, date });
+  // welcome-like emails are allowed at a slightly lower signal threshold
+  if (!amountInfo?.amount && !nextDate && !isWelcomeLike) {
+    confidence = Math.min(confidence, 70);
+  }
 
   return {
     fingerprint,
@@ -98,6 +170,8 @@ export function buildCandidate({ from, subject, date, text, html }) {
       from: compact(from),
       subject: compact(subject),
       date: date.toISOString(),
+      merchantReason: senderHit.reason || null,
+      merchantKeyword: keywordHit?.keyword || null,
     },
   };
 }
@@ -117,107 +191,73 @@ function htmlToTextSafe(html) {
 function normalizeText(s) {
   return String(s).replace(/\s+/g, " ").trim();
 }
+
 function compact(s) {
-  return String(s).replace(/\s+/g, " ").trim().slice(0, 180);
+  return String(s || "").replace(/\s+/g, " ").trim();
 }
+
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
+
 function keywordScore(text, keywords) {
   let score = 0;
-  for (const k of keywords) if (text.includes(k)) score += 5;
+  for (const k of keywords) {
+    if (text.includes(k)) score += 5;
+  }
   return score;
 }
 
-function domainFromFromHeader(from) {
-  const m = from.match(/<([^>]+)>/);
-  const addr = (m?.[1] ?? from).trim();
-  const at = addr.lastIndexOf("@");
-  if (at === -1) return null;
-  return addr.slice(at + 1).toLowerCase();
-}
-
-function guessMerchant({ from, subject, text }) {
-  const fromLower = from.toLowerCase();
-  const subjectLower = subject.toLowerCase();
-  const textLower = text.toLowerCase();
-  const domain = domainFromFromHeader(from);
-
-  for (const hint of MERCHANT_HINTS) {
-    if (domain && hint.domains.some((d) => domain.endsWith(d))) return hint.name;
-    if (hint.keywords.some((k) => fromLower.includes(k))) return hint.name;
-    if (hint.keywords.some((k) => subjectLower.includes(k))) return hint.name;
-    if (hint.keywords.some((k) => textLower.includes(k))) return hint.name;
-  }
-
-  const display = from.split("<")[0].trim();
-  if (display && display.length <= 40 && !/no-?reply|notification|billing/i.test(display)) return display;
-
-  return null;
-}
-
 function extractAmount(text) {
-  const lines = text.split(/\n|\r/).slice(0, 250);
-  const targetLines = lines
-    .filter((l) => /(total|amount|charged|payment|paid|price|plan)/i.test(l))
-    .concat(lines);
+  // Simple amount parse: "$9.99", "USD 9.99", etc.
+  const m =
+    text.match(/\$\s?(\d+(?:\.\d{2})?)/) ||
+    text.match(/usd\s?(\d+(?:\.\d{2})?)/i) ||
+    text.match(/(\d+(?:\.\d{2})?)\s?usd/i);
 
-  for (const line of targetLines) {
-    const hit = matchCurrencyAmount(line);
-    if (hit) return hit;
-  }
-  return null;
-}
-
-function matchCurrencyAmount(s) {
-  const usd = s.match(/(?:\$|usd\s?)(\d{1,6}(?:[\.,]\d{2})?)/i);
-  if (usd) {
-    const amount = parseFloat(usd[1].replace(",", "."));
-    if (Number.isFinite(amount) && amount > 0 && amount < 100000) return { amount, currency: "USD" };
-  }
-  const eur = s.match(/(?:€|eur\s?)(\d{1,6}(?:[\.,]\d{2})?)/i);
-  if (eur) {
-    const amount = parseFloat(eur[1].replace(",", "."));
-    if (Number.isFinite(amount) && amount > 0 && amount < 100000) return { amount, currency: "EUR" };
-  }
-  return null;
+  if (!m) return null;
+  const amount = Number(m[1]);
+  if (!Number.isFinite(amount)) return null;
+  return { amount, currency: "USD" };
 }
 
 function guessCadence(text) {
-  if (/\bweekly\b|every week|per week/i.test(text)) return "weekly";
-  if (/\bquarterly\b|every 3 months|per quarter/i.test(text)) return "quarterly";
-  if (/\bannual\b|\byearly\b|per year|every year/i.test(text)) return "yearly";
-  if (/\bmonthly\b|per month|every month/i.test(text)) return "monthly";
-  return undefined;
+  const t = text.toLowerCase();
+  if (t.includes("every year") || t.includes("annual") || t.includes("yearly")) return "yearly";
+  if (t.includes("every month") || t.includes("monthly")) return "monthly";
+  if (t.includes("every week") || t.includes("weekly")) return "weekly";
+  return "monthly";
 }
 
 function guessNextDate({ haystack, messageDate }) {
-  const idx = haystack.search(/renews|renewal date|next billing date|billed on|trial ends|valid until/i);
-  const focus = idx >= 0 ? haystack.slice(idx, Math.min(haystack.length, idx + 500)) : haystack.slice(0, 700);
-
-  const parsed = chrono.parse(focus, messageDate);
-  if (!parsed.length) return undefined;
-
-  const now = new Date();
-  const future = parsed
-    .map((c) => c.start?.date())
-    .filter((d) => d instanceof Date)
-    .filter((d) => d.getTime() >= now.getTime() - 24 * 3600 * 1000)
-    .filter((d) => d.getTime() <= now.getTime() + 400 * 24 * 3600 * 1000)
-    .sort((a, b) => a.getTime() - b.getTime());
-
-  if (!future.length) return undefined;
-  return toISODate(future[0]);
+  const results = chrono.parse(haystack, messageDate);
+  if (!results?.length) return null;
+  const d = results[0]?.start?.date?.();
+  if (!d) return null;
+  return d.toISOString().slice(0, 10);
 }
 
-function toISODate(d) {
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
+function guessMerchant({ from, subject, text }) {
+  const fromLower = String(from || "").toLowerCase();
+  const subjectLower = String(subject || "").toLowerCase();
+  const bodyLower = String(text || "").toLowerCase();
+  const all = `${fromLower}\n${subjectLower}\n${bodyLower}`;
 
-function makeFingerprint({ from, subject, merchant, amount, date }) {
-  const base = `${merchant}|${from}|${subject}|${amount ?? ""}|${toISODate(date)}`;
-  return crypto.createHash("sha256").update(base).digest("hex").slice(0, 24);
+  for (const hint of MERCHANT_HINTS) {
+    for (const d of hint.domains) {
+      if (fromLower.includes(d)) return hint.name;
+    }
+    for (const kw of hint.keywords) {
+      if (all.includes(kw)) return hint.name;
+    }
+  }
+
+  // fallback: try to extract a display name from "From: Name <email>"
+  const m = String(from || "").match(/^([^<]+)</);
+  if (m?.[1]) {
+    const name = m[1].trim();
+    if (name.length >= 2 && name.length <= 40) return name;
+  }
+
+  return null;
 }
