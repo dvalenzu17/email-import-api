@@ -1,3 +1,4 @@
+// src/lib/detect.js
 import crypto from "node:crypto";
 import { htmlToText } from "html-to-text";
 import * as chrono from "chrono-node";
@@ -29,6 +30,8 @@ const SUBJECT_KEYWORDS = [
   "plan",
   "billing",
   "confirmation",
+  "expires",
+  "expiring",
 ];
 
 const BODY_KEYWORDS = [
@@ -42,6 +45,7 @@ const BODY_KEYWORDS = [
   "renewal price",
   "subscription confirmed",
   "subscription expiring",
+  "your subscription",
 ];
 
 const WELCOME_KEYWORDS = ["welcome", "thanks for joining", "start watching", "your account information"];
@@ -54,8 +58,10 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
   // Sender resolution (directory + user overrides)
   const senderHit = resolveMerchantFromSender({ from, directory, overrides });
 
-  // Apple receipts: if sender is Apple-ish, try extracting the real app
-  const apple = parseAppleSubscription({ from, subject, text: haystackOriginal });
+  // Apple subscription / receipt parsing (merchant extraction)
+  const apple = parseAppleSubscription({ from, subject, text: haystackOriginal, messageDate: date });
+
+  // fallback merchant guessing
   const guessed = guessMerchant({ from, subject, text: plainOriginal });
 
   // Canonical merchant selection order
@@ -65,15 +71,15 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
     guessed ??
     "Unknown merchant";
 
+  const subjectLower = String(subject || "").toLowerCase();
+  const subjectSignal = SUBJECT_KEYWORDS.some((k) => subjectLower.includes(k));
+  const bodySignal = BODY_KEYWORDS.some((k) => haystack.includes(k));
+
   const isWelcomeLike =
     merchant !== "Unknown merchant" &&
     WELCOME_KEYWORDS.some((k) => haystack.includes(k));
 
-  const hasSignal =
-    SUBJECT_KEYWORDS.some((k) => String(subject || "").toLowerCase().includes(k)) ||
-    BODY_KEYWORDS.some((k) => haystack.includes(k)) ||
-    isWelcomeLike;
-
+  const hasSignal = subjectSignal || bodySignal || isWelcomeLike;
   if (!hasSignal) return null;
 
   const amountInfo = apple?.amountInfo ?? extractAmount(haystackOriginal);
@@ -81,7 +87,7 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
   const nextDate = apple?.nextDate ?? guessNextDate({ haystack: haystackOriginal, messageDate: date });
 
   // --- Confidence signals (deterministic) ---
-  const keywordMatch = guessed && guessed !== "Unknown merchant";
+  const keywordMatch = !!guessed && guessed !== "Unknown merchant";
   const pastAmountMatch = matchesPastAmount({ knownSubs, merchant, amount: amountInfo?.amount });
   const cadenceMatch = matchesPastCadence({ knownSubs, merchant, cadence });
 
@@ -93,16 +99,25 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
 
   const confidence = computeConfidence({
     senderMatchType: senderHit.matchType,
-    keywordMatch: !!keywordMatch,
+    keywordMatch,
     pastAmountMatch: !!pastAmountMatch,
     cadenceMatch: !!cadenceMatch,
     conflict: !!conflict,
+
+    // new real signals so unknown merchants can pass
+    subjectSignal: !!subjectSignal,
+    bodySignal: !!bodySignal,
+    hasAmount: !!(amountInfo && Number.isFinite(Number(amountInfo.amount))),
+    hasCadence: !!cadence,
+    hasNextDate: !!nextDate,
+    isAppleExtracted: !!apple?.merchant && apple?.merchant !== "Apple",
   });
 
   const confidenceLabel = labelConfidence(confidence);
 
-  // welcome-like emails are allowed at a slightly lower floor
-  const floor = isWelcomeLike ? 30 : 40;
+  // Floors: welcome emails can be lower, unknown merchants can be medium if signals are strong
+  const isUnknown = String(merchant).toLowerCase() === "unknown merchant";
+  const floor = isWelcomeLike ? 30 : (isUnknown ? 35 : 40);
   if (confidence < floor) return null;
 
   const fingerprint = makeFingerprint({ from, subject, amount: amountInfo?.amount, merchant, date });
@@ -118,10 +133,16 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
     confidenceLabel,
     confidenceSignals: {
       senderMatchType: senderHit.matchType,
-      keywordMatch: !!keywordMatch,
+      keywordMatch,
       pastAmountMatch: !!pastAmountMatch,
       cadenceMatch: !!cadenceMatch,
       conflict: !!conflict,
+      subjectSignal: !!subjectSignal,
+      bodySignal: !!bodySignal,
+      hasAmount: !!(amountInfo && Number.isFinite(Number(amountInfo.amount))),
+      hasCadence: !!cadence,
+      hasNextDate: !!nextDate,
+      isAppleExtracted: !!apple?.merchant && apple?.merchant !== "Apple",
     },
     evidence: {
       from: compact(from),
@@ -133,25 +154,42 @@ export function buildCandidate({ from, subject, date, text, html, directory, ove
 
 // ---------------- Confidence model ----------------
 
-function computeConfidence({ senderMatchType, keywordMatch, pastAmountMatch, cadenceMatch, conflict }) {
+function computeConfidence({
+  senderMatchType,
+  keywordMatch,
+  pastAmountMatch,
+  cadenceMatch,
+  conflict,
+  subjectSignal,
+  bodySignal,
+  hasAmount,
+  hasCadence,
+  hasNextDate,
+  isAppleExtracted,
+}) {
   let score = 0;
 
-  // +40 exact sender email match
+  // Sender directory / overrides
   if (senderMatchType === "override_email" || senderMatchType === "directory_email") score += 40;
-
-  // +25 domain match
   if (senderMatchType === "override_domain" || senderMatchType === "directory_domain") score += 25;
 
-  // +20 keyword match (dictionary-ish; our hints list)
+  // Merchant hints / keyword guess
   if (keywordMatch) score += 20;
 
-  // +10 amount pattern matches past charge
-  if (pastAmountMatch) score += 10;
+  // Real "this looks like a subscription" evidence
+  if (subjectSignal) score += 10;
+  if (bodySignal) score += 10;
+  if (hasAmount) score += 15;
+  if (hasNextDate) score += 15;
+  if (hasCadence) score += 10;
 
-  // +10 billing cadence matches detected interval
+  // Apple subscription emails: extracting the real app is strong signal
+  if (isAppleExtracted) score += 15;
+
+  // Behavioral confidence (optional)
+  if (pastAmountMatch) score += 10;
   if (cadenceMatch) score += 10;
 
-  // -30 conflicting merchant signals
   if (conflict) score -= 30;
 
   return clamp(score, 0, 100);
@@ -177,10 +215,7 @@ function matchesPastAmount({ knownSubs, merchant, amount }) {
     const ra = Number(row.amount ?? 0);
     if (!Number.isFinite(ra)) continue;
 
-    // exact-ish match with a small tolerance
     if (Math.abs(ra - a) <= 0.05) return true;
-
-    // or within 2% (some taxes/rounding)
     const denom = Math.max(ra, a, 1);
     if (Math.abs(ra - a) / denom <= 0.02) return true;
   }
@@ -202,13 +237,12 @@ function matchesPastCadence({ knownSubs, merchant, cadence }) {
   return false;
 }
 
-// ---------------- Apple parsing (merchant extraction) ----------------
+// ---------------- Apple parsing ----------------
 
-function parseAppleSubscription({ from, subject, text }) {
+function parseAppleSubscription({ from, subject, text, messageDate }) {
   const fromLower = String(from || "").toLowerCase();
   const subjLower = String(subject || "").toLowerCase();
 
-  // Apple subscription emails commonly from: no_reply@email.apple.com
   const looksAppleSender = fromLower.includes("email.apple.com") || fromLower.includes("apple.com");
   const looksAppleSub = subjLower.includes("subscription") || String(text || "").toLowerCase().includes("subscription");
 
@@ -219,8 +253,8 @@ function parseAppleSubscription({ from, subject, text }) {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  // Prefer explicit “App” line (like your screenshot)
   let appName = null;
+
   for (const l of lines) {
     const m = l.match(/^App\s*[:\-]\s*(.+)$/i);
     if (m?.[1]) {
@@ -229,15 +263,11 @@ function parseAppleSubscription({ from, subject, text }) {
     }
   }
 
-  // Fallback: pick a strong-looking app title line
   if (!appName) {
-    // often the app title appears near the top and is not “Subscription Confirmed/Expiring/Dear”
-    for (const l of lines.slice(0, 40)) {
+    for (const l of lines.slice(0, 50)) {
       if (/subscription confirmed|subscription expiring|dear\s/i.test(l)) continue;
       if (l.length < 3 || l.length > 80) continue;
       if (/^apple$/i.test(l)) continue;
-
-      // looks like “LinkedIn: Network & Job Finder”
       if (/^[a-z0-9][a-z0-9 &:+\-'.()]{2,}$/i.test(l)) {
         appName = l.trim();
         break;
@@ -246,15 +276,11 @@ function parseAppleSubscription({ from, subject, text }) {
   }
 
   const merchant = canonicalizeAppleAppName(appName);
+  if (!merchant) return null;
 
-  // Renewal price (US$39.99/month etc)
   const amt = extractAmount(String(text || ""));
   const cadence = guessCadence(String(text || "").toLowerCase()) || (String(text || "").includes("/month") ? "monthly" : undefined);
-
-  // renewal/expiry dates
-  const nextDate = guessNextDate({ haystack: String(text || ""), messageDate: new Date() });
-
-  if (!merchant) return null;
+  const nextDate = guessNextDate({ haystack: String(text || ""), messageDate });
 
   return { merchant, amountInfo: amt, cadence, nextDate };
 }
@@ -262,15 +288,12 @@ function parseAppleSubscription({ from, subject, text }) {
 function canonicalizeAppleAppName(appName) {
   const raw = String(appName || "").trim();
   if (!raw) return null;
-
-  // “LinkedIn: Network & Job Finder” -> “LinkedIn”
   const cut = raw.split(":")[0].trim();
   if (cut && cut.length <= 40) return cut;
-
   return raw;
 }
 
-// ---------------- Existing detection helpers ----------------
+// ---------------- Helpers ----------------
 
 function htmlToTextSafe(html) {
   if (!html) return "";
@@ -360,8 +383,8 @@ function guessCadence(text) {
 
 function guessNextDate({ haystack, messageDate }) {
   const h = String(haystack || "");
-  const idx = h.search(/renews|renewal date|next billing date|billed on|trial ends|valid until|starting/i);
-  const focus = idx >= 0 ? h.slice(idx, Math.min(h.length, idx + 700)) : h.slice(0, 900);
+  const idx = h.search(/renews|renewal date|next billing date|billed on|trial ends|valid until|starting|expires|expiring/i);
+  const focus = idx >= 0 ? h.slice(idx, Math.min(h.length, idx + 900)) : h.slice(0, 1000);
 
   const parsed = chrono.parse(focus, messageDate);
   if (!parsed.length) return undefined;

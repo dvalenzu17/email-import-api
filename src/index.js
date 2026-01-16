@@ -111,7 +111,7 @@ const ScanBodySchema = z.object({
   options: z
     .object({
       daysBack: z.number().int().min(1).max(3650).default(180),
-      maxMessages: z.number().int().min(1).max(500).default(250),
+      maxMessages: z.number().int().min(1).max(2000).default(250),
       maxCandidates: z.number().int().min(1).max(200).default(60),
       cursor: z.string().optional(),
     })
@@ -146,18 +146,16 @@ server.post("/v1/email/scan", async (req, reply) => {
   }
 });
 
-/** --------------------------
- * Gmail OAuth: scan
- * -------------------------- */
+// ---- Gmail OAuth: scan ----
 const GmailScanBodySchema = z.object({
   auth: z.object({
     accessToken: z.string().min(10),
   }),
   options: z
     .object({
-      daysBack: z.number().int().min(1).max(3650).default(365),
-      maxMessages: z.number().int().min(1).max(500).default(300),
-      maxCandidates: z.number().int().min(1).max(200).default(80),
+      daysBack: z.number().int().min(1).max(3650).default(730),
+      maxMessages: z.number().int().min(1).max(5000).default(2000),
+      maxCandidates: z.number().int().min(1).max(400).default(120),
       cursor: z.string().optional(), // pageToken
     })
     .default({}),
