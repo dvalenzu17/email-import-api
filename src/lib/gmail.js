@@ -1,6 +1,8 @@
 // src/lib/gmail.js
 import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detect.js";
 
+const ENGINE_VERSION = "gmail-scan-v99-deadline-20s";
+
 function b64urlDecode(s) {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
   return Buffer.from(padded, "base64").toString("utf8");
@@ -50,22 +52,38 @@ function extractBodies(payload) {
   return { text: text.trim() || "", html: html.trim() || "" };
 }
 
-/**
- * Merchant-agnostic but transactional-focused Gmail query.
- * This avoids wasting pages on promos/newsletters.
- */
 function buildQuery(daysBack) {
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
   return `in:anywhere newer_than:${daysBack}d (${transactional})`;
 }
 
-async function pMap(items, concurrency, fn) {
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function pMap(items, concurrency, fn, shouldStop) {
   const ret = new Array(items.length);
   let idx = 0;
 
   const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
     while (idx < items.length) {
+      if (shouldStop?.()) break;
       const i = idx++;
       try {
         ret[i] = await fn(items[i], i);
@@ -80,28 +98,43 @@ async function pMap(items, concurrency, fn) {
 }
 
 export async function scanGmail({ accessToken, options, context }) {
-  const daysBack = options.daysBack ?? 730;
+  const startedAt = Date.now();
 
-  // IMPORTANT: "pageSize" is per-request scan size. Keep this bounded for reliability.
-  const pageSize = Math.max(50, Math.min(500, Number(options.pageSize ?? 250)));
-  const maxCandidates = Math.max(10, Math.min(200, Number(options.maxCandidates ?? 60)));
-  const concurrency = Math.max(2, Math.min(10, Number(options.concurrency ?? 6)));
+  const daysBack = Number(options?.daysBack ?? 730);
+  const pageSize = clamp(Number(options?.pageSize ?? 250), 50, 500);
+  const maxCandidates = clamp(Number(options?.maxCandidates ?? 60), 10, 200);
 
-  const cursor = options.cursor || undefined;
+  // HARD LIMITS to avoid Render timeouts
+  const deadlineMs = clamp(Number(options?.deadlineMs ?? 20000), 8000, 45000);
+  const deadlineAt = startedAt + deadlineMs;
+
+  // keep concurrency small to reduce per-request load
+  const concurrency = clamp(Number(options?.concurrency ?? 5), 2, 8);
+
+  // per-call timeouts (Gmail can hang on some accounts)
+  const listTimeoutMs = clamp(Number(options?.timeouts?.listMs ?? 8000), 3000, 15000);
+  const metaTimeoutMs = clamp(Number(options?.timeouts?.metaMs ?? 7000), 3000, 15000);
+  const fullTimeoutMs = clamp(Number(options?.timeouts?.fullMs ?? 9000), 3000, 20000);
+
+  const cursor = options?.cursor || undefined;
   const q = buildQuery(daysBack);
 
-  // ---- Step 1: list ONE page of message IDs ----
+  const shouldStop = () => Date.now() > deadlineAt - 750; // keep buffer for response
+
+  // ---- Step 1: list one page of IDs ----
   const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
   listUrl.searchParams.set("q", q);
   listUrl.searchParams.set("maxResults", String(pageSize));
   if (cursor) listUrl.searchParams.set("pageToken", cursor);
 
-  const listRes = await fetch(listUrl.toString(), {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
+  const listRes = await fetchWithTimeout(
+    listUrl.toString(),
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    listTimeoutMs
+  );
 
   if (!listRes.ok) {
-    const txt = await listRes.text();
+    const txt = await listRes.text().catch(() => "");
     throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
   }
 
@@ -115,81 +148,102 @@ export async function scanGmail({ accessToken, options, context }) {
   if (!ids.length) {
     return {
       candidates: [],
+      nextCursor,
       stats: {
+        engineVersion: ENGINE_VERSION,
+        daysBack,
+        pageSize,
         scanned: 0,
         screenedIn: 0,
         fullFetched: 0,
-        rawMatched: 0,
         matched: 0,
-        daysBack,
-        pageSize,
+        deadlineMs,
+        tookMs: Date.now() - startedAt,
+        query: q,
       },
-      nextCursor,
     };
   }
 
-  // ---- Step 2: metadata screening (cheap) ----
-  const meta = await pMap(ids, concurrency, async (id) => {
-    const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
-    url.searchParams.set("format", "metadata");
-    url.searchParams.set("metadataHeaders", "From");
-    url.searchParams.set("metadataHeaders", "Subject");
-    url.searchParams.set("metadataHeaders", "Date");
-    url.searchParams.set("metadataHeaders", "Reply-To");
-    url.searchParams.set("metadataHeaders", "Return-Path");
-    url.searchParams.set("metadataHeaders", "List-Unsubscribe");
-    url.searchParams.set("metadataHeaders", "List-Id");
-    url.searchParams.set("metadataHeaders", "Precedence");
-    url.searchParams.set("metadataHeaders", "Auto-Submitted");
+  // ---- Step 2: metadata screening ----
+  const meta = await pMap(
+    ids,
+    concurrency,
+    async (id) => {
+      if (shouldStop()) return null;
 
-    const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
-    if (!res.ok) return null;
+      const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
+      url.searchParams.set("format", "metadata");
+      url.searchParams.set("metadataHeaders", "From");
+      url.searchParams.set("metadataHeaders", "Subject");
+      url.searchParams.set("metadataHeaders", "Date");
+      url.searchParams.set("metadataHeaders", "Reply-To");
+      url.searchParams.set("metadataHeaders", "Return-Path");
+      url.searchParams.set("metadataHeaders", "List-Unsubscribe");
+      url.searchParams.set("metadataHeaders", "List-Id");
+      url.searchParams.set("metadataHeaders", "Precedence");
+      url.searchParams.set("metadataHeaders", "Auto-Submitted");
 
-    const msg = await res.json();
-    const headers = pickHeaders(msg.payload?.headers ?? []);
-    const snippet = msg.snippet || "";
-    const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
+      const res = await fetchWithTimeout(
+        url.toString(),
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+        metaTimeoutMs
+      );
+      if (!res.ok) return null;
 
-    const screen = quickScreenMessage({
-      from: headers.from,
-      subject: headers.subject,
-      snippet,
-      headerMap: headers.headerMap,
-    });
+      const msg = await res.json();
+      const headers = pickHeaders(msg.payload?.headers ?? []);
+      const snippet = msg.snippet || "";
+      const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
 
-    // allow "weak_signal" to pass so we don't drop everything
-    const ok = screen.ok || screen.reason === "weak_signal";
+      const screen = quickScreenMessage({
+        from: headers.from,
+        subject: headers.subject,
+        snippet,
+        headerMap: headers.headerMap,
+      });
 
-    return {
-      id,
-      ok,
-      headers,
-      snippet,
-      dateMs: msgDate.getTime(),
-    };
-  });
+      // Don’t let “strict” screening produce 0 forever. “weak_signal” may still be a receipt.
+      const ok = screen.ok || screen.reason === "weak_signal";
+
+      return {
+        id,
+        ok,
+        headers,
+        snippet,
+        dateMs: msgDate.getTime(),
+      };
+    },
+    shouldStop
+  );
 
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  // ---- Step 3: full fetch only for screened-in, STOP EARLY once we have enough ----
+  // ---- Step 3: full fetch only for a small subset (to keep it fast) ----
+  // We don’t need to full-fetch everything; grab enough to produce candidates.
+  const fullCap = clamp(Number(options?.fullFetchCap ?? 40), 10, 80);
+  const fullTargets = screenedIn.slice(0, fullCap);
+
   const rawCandidates = [];
+  let fullFetched = 0;
 
-  // Process in small chunks to avoid long request time
-  for (let i = 0; i < screenedIn.length; i += 40) {
-    const chunk = screenedIn.slice(i, i + 40);
+  for (let i = 0; i < fullTargets.length; i++) {
+    if (shouldStop()) break;
 
-    await pMap(chunk, concurrency, async (m) => {
-      if (!m?.id) return null;
-      if (rawCandidates.length >= maxCandidates * 2) return null;
-
+    const m = fullTargets[i];
+    try {
       const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-      if (!res.ok) return null;
+      const res = await fetchWithTimeout(
+        url,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+        fullTimeoutMs
+      );
+      if (!res.ok) continue;
 
       const msg = await res.json();
-      const bodies = extractBodies(msg.payload);
+      fullFetched++;
 
+      const bodies = extractBodies(msg.payload);
       const cand = buildCandidate(
         {
           from: m.headers.from,
@@ -206,26 +260,35 @@ export async function scanGmail({ accessToken, options, context }) {
       );
 
       if (cand) rawCandidates.push(cand);
-      return true;
-    });
 
-    // If we already have enough evidence, stop early
-    if (rawCandidates.length >= maxCandidates) break;
+      // Stop early if we already have enough
+      if (rawCandidates.length >= maxCandidates) break;
+
+      // tiny yield every few fetches to avoid event-loop stalls
+      if (i % 8 === 0) await sleep(10);
+    } catch {
+      // ignore per-email failures
+    }
   }
 
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
   return {
     candidates,
+    nextCursor,
     stats: {
-      scanned,
-      screenedIn: screenedIn.length,
-      fullFetched: Math.min(screenedIn.length, scanned),
-      rawMatched: rawCandidates.length,
-      matched: candidates.length,
+      engineVersion: ENGINE_VERSION,
       daysBack,
       pageSize,
+      scanned,
+      screenedIn: screenedIn.length,
+      fullFetched,
+      rawMatched: rawCandidates.length,
+      matched: candidates.length,
+      deadlineMs,
+      fullFetchCap: fullCap,
+      tookMs: Date.now() - startedAt,
+      query: q,
     },
-    nextCursor,
   };
 }
