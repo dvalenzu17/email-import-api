@@ -140,7 +140,7 @@ server.post("/v1/email/scan", async (req, reply) => {
     req.log.warn({ err: e, provider }, "imap_scan_failed");
     return reply.code(400).send({ ok: false, error: mapImapError(e) });
   }
-});P
+});
 
 // ---- Gmail OAuth: scan ----
 const GmailScanBodySchema = z.object({
