@@ -110,13 +110,14 @@ const ScanBodySchema = z.object({
   auth: AuthSchema,
   options: z
     .object({
-      daysBack: z.number().int().min(1).max(3650).default(180),
-      maxMessages: z.number().int().min(1).max(2000).default(250),
-      maxCandidates: z.number().int().min(1).max(200).default(60),
+      daysBack: z.number().int().min(1).max(3650).default(730),
+      maxMessages: z.number().int().min(1).max(5000).default(2000),
+      maxCandidates: z.number().int().min(1).max(200).default(80),
       cursor: z.string().optional(),
     })
     .default({}),
 });
+
 
 server.post("/v1/email/scan", async (req, reply) => {
   const parsed = ScanBodySchema.safeParse(req.body);
@@ -131,13 +132,8 @@ server.post("/v1/email/scan", async (req, reply) => {
     const overrides = await getUserOverrides(req.userId);
     const knownSubs = await getUserSubscriptionSignals(req.userId);
 
-    const result = await scanImap({
-      provider,
-      imap,
-      auth,
-      options,
-      context: { directory, overrides, knownSubs },
-    });
+    const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
+
 
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
@@ -154,12 +150,14 @@ const GmailScanBodySchema = z.object({
   options: z
     .object({
       daysBack: z.number().int().min(1).max(3650).default(730),
-      maxMessages: z.number().int().min(1).max(5000).default(2000),
-      maxCandidates: z.number().int().min(1).max(400).default(120),
-      cursor: z.string().optional(), // pageToken
+      maxMessages: z.number().int().min(1).max(5000).default(2500),
+      maxCandidates: z.number().int().min(1).max(200).default(100),
+      cursor: z.string().optional(),
+      concurrency: z.number().int().min(1).max(20).default(10),
     })
     .default({}),
 });
+
 
 server.post("/v1/gmail/scan", async (req, reply) => {
   const parsed = GmailScanBodySchema.safeParse(req.body);

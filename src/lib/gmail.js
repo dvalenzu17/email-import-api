@@ -1,20 +1,28 @@
-// src/lib/gmail.js
-import { buildCandidate } from "./detect.js";
+import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detect.js";
 
 function b64urlDecode(s) {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
   return Buffer.from(padded, "base64").toString("utf8");
 }
 
-function pickHeaders(headers = []) {
-  const map = new Map();
-  for (const h of headers) {
-    if (h?.name && typeof h?.value === "string") map.set(String(h.name).toLowerCase(), h.value);
+function headersToMap(headers = []) {
+  const map = {};
+  for (const h of headers || []) {
+    if (!h?.name) continue;
+    map[String(h.name).toLowerCase()] = String(h.value || "");
   }
+  return map;
+}
+
+function pickHeaders(headers = []) {
+  const m = headersToMap(headers);
   return {
-    from: map.get("from") ?? "",
-    subject: map.get("subject") ?? "",
-    date: map.get("date") ?? "",
+    headerMap: m,
+    from: m["from"] ?? "",
+    subject: m["subject"] ?? "",
+    date: m["date"] ?? "",
+    replyTo: m["reply-to"] ?? "",
+    returnPath: m["return-path"] ?? "",
   };
 }
 
@@ -38,82 +46,47 @@ function extractBodies(payload) {
   }
 
   walk(payload);
-  return { text: text.trim() || undefined, html: html.trim() || undefined };
+  return { text: text.trim() || "", html: html.trim() || "" };
 }
 
-// Less fragile: grab recent mail, let detect.js filter
 function buildQuery(daysBack) {
-  // exclude chats; keep everything else
-  return `newer_than:${daysBack}d -in:chats`;
+  // open-world: DON'T over-filter with keywords (that’s why your mom got 0 results)
+  // we screen aggressively client-side using headers/snippets.
+  return `in:anywhere newer_than:${daysBack}d`;
 }
 
-function normalizeMerchantKey(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
+async function pMap(items, concurrency, fn) {
+  const ret = new Array(items.length);
+  let idx = 0;
 
-function groupCandidates(cands = []) {
-  const groups = new Map();
-
-  for (const c of cands) {
-    const merchantKey = normalizeMerchantKey(c.merchant);
-    const cadenceKey = String(c.cadenceGuess || "").trim().toLowerCase();
-    const amountKey =
-      typeof c.amount === "number" && Number.isFinite(c.amount)
-        ? String(Math.round(c.amount * 100))
-        : "";
-
-    // Group by merchant primarily; cadence/amount help avoid merging unrelated stuff
-    const key = `${merchantKey}|${cadenceKey}|${amountKey}`;
-
-    const prev = groups.get(key);
-    if (!prev) {
-      groups.set(key, {
-        ...c,
-        occurrences: 1,
-        evidenceSamples: [c.evidence].filter(Boolean),
-        confidenceMax: c.confidence ?? 0,
-      });
-    } else {
-      prev.occurrences += 1;
-      prev.confidenceMax = Math.max(prev.confidenceMax, c.confidence ?? 0);
-
-      // keep best "representative" candidate (highest confidence)
-      if ((c.confidence ?? 0) > (prev.confidence ?? 0)) {
-        groups.set(key, {
-          ...prev,
-          ...c,
-          occurrences: prev.occurrences,
-          evidenceSamples: prev.evidenceSamples,
-          confidenceMax: prev.confidenceMax,
-        });
-      }
-
-      if (c.evidence && prev.evidenceSamples.length < 4) {
-        prev.evidenceSamples.push(c.evidence);
+  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      try {
+        ret[i] = await fn(items[i], i);
+      } catch (e) {
+        ret[i] = null;
       }
     }
-  }
+  });
 
-  return Array.from(groups.values()).sort((a, b) => (b.confidenceMax ?? 0) - (a.confidenceMax ?? 0));
+  await Promise.all(workers);
+  return ret;
 }
 
 export async function scanGmail({ accessToken, options, context }) {
-  const q = buildQuery(options.daysBack);
+  const daysBack = options.daysBack;
+  const maxMessages = options.maxMessages;
+  const maxCandidates = options.maxCandidates;
+
+  const q = buildQuery(daysBack);
   let pageToken = options.cursor;
-
   const ids = [];
-  let pages = 0;
 
-  // list up to maxMessages message IDs (paginated)
-  while (ids.length < options.maxMessages) {
+  while (ids.length < maxMessages) {
     const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
     url.searchParams.set("q", q);
-
-    // Gmail maxResults max is 500 per request
-    url.searchParams.set("maxResults", String(Math.min(500, options.maxMessages - ids.length)));
+    url.searchParams.set("maxResults", String(Math.min(500, maxMessages - ids.length)));
     if (pageToken) url.searchParams.set("pageToken", pageToken);
 
     const res = await fetch(url.toString(), {
@@ -130,56 +103,91 @@ export async function scanGmail({ accessToken, options, context }) {
     for (const m of batch) if (m?.id) ids.push(m.id);
 
     pageToken = json.nextPageToken;
-    pages += 1;
-
     if (!pageToken) break;
   }
 
-  const rawCandidates = [];
-  let scanned = 0;
+  // Phase 1: metadata screening (cheap)
+  const meta = await pMap(ids, options.concurrency || 10, async (id) => {
+    const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
+    url.searchParams.set("format", "metadata");
+    url.searchParams.set("metadataHeaders", "From");
+    url.searchParams.set("metadataHeaders", "Subject");
+    url.searchParams.set("metadataHeaders", "Date");
+    url.searchParams.set("metadataHeaders", "Reply-To");
+    url.searchParams.set("metadataHeaders", "Return-Path");
+    url.searchParams.set("metadataHeaders", "List-Unsubscribe");
+    url.searchParams.set("metadataHeaders", "List-Id");
+    url.searchParams.set("metadataHeaders", "Precedence");
+    url.searchParams.set("metadataHeaders", "Auto-Submitted");
 
-  for (const id of ids) {
-    if (scanned >= options.maxMessages) break;
-    if (rawCandidates.length >= options.maxCandidates) break;
-
-    const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-
-    scanned += 1;
-    if (!res.ok) continue;
+    const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) return null;
 
     const msg = await res.json();
-
     const headers = pickHeaders(msg.payload?.headers ?? []);
-    const bodies = extractBodies(msg.payload);
+    const snippet = msg.snippet || "";
     const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
 
-    const cand = buildCandidate({
+    const screen = quickScreenMessage({
       from: headers.from,
       subject: headers.subject,
-      date: msgDate,
-      text: bodies.text,
-      html: bodies.html,
-      directory: context?.directory,
-      overrides: context?.overrides,
-      knownSubs: context?.knownSubs,
+      snippet,
+      headerMap: headers.headerMap,
     });
 
-    if (cand) rawCandidates.push(cand);
-  }
+    return {
+      id,
+      ok: screen.ok,
+      screenReason: screen.reason,
+      headers,
+      snippet,
+      dateMs: msgDate.getTime(),
+    };
+  });
 
-  const candidates = groupCandidates(rawCandidates).slice(0, options.maxCandidates);
+  const screenedIn = meta.filter((m) => m?.ok);
+  const scanned = meta.filter(Boolean).length;
+
+  // Phase 2: fetch FULL only for screened-in messages
+  const rawCandidates = [];
+  const fullFetched = await pMap(screenedIn, options.concurrency || 10, async (m) => {
+    const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) return null;
+
+    const msg = await res.json();
+    const bodies = extractBodies(msg.payload);
+    const cand = buildCandidate(
+      {
+        from: m.headers.from,
+        replyTo: m.headers.replyTo,
+        returnPath: m.headers.returnPath,
+        subject: m.headers.subject,
+        snippet: m.snippet,
+        text: bodies.text,
+        html: bodies.html,
+        headerMap: m.headers.headerMap,
+        dateMs: m.dateMs,
+      },
+      { directory: context?.directory, overrides: context?.overrides }
+    );
+
+    if (cand) rawCandidates.push(cand);
+    return true;
+  });
+
+  const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
   return {
     candidates,
     stats: {
-      listed: ids.length,
-      pages,
       scanned,
-      matchedRaw: rawCandidates.length,
-      matchedDeduped: candidates.length,
-      daysBack: options.daysBack,
-      maxMessages: options.maxMessages,
+      screenedIn: screenedIn.length,
+      fullFetched: fullFetched.filter(Boolean).length,
+      rawMatched: rawCandidates.length,
+      matched: candidates.length,
+      daysBack,
+      maxMessages,
     },
     nextCursor: pageToken,
   };

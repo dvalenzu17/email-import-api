@@ -1,6 +1,7 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { buildCandidate } from "./detect.js";
+import { buildCandidate, aggregateCandidates } from "./detect.js";
+import { getMerchantDirectoryCached, getUserOverrides } from "./merchantData.js";
 
 export async function verifyImapConnection({ provider, imap, auth }) {
   const client = new ImapFlow({
@@ -26,7 +27,7 @@ export async function verifyImapConnection({ provider, imap, auth }) {
   }
 }
 
-export async function scanImap({ provider, imap, auth, options, context }) {
+export async function scanImap({ provider, imap, auth, options, userId }) {
   const client = new ImapFlow({
     host: imap.host,
     port: imap.port,
@@ -38,6 +39,9 @@ export async function scanImap({ provider, imap, auth, options, context }) {
   const since = new Date(Date.now() - options.daysBack * 24 * 3600 * 1000);
   const startAfterUid = decodeCursor(options.cursor);
 
+  const directory = await getMerchantDirectoryCached();
+  const overrides = userId ? await getUserOverrides(userId) : [];
+
   await client.connect();
   try {
     const lock = await client.getMailboxLock("INBOX");
@@ -48,13 +52,13 @@ export async function scanImap({ provider, imap, auth, options, context }) {
       uids.sort((a, b) => a - b);
       if (startAfterUid) uids = uids.filter((u) => u > startAfterUid);
 
-      const candidates = [];
+      const raw = [];
       let scanned = 0;
+      let fullFetched = 0;
       let lastProcessedUid;
 
       for (const uid of uids) {
         if (scanned >= options.maxMessages) break;
-        if (candidates.length >= options.maxCandidates) break;
 
         const header = await client.fetchOne(uid, { envelope: true, internalDate: true, uid: true });
         const subject = header.envelope?.subject ?? "";
@@ -62,40 +66,53 @@ export async function scanImap({ provider, imap, auth, options, context }) {
           ? formatAddress(header.envelope.from[0].name, header.envelope.from[0].address)
           : "";
 
-        if (!looksPromising(subject, from)) {
+        // Conservative but not blind: always pull full for non-bulk-ish subjects
+        // (IMAP doesn’t easily give list-unsub without full, so we keep it simple)
+        const looksMarketing = /(promo|newsletter|offer|discount|sale|recommended|update)/i.test(`${subject} ${from}`);
+        if (looksMarketing) {
           scanned += 1;
           lastProcessedUid = uid;
           continue;
         }
 
         const full = await client.fetchOne(uid, { envelope: true, internalDate: true, uid: true, source: true });
-        const msgDate = full.internalDate instanceof Date ? full.internalDate : new Date();
+        fullFetched += 1;
 
+        const msgDate = full.internalDate instanceof Date ? full.internalDate : new Date();
         const parsed = await simpleParser(full.source);
 
-        const candidate = buildCandidate({
-          from: from || parsed.from?.text || "",
-          subject: subject || parsed.subject || "",
-          date: msgDate,
-          text: parsed.text,
-          html: typeof parsed.html === "string" ? parsed.html : null,
-          directory: context?.directory,
-          overrides: context?.overrides,
-          knownSubs: context?.knownSubs,
-        });
+        const headerMap = {};
+        for (const [k, v] of parsed.headers || []) headerMap[String(k).toLowerCase()] = String(v || "");
+
+        const candidate = buildCandidate(
+          {
+            from: from || parsed.from?.text || "",
+            replyTo: parsed.replyTo?.text || "",
+            returnPath: headerMap["return-path"] || "",
+            subject: subject || parsed.subject || "",
+            snippet: "",
+            text: parsed.text || "",
+            html: typeof parsed.html === "string" ? parsed.html : "",
+            headerMap,
+            dateMs: msgDate.getTime(),
+          },
+          { directory, overrides }
+        );
 
         scanned += 1;
         lastProcessedUid = uid;
 
-        if (candidate) candidates.push(candidate);
+        if (candidate) raw.push(candidate);
       }
+
+      const candidates = aggregateCandidates(raw, options.maxCandidates || 60);
 
       const nextCursor =
         lastProcessedUid && lastProcessedUid < (uids.at(-1) ?? 0) ? encodeCursor(lastProcessedUid) : undefined;
 
       return {
         candidates,
-        stats: { scanned, matched: candidates.length },
+        stats: { scanned, fullFetched, rawMatched: raw.length, matched: candidates.length },
         nextCursor,
       };
     } finally {
@@ -104,11 +121,6 @@ export async function scanImap({ provider, imap, auth, options, context }) {
   } finally {
     await safeLogout(client);
   }
-}
-
-function looksPromising(subject, from) {
-  const s = `${subject} ${from}`.toLowerCase();
-  return /receipt|invoice|payment|charged|subscription|renewal|trial|membership|billing|plan|welcome|confirmation|valid until/.test(s);
 }
 
 function formatAddress(name, address) {
@@ -141,8 +153,6 @@ async function safeLogout(client) {
   } catch {
     try {
       await client.close();
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 }

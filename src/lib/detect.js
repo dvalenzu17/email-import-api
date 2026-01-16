@@ -1,414 +1,527 @@
-// src/lib/detect.js
-import crypto from "node:crypto";
-import { htmlToText } from "html-to-text";
-import * as chrono from "chrono-node";
-import { resolveMerchantFromSender } from "./merchantResolver.js";
+// lib/detect.js
+// Detection engine: conservative + explainable + open-world.
 
-const MERCHANT_HINTS = [
-  { name: "Netflix", domains: ["netflix.com"], keywords: ["netflix"] },
-  { name: "Uber One", domains: ["uber.com"], keywords: ["uber one", "uberone", "uber"] },
-  { name: "Spotify", domains: ["spotify.com"], keywords: ["spotify"] },
-  { name: "Apple", domains: ["apple.com", "icloud.com"], keywords: ["apple", "icloud"] },
-  { name: "Google", domains: ["google.com"], keywords: ["google", "youtube"] },
-  { name: "Amazon", domains: ["amazon.com"], keywords: ["amazon", "prime"] },
-  { name: "Microsoft", domains: ["microsoft.com"], keywords: ["microsoft", "xbox", "office 365"] },
-  { name: "Adobe", domains: ["adobe.com"], keywords: ["adobe", "creative cloud"] },
-  { name: "Dropbox", domains: ["dropbox.com"], keywords: ["dropbox"] },
-  { name: "Disney+", domains: ["disneyplus.com", "disney.com"], keywords: ["disney+"] },
-  { name: "LinkedIn", domains: ["linkedin.com"], keywords: ["linkedin"] },
-];
+import { resolveMerchant } from "./merchantResolver.js";
 
-const SUBJECT_KEYWORDS = [
-  "receipt",
-  "invoice",
-  "payment",
-  "charged",
-  "subscription",
-  "renewal",
-  "trial",
-  "membership",
-  "plan",
-  "billing",
-  "confirmation",
-  "expires",
-  "expiring",
-];
-
-const BODY_KEYWORDS = [
-  "renews",
-  "renewal date",
-  "next billing date",
-  "billed",
-  "trial ends",
-  "payment was successful",
-  "valid until",
-  "renewal price",
-  "subscription confirmed",
-  "subscription expiring",
-  "your subscription",
-];
-
-const WELCOME_KEYWORDS = ["welcome", "thanks for joining", "start watching", "your account information"];
-
-export function buildCandidate({ from, subject, date, text, html, directory, overrides, knownSubs }) {
-  const plainOriginal = normalizeText(text ?? "") || normalizeText(htmlToTextSafe(html ?? ""));
-  const haystackOriginal = `${subject}\n${from}\n${plainOriginal}`.trim();
-  const haystack = haystackOriginal.toLowerCase();
-
-  // Sender resolution (directory + user overrides)
-  const senderHit = resolveMerchantFromSender({ from, directory, overrides });
-
-  // Apple subscription / receipt parsing (merchant extraction)
-  const apple = parseAppleSubscription({ from, subject, text: haystackOriginal, messageDate: date });
-
-  // fallback merchant guessing
-  const guessed = guessMerchant({ from, subject, text: plainOriginal });
-
-  // Canonical merchant selection order
-  const merchant =
-    senderHit.canonicalName ??
-    apple?.merchant ??
-    guessed ??
-    "Unknown merchant";
-
-  const subjectLower = String(subject || "").toLowerCase();
-  const subjectSignal = SUBJECT_KEYWORDS.some((k) => subjectLower.includes(k));
-  const bodySignal = BODY_KEYWORDS.some((k) => haystack.includes(k));
-
-  const isWelcomeLike =
-    merchant !== "Unknown merchant" &&
-    WELCOME_KEYWORDS.some((k) => haystack.includes(k));
-
-  const hasSignal = subjectSignal || bodySignal || isWelcomeLike;
-  if (!hasSignal) return null;
-
-  const amountInfo = apple?.amountInfo ?? extractAmount(haystackOriginal);
-  const cadence = apple?.cadence ?? guessCadence(haystack);
-  const nextDate = apple?.nextDate ?? guessNextDate({ haystack: haystackOriginal, messageDate: date });
-
-  // --- Confidence signals (deterministic) ---
-  const keywordMatch = !!guessed && guessed !== "Unknown merchant";
-  const pastAmountMatch = matchesPastAmount({ knownSubs, merchant, amount: amountInfo?.amount });
-  const cadenceMatch = matchesPastCadence({ knownSubs, merchant, cadence });
-
-  const conflict =
-    !!senderHit.canonicalName &&
-    !!guessed &&
-    senderHit.canonicalName.toLowerCase() !== guessed.toLowerCase() &&
-    guessed !== "Unknown merchant";
-
-  const confidence = computeConfidence({
-    senderMatchType: senderHit.matchType,
-    keywordMatch,
-    pastAmountMatch: !!pastAmountMatch,
-    cadenceMatch: !!cadenceMatch,
-    conflict: !!conflict,
-
-    // new real signals so unknown merchants can pass
-    subjectSignal: !!subjectSignal,
-    bodySignal: !!bodySignal,
-    hasAmount: !!(amountInfo && Number.isFinite(Number(amountInfo.amount))),
-    hasCadence: !!cadence,
-    hasNextDate: !!nextDate,
-    isAppleExtracted: !!apple?.merchant && apple?.merchant !== "Apple",
-  });
-
-  const confidenceLabel = labelConfidence(confidence);
-
-  // Floors: welcome emails can be lower, unknown merchants can be medium if signals are strong
-  const isUnknown = String(merchant).toLowerCase() === "unknown merchant";
-  const floor = isWelcomeLike ? 30 : (isUnknown ? 35 : 40);
-  if (confidence < floor) return null;
-
-  const fingerprint = makeFingerprint({ from, subject, amount: amountInfo?.amount, merchant, date });
-
-  return {
-    fingerprint,
-    merchant,
-    amount: amountInfo?.amount,
-    currency: amountInfo?.currency,
-    cadenceGuess: cadence,
-    nextDateGuess: nextDate,
-    confidence,
-    confidenceLabel,
-    confidenceSignals: {
-      senderMatchType: senderHit.matchType,
-      keywordMatch,
-      pastAmountMatch: !!pastAmountMatch,
-      cadenceMatch: !!cadenceMatch,
-      conflict: !!conflict,
-      subjectSignal: !!subjectSignal,
-      bodySignal: !!bodySignal,
-      hasAmount: !!(amountInfo && Number.isFinite(Number(amountInfo.amount))),
-      hasCadence: !!cadence,
-      hasNextDate: !!nextDate,
-      isAppleExtracted: !!apple?.merchant && apple?.merchant !== "Apple",
-    },
-    evidence: {
-      from: compact(from),
-      subject: compact(subject),
-      date: date.toISOString(),
-    },
-  };
+// ---------- text helpers ----------
+function normalizeTextForParsing(input) {
+  return (input || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[\t\r]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
-// ---------------- Confidence model ----------------
-
-function computeConfidence({
-  senderMatchType,
-  keywordMatch,
-  pastAmountMatch,
-  cadenceMatch,
-  conflict,
-  subjectSignal,
-  bodySignal,
-  hasAmount,
-  hasCadence,
-  hasNextDate,
-  isAppleExtracted,
-}) {
-  let score = 0;
-
-  // Sender directory / overrides
-  if (senderMatchType === "override_email" || senderMatchType === "directory_email") score += 40;
-  if (senderMatchType === "override_domain" || senderMatchType === "directory_domain") score += 25;
-
-  // Merchant hints / keyword guess
-  if (keywordMatch) score += 20;
-
-  // Real "this looks like a subscription" evidence
-  if (subjectSignal) score += 10;
-  if (bodySignal) score += 10;
-  if (hasAmount) score += 15;
-  if (hasNextDate) score += 15;
-  if (hasCadence) score += 10;
-
-  // Apple subscription emails: extracting the real app is strong signal
-  if (isAppleExtracted) score += 15;
-
-  // Behavioral confidence (optional)
-  if (pastAmountMatch) score += 10;
-  if (cadenceMatch) score += 10;
-
-  if (conflict) score -= 30;
-
-  return clamp(score, 0, 100);
+function safeLower(s) {
+  return (s || "").toString().toLowerCase();
 }
 
-function labelConfidence(score) {
-  if (score >= 80) return "High";
-  if (score >= 50) return "Medium";
-  return "Low";
-}
-
-function matchesPastAmount({ knownSubs, merchant, amount }) {
-  if (!amount || !Number.isFinite(Number(amount))) return false;
-  const a = Number(amount);
-  const m = String(merchant || "").trim().toLowerCase();
-  if (!m || m === "unknown merchant") return false;
-
-  for (const row of knownSubs || []) {
-    const rm = String(row.merchant || "").trim().toLowerCase();
-    if (!rm) continue;
-    if (rm !== m) continue;
-
-    const ra = Number(row.amount ?? 0);
-    if (!Number.isFinite(ra)) continue;
-
-    if (Math.abs(ra - a) <= 0.05) return true;
-    const denom = Math.max(ra, a, 1);
-    if (Math.abs(ra - a) / denom <= 0.02) return true;
-  }
-
-  return false;
-}
-
-function matchesPastCadence({ knownSubs, merchant, cadence }) {
-  const c = String(cadence || "").trim().toLowerCase();
-  const m = String(merchant || "").trim().toLowerCase();
-  if (!c || !m || m === "unknown merchant") return false;
-
-  for (const row of knownSubs || []) {
-    const rm = String(row.merchant || "").trim().toLowerCase();
-    const rc = String(row.cadence || "").trim().toLowerCase();
-    if (rm === m && rc && rc === c) return true;
-  }
-
-  return false;
-}
-
-// ---------------- Apple parsing ----------------
-
-function parseAppleSubscription({ from, subject, text, messageDate }) {
-  const fromLower = String(from || "").toLowerCase();
-  const subjLower = String(subject || "").toLowerCase();
-
-  const looksAppleSender = fromLower.includes("email.apple.com") || fromLower.includes("apple.com");
-  const looksAppleSub = subjLower.includes("subscription") || String(text || "").toLowerCase().includes("subscription");
-
-  if (!looksAppleSender || !looksAppleSub) return null;
-
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  let appName = null;
-
-  for (const l of lines) {
-    const m = l.match(/^App\s*[:\-]\s*(.+)$/i);
-    if (m?.[1]) {
-      appName = m[1].trim();
-      break;
-    }
-  }
-
-  if (!appName) {
-    for (const l of lines.slice(0, 50)) {
-      if (/subscription confirmed|subscription expiring|dear\s/i.test(l)) continue;
-      if (l.length < 3 || l.length > 80) continue;
-      if (/^apple$/i.test(l)) continue;
-      if (/^[a-z0-9][a-z0-9 &:+\-'.()]{2,}$/i.test(l)) {
-        appName = l.trim();
-        break;
-      }
-    }
-  }
-
-  const merchant = canonicalizeAppleAppName(appName);
-  if (!merchant) return null;
-
-  const amt = extractAmount(String(text || ""));
-  const cadence = guessCadence(String(text || "").toLowerCase()) || (String(text || "").includes("/month") ? "monthly" : undefined);
-  const nextDate = guessNextDate({ haystack: String(text || ""), messageDate });
-
-  return { merchant, amountInfo: amt, cadence, nextDate };
-}
-
-function canonicalizeAppleAppName(appName) {
-  const raw = String(appName || "").trim();
-  if (!raw) return null;
-  const cut = raw.split(":")[0].trim();
-  if (cut && cut.length <= 40) return cut;
-  return raw;
-}
-
-// ---------------- Helpers ----------------
-
-function htmlToTextSafe(html) {
-  if (!html) return "";
-  try {
-    return htmlToText(html, {
-      wordwrap: 120,
-      selectors: [{ selector: "a", options: { ignoreHref: true } }],
-    });
-  } catch {
-    return "";
-  }
-}
-
-function normalizeText(s) {
-  return String(s).replace(/\s+/g, " ").trim();
-}
-function compact(s) {
-  return String(s).replace(/\s+/g, " ").trim().slice(0, 180);
-}
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function domainFromFromHeader(from) {
-  const m = String(from || "").match(/<([^>]+)>/);
-  const addr = (m?.[1] ?? from ?? "").trim();
-  const at = addr.lastIndexOf("@");
-  if (at === -1) return null;
-  return addr.slice(at + 1).toLowerCase();
+// ---------- link domain extraction (adds intelligence without hardcoding) ----------
+function extractLinkDomains({ text = "", html = "" }) {
+  const domains = new Set();
+  const scan = `${text}\n${html}`;
+  const urls = scan.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+  for (const u of urls.slice(0, 200)) {
+    try {
+      const host = new URL(u).hostname;
+      if (host) domains.add(host.toLowerCase());
+    } catch {}
+  }
+  return [...domains];
 }
 
-function guessMerchant({ from, subject, text }) {
-  const fromLower = String(from || "").toLowerCase();
-  const subjectLower = String(subject || "").toLowerCase();
-  const textLower = String(text || "").toLowerCase();
-  const domain = domainFromFromHeader(from);
+// ---------- marketing vs transactional classifier ----------
+const POSITIVE_SIGNAL_PHRASES = [
+  "payment successful",
+  "payment was successful",
+  "we charged",
+  "you were charged",
+  "has been charged",
+  "charged to",
+  "invoice",
+  "receipt",
+  "tax invoice",
+  "order confirmation",
+  "purchase confirmed",
+  "subscription renewed",
+  "will renew",
+  "renews on",
+  "next billing date",
+  "billing date",
+  "amount due",
+  "you paid",
+  "total",
+  "trial ends",
+  "subscription confirmed",
+  "expires on",
+  "expiring",
+];
 
-  for (const hint of MERCHANT_HINTS) {
-    if (domain && hint.domains.some((d) => domain.endsWith(d))) return hint.name;
-    if (hint.keywords.some((k) => fromLower.includes(k))) return hint.name;
-    if (hint.keywords.some((k) => subjectLower.includes(k))) return hint.name;
-    if (hint.keywords.some((k) => textLower.includes(k))) return hint.name;
+const NEGATIVE_SIGNAL_PHRASES = [
+  "newsletter",
+  "promo",
+  "promotion",
+  "offer",
+  "sale",
+  "discount",
+  "limited time",
+  "recommended",
+  "suggested",
+  "restaurants everyone is loving",
+  "new features",
+  "update",
+];
+
+function headerIsBulk(headerMap = {}) {
+  const h = {};
+  for (const [k, v] of Object.entries(headerMap)) h[safeLower(k)] = String(v || "");
+  const precedence = safeLower(h["precedence"] || "");
+  const autoSubmitted = safeLower(h["auto-submitted"] || "");
+  const listId = safeLower(h["list-id"] || "");
+  const listUnsub = safeLower(h["list-unsubscribe"] || "");
+  const bulk = precedence.includes("bulk") || precedence.includes("list") || precedence.includes("junk");
+  const auto = autoSubmitted.includes("auto-generated") || autoSubmitted.includes("auto-replied");
+  const hasList = !!(listId || listUnsub);
+  return bulk || auto || hasList;
+}
+
+function classifyEmail({ subject = "", text = "", snippet = "", headerMap = {}, fromDomain = "" }) {
+  const s = safeLower(`${subject}\n${snippet}\n${text}`);
+
+  const pos = POSITIVE_SIGNAL_PHRASES.reduce((n, p) => (s.includes(p) ? n + 1 : n), 0);
+  const neg = NEGATIVE_SIGNAL_PHRASES.reduce((n, p) => (s.includes(p) ? n + 1 : n), 0);
+
+  const isApple = /(^|\.)apple\.com$/.test(fromDomain) || fromDomain.includes("apple.com");
+  const appleReceiptHint = isApple && /(subscription|purchase confirmed|your receipt|app store|itunes)/i.test(s);
+
+  const bulkHeader = headerIsBulk(headerMap);
+
+  // marketing heavy when: bulk + negative + weak/no receipt language
+  const marketingHeavy = bulkHeader && neg >= 1 && pos === 0 && !appleReceiptHint;
+
+  // transactional when we have enough positives or explicit Apple receipt hint
+  const likelyTransactional = appleReceiptHint || pos >= 2 || /(invoice|receipt|charged|payment|subscription renewed)/i.test(s);
+
+  return {
+    appleReceiptHint,
+    bulkHeader,
+    marketingHeavy,
+    likelyTransactional,
+    pos,
+    neg,
+  };
+}
+
+// ---------- money parsing ----------
+const CURRENCY_SYMBOLS = {
+  "$": "USD",
+  "€": "EUR",
+  "£": "GBP",
+  "¥": "JPY",
+  "₩": "KRW",
+  "₹": "INR",
+  "R$": "BRL",
+  "C$": "CAD",
+  "A$": "AUD",
+};
+
+function parseMoney(raw) {
+  const str = normalizeTextForParsing(raw);
+  const m = str.match(
+    /(US\$|C\$|A\$|R\$|\$|€|£|¥|₩|₹)?\s*(USD|EUR|GBP|JPY|KRW|INR|BRL|CAD|AUD)?\s*([0-9]{1,3}(?:[.,\s][0-9]{3})*(?:[.,][0-9]{2})|[0-9]+(?:[.,][0-9]{2}))\s*(USD|EUR|GBP|JPY|KRW|INR|BRL|CAD|AUD)?\s*(US\$|C\$|A\$|R\$|\$|€|£|¥|₩|₹)?/i
+  );
+  if (!m) return null;
+
+  const sym1 = m[1];
+  const code1 = m[2];
+  const number = m[3];
+  const code2 = m[4];
+  const sym2 = m[5];
+
+  const currency = (code1 || code2 || (sym1 && CURRENCY_SYMBOLS[sym1]) || (sym2 && CURRENCY_SYMBOLS[sym2]) || "USD").toUpperCase();
+
+  let n = number.replace(/\s/g, "");
+  const lastComma = n.lastIndexOf(",");
+  const lastDot = n.lastIndexOf(".");
+  const decimalSep = lastComma > lastDot ? "," : ".";
+  if (decimalSep === ",") n = n.replace(/\./g, "").replace(/,/g, ".");
+  else n = n.replace(/,/g, "");
+
+  const amount = Number.parseFloat(n);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  return { amount, currency };
+}
+
+function extractAmount({ subject = "", text = "", html = "" }) {
+  const haystack = `${subject}\n${text}\n${html}`;
+
+  // prioritize total/charged lines
+  const totalLine = haystack.match(/\b(total|amount due|you paid|charged)\b[^\n]{0,80}/i);
+  if (totalLine) {
+    const parsed = parseMoney(totalLine[0]);
+    if (parsed) return parsed;
   }
 
-  const display = String(from || "").split("<")[0].trim();
-  if (display && display.length <= 40 && !/no-?reply|notification|billing/i.test(display)) return display;
+  const moneyMatches = haystack.match(
+    /(US\$|C\$|A\$|R\$|\$|€|£|¥|₩|₹)?\s*(USD|EUR|GBP|JPY|KRW|INR|BRL|CAD|AUD)?\s*[0-9]{1,3}(?:[.,\s][0-9]{3})*(?:[.,][0-9]{2})\s*(USD|EUR|GBP|JPY|KRW|INR|BRL|CAD|AUD)?/gi
+  );
+  if (!moneyMatches) return null;
+
+  // keep it conservative: only accept amounts near billing-ish keywords
+  const keywords = /(total|charged|you paid|amount due|payment|invoice|receipt|renewal|subscription)/i;
+  for (const raw of moneyMatches.slice(0, 20)) {
+    const idx = haystack.toLowerCase().indexOf(raw.toLowerCase());
+    const window = haystack.slice(Math.max(0, idx - 60), idx + raw.length + 60);
+    if (!keywords.test(window)) continue;
+
+    const parsed = parseMoney(raw);
+    if (parsed) return parsed;
+  }
 
   return null;
 }
 
-function extractAmount(text) {
-  const s = String(text || "");
-  const lines = s.split(/\n|\r/).slice(0, 250);
-  const targetLines = lines
-    .filter((l) => /(total|amount|charged|payment|paid|price|plan|renewal price)/i.test(l))
-    .concat(lines);
+// ---------- cadence + dates ----------
+function extractCadence({ subject = "", text = "", html = "" }, inferredCadence = null) {
+  const s = safeLower(`${subject}\n${text}\n${html}`);
 
-  for (const line of targetLines) {
-    const hit = matchCurrencyAmount(line);
-    if (hit) return hit;
+  if (/\bweekly\b|\bper week\b|\/week|\bwk\b/.test(s)) return "weekly";
+  if (/\bmonthly\b|\bper month\b|\/mo\b|\/month\b/.test(s)) return "monthly";
+  if (/\bquarterly\b|\bper quarter\b/.test(s)) return "quarterly";
+  if (/\byearly\b|\bannual\b|\bannually\b|\bper year\b|\/year\b/.test(s)) return "yearly";
+
+  return inferredCadence;
+}
+
+function extractNextRenewal({ subject = "", text = "", html = "" }) {
+  const s = `${subject}\n${text}\n${html}`;
+
+  const iso = s.match(/\b(20\d{2})-(0\d|1[0-2])-(0\d|[12]\d|3[01])\b/);
+  if (iso) return iso[0];
+
+  const month = s.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+([0-3]?\d),\s*(20\d{2})\b/i);
+  if (month) {
+    const [_, mon, day, year] = month;
+    const mm =
+      { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" }[
+        mon.toLowerCase().slice(0, 3)
+      ];
+    const dd = String(day).padStart(2, "0");
+    return `${year}-${mm}-${dd}`;
   }
+
   return null;
 }
 
-function matchCurrencyAmount(s) {
-  const usd = String(s).match(/(?:US\$\s?|\$|usd\s?)(\d{1,6}(?:[\.,]\d{2})?)/i);
-  if (usd) {
-    const amount = parseFloat(usd[1].replace(",", "."));
-    if (Number.isFinite(amount) && amount > 0 && amount < 100000) return { amount, currency: "USD" };
-  }
-  const eur = String(s).match(/(?:€|eur\s?)(\d{1,6}(?:[\.,]\d{2})?)/i);
-  if (eur) {
-    const amount = parseFloat(eur[1].replace(",", "."));
-    if (Number.isFinite(amount) && amount > 0 && amount < 100000) return { amount, currency: "EUR" };
-  }
+function inferCadenceFromDates(dates) {
+  if (!dates || dates.length < 2) return null;
+  const sorted = [...dates].sort((a, b) => a - b);
+  const diffs = [];
+  for (let i = 1; i < sorted.length; i++) diffs.push(sorted[i] - sorted[i - 1]);
+  diffs.sort((a, b) => a - b);
+  const median = diffs[Math.floor(diffs.length / 2)];
+  const days = median / (1000 * 60 * 60 * 24);
+
+  if (days >= 6 && days <= 8) return "weekly";
+  if (days >= 25 && days <= 35) return "monthly";
+  if (days >= 80 && days <= 100) return "quarterly";
+  if (days >= 330 && days <= 400) return "yearly";
   return null;
 }
 
-function guessCadence(text) {
-  const t = String(text || "");
-  if (/\bweekly\b|every week|per week/i.test(t)) return "weekly";
-  if (/\bquarterly\b|every 3 months|per quarter/i.test(t)) return "quarterly";
-  if (/\bannual\b|\byearly\b|per year|every year|\/year/i.test(t)) return "yearly";
-  if (/\bmonthly\b|per month|every month|\/month/i.test(t)) return "monthly";
-  return undefined;
+// ---------- plan/product extraction (reduces “Subscription” generic junk) ----------
+function extractPlan({ subject = "", text = "" }) {
+  const s = normalizeTextForParsing(`${subject}\n${text}`);
+
+  // patterns across a bunch of receipts
+  const p1 = s.match(/\b(Plan|Membership|Subscription)\b\s*[:\-]\s*([^\n]{2,80})/i);
+  if (p1?.[2]) return p1[2].trim();
+
+  // apple reminders often show: “LinkedIn Premium (Monthly)” etc
+  const p2 = s.match(/\b([A-Z][A-Za-z0-9+&()'’.\- ]{2,60})\s*\((Monthly|Yearly|Annual|Weekly)\)/);
+  if (p2?.[0]) return p2[0].trim();
+
+  return null;
 }
 
-function guessNextDate({ haystack, messageDate }) {
-  const h = String(haystack || "");
-  const idx = h.search(/renews|renewal date|next billing date|billed on|trial ends|valid until|starting|expires|expiring/i);
-  const focus = idx >= 0 ? h.slice(idx, Math.min(h.length, idx + 900)) : h.slice(0, 1000);
+// ---------- platform receipts: extract real merchant when sender is aggregator ----------
+function extractAppleLineItemMerchant({ subject = "", text = "", html = "" }) {
+  const s = normalizeTextForParsing(`${subject}\n${text}`);
 
-  const parsed = chrono.parse(focus, messageDate);
-  if (!parsed.length) return undefined;
+  const app = s.match(/\bApp\b\s*[:\-]?\s*([^\n]{2,80})/i);
+  const sub = s.match(/\bSubscription\b\s*[:\-]?\s*([^\n]{2,80})/i);
+  const provider = s.match(/\b(Content Provider|Developer)\b\s*[:\-]?\s*([^\n]{2,80})/i);
 
-  const now = new Date();
-  const future = parsed
-    .map((c) => c.start?.date())
-    .filter((d) => d instanceof Date)
-    .filter((d) => d.getTime() >= now.getTime() - 24 * 3600 * 1000)
-    .filter((d) => d.getTime() <= now.getTime() + 400 * 24 * 3600 * 1000)
-    .sort((a, b) => a.getTime() - b.getTime());
+  const candidate = (app && app[1]) || (sub && sub[1]) || (provider && provider[2]);
+  if (!candidate) return null;
 
-  if (!future.length) return undefined;
-  return toISODate(future[0]);
+  return candidate
+    .replace(/\s{2,}.+$/, "")
+    .replace(/\b(total|tax|vat)\b.+$/i, "")
+    .trim();
 }
 
-function toISODate(d) {
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function extractPayPalMerchant({ subject = "", text = "" }) {
+  const s = normalizeTextForParsing(`${subject}\n${text}`);
+
+  // examples: “You paid $X USD to MERCHANT”
+  const m1 = s.match(/\byou paid\b[^\n]{0,80}\bto\b\s*([^\n]{2,80})/i);
+  if (m1?.[1]) return m1[1].trim();
+
+  // “Receipt for MERCHANT”
+  const m2 = s.match(/\breceipt for\b\s*([^\n]{2,80})/i);
+  if (m2?.[1]) return m2[1].trim();
+
+  return null;
 }
 
-function makeFingerprint({ from, subject, merchant, amount, date }) {
-  const base = `${merchant}|${from}|${subject}|${amount ?? ""}|${toISODate(date)}`;
-  return crypto.createHash("sha256").update(base).digest("hex").slice(0, 24);
+function extractGooglePlayMerchant({ subject = "", text = "" }) {
+  const s = normalizeTextForParsing(`${subject}\n${text}`);
+
+  // “Your Google Play subscription to X”
+  const m1 = s.match(/\b(subscription|subscribed)\b[^\n]{0,40}\bto\b\s*([^\n]{2,80})/i);
+  if (m1?.[2]) return m1[2].trim();
+
+  // “Item: X” sometimes works
+  const m2 = s.match(/\bItem\b\s*[:\-]\s*([^\n]{2,80})/i);
+  if (m2?.[1]) return m2[1].trim();
+
+  return null;
+}
+
+// ---------- quick screen (used before fetching full bodies) ----------
+export function quickScreenMessage(message) {
+  const subject = message.subject || "";
+  const snippet = message.snippet || "";
+  const from = message.from || "";
+
+  const headerMap = message.headerMap || {};
+  const fromDomain = (from.match(/@([^>\s]+)/)?.[1] || "").toLowerCase();
+
+  const c = classifyEmail({ subject, snippet, text: "", headerMap, fromDomain });
+
+  // if bulk+marketing and no transactional hints: hard skip
+  if (c.marketingHeavy && !c.likelyTransactional) {
+    return { ok: false, reason: "marketing_heavy" };
+  }
+
+  // if it has transactional hints, keep it
+  if (c.likelyTransactional) return { ok: true, reason: "transactional_hint" };
+
+  // otherwise: keep only if subject has any money/billing keyword
+  if (/(receipt|invoice|charged|payment|renew|subscription|trial ends|expires)/i.test(subject)) {
+    return { ok: true, reason: "subject_hint" };
+  }
+
+  return { ok: false, reason: "weak_signal" };
+}
+
+// ---------- aggregation (dedupe + cadence inference + confidence smoothing) ----------
+export function aggregateCandidates(rawCandidates, maxCandidates = 50) {
+  const groups = new Map();
+
+  for (const c of rawCandidates) {
+    const merchantKey = safeLower(c.merchant || "unknown");
+    const planKey = safeLower(c.plan || "");
+    const amountKey = c.amount ? String(Math.round(c.amount * 100) / 100) : "";
+    const key = `${merchantKey}|${planKey}|${c.currency || ""}|${amountKey}`;
+
+    if (!groups.has(key)) groups.set(key, { best: c, dates: [], evidence: [] });
+
+    const g = groups.get(key);
+    if (c._evidence?.dateMs) g.dates.push(c._evidence.dateMs);
+    g.evidence.push(c);
+    if ((c.confidence || 0) > (g.best.confidence || 0)) g.best = c;
+  }
+
+  const out = [];
+  for (const { best, dates, evidence } of groups.values()) {
+    const inferredCadence = inferCadenceFromDates(dates);
+    const merged = { ...best };
+
+    merged.cadence = merged.cadence || inferredCadence || null;
+
+    if (!merged.nextRenewal) {
+      const nr = evidence.map((e) => e.nextRenewal).filter(Boolean).sort()[0];
+      if (nr) merged.nextRenewal = nr;
+    }
+
+    merged.eventCount = evidence.length;
+
+    // boost confidence if we saw repeat billing events (real subscription evidence)
+    if (dates.length >= 2 && inferredCadence) {
+      merged.confidence = clamp((merged.confidence || 0) + 10, 0, 100);
+      merged.reason = [...(merged.reason || []), `Cadence inferred from ${dates.length} emails`];
+    }
+
+    // if it's a one-off purchase with weak cadence and no renewal -> cap confidence
+    if (dates.length <= 1 && !merged.nextRenewal && !merged.cadence) {
+      merged.confidence = Math.min(merged.confidence || 0, 70);
+      merged.reason = [...(merged.reason || []), "Single email evidence (capped confidence)"];
+    }
+
+    delete merged._evidence;
+    out.push(merged);
+  }
+
+  out.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  return out.slice(0, maxCandidates);
+}
+
+// ---------- public: buildCandidate ----------
+export function buildCandidate(message, context) {
+  const directory = context?.directory || [];
+  const overrides = context?.overrides || [];
+
+  const subject = message.subject || "";
+  const text = message.text || "";
+  const html = message.html || "";
+  const snippet = message.snippet || "";
+
+  const from = message.from || "";
+  const replyTo = message.replyTo || "";
+  const returnPath = message.returnPath || "";
+  const headerMap = message.headerMap || {};
+  const dateMs = message.dateMs || null;
+
+  const linkDomains = message.linkDomains || extractLinkDomains({ text, html });
+
+  const haystack = `${subject}\n${text}\n${snippet}`.slice(0, 20000);
+
+  const resolved = resolveMerchant({
+    email: { from, replyTo, returnPath, headerMap, linkDomains },
+    directory,
+    overrides,
+    haystack,
+  });
+
+  const classifier = classifyEmail({
+    subject,
+    text: `${snippet}\n${text}`,
+    snippet,
+    headerMap,
+    fromDomain: resolved.fromDomain || "",
+  });
+
+  // HARD SKIP: marketing heavy with no transactional evidence
+  if (classifier.marketingHeavy && !classifier.likelyTransactional) return null;
+
+  // platform/aggregator logic: Apple/PayPal/GooglePlay -> extract real merchant
+  let merchant = resolved.canonical || null;
+  const fromDomain = resolved.fromDomain || "";
+
+  const isAppleSender = /(^|\.)apple\.com$/.test(fromDomain) || fromDomain.includes("apple.com");
+  const isPayPalSender = fromDomain.includes("paypal.com");
+  const isGooglePlaySender = fromDomain.includes("google.com") || fromDomain.includes("googleplay");
+
+  let platformExtract = null;
+  if (isAppleSender || classifier.appleReceiptHint) platformExtract = extractAppleLineItemMerchant({ subject, text, html });
+  else if (isPayPalSender) platformExtract = extractPayPalMerchant({ subject, text });
+  else if (isGooglePlaySender) platformExtract = extractGooglePlayMerchant({ subject, text });
+
+  if (platformExtract && platformExtract.length >= 2) {
+    merchant = platformExtract;
+  }
+
+  // require a merchant for non-trials; else ignore
+  const isTrial = /\btrial\b/i.test(`${subject}\n${text}`) && !/extend your trial/i.test(`${subject}\n${text}`);
+  if (!merchant && !isTrial) return null;
+
+  const money = extractAmount({ subject, text, html });
+  const amount = money?.amount ?? null;
+  const currency = money?.currency ?? "USD";
+
+  const nextRenewal = extractNextRenewal({ subject, text, html });
+  const plan = extractPlan({ subject, text });
+
+  // cadence is ONLY accepted if we have strong evidence
+  let cadence = extractCadence({ subject, text, html });
+
+  // evidence type
+  const evidenceType =
+    isTrial ? "trial" :
+    classifier.appleReceiptHint ? "platform_receipt" :
+    classifier.likelyTransactional ? "transactional" :
+    "unknown";
+
+  // Confidence: deterministic with ceilings to avoid fake certainty
+  let confidence = 0;
+  const reason = [];
+
+  // core merchant confidence from resolver
+  confidence += Math.min(60, resolved.confidence || 0);
+  if (resolved.reason) reason.push(`Resolver: ${resolved.reason}`);
+
+  // content signals
+  if (classifier.likelyTransactional) {
+    confidence += 12;
+    reason.push("Transactional language");
+  }
+  if (classifier.bulkHeader) {
+    confidence -= 10;
+    reason.push("Bulk/list header detected");
+  }
+  if (resolved.signals?.personalSenderDomain) {
+    confidence -= 15;
+    reason.push("Sender domain looks consumer");
+  }
+  if (platformExtract) {
+    confidence += 10;
+    reason.push("Extracted merchant from platform email");
+  }
+
+  // amount is strong, but only if transactional-ish
+  if (amount && classifier.likelyTransactional) {
+    confidence += 10;
+    reason.push("Found amount near billing keywords");
+  }
+
+  // renewal date is a strong subscription indicator
+  if (nextRenewal) {
+    confidence += 8;
+    reason.push("Found renewal/expiry date");
+  }
+
+  // cadence: only trust if renewal exists OR multiple events later (aggregation)
+  if (cadence && (nextRenewal || classifier.likelyTransactional)) {
+    confidence += 4;
+    reason.push("Detected cadence");
+  } else {
+    cadence = null;
+  }
+
+  // Floors / ceilings
+  confidence = clamp(confidence, 0, 100);
+
+  // If we’re missing amount + missing renewal + missing cadence and not trial: too weak
+  const weak = !amount && !nextRenewal && !cadence && !isTrial;
+  if (weak) confidence = Math.min(confidence, 55);
+
+  // Final guard: avoid low-confidence spam
+  const floor = isTrial ? 35 : 45;
+  if (confidence < floor) return null;
+
+  const label = confidence >= 80 ? "High" : confidence >= 55 ? "Medium" : "Low";
+
+  return {
+    merchant,
+    plan,
+    amount,
+    currency,
+    cadence,
+    nextRenewal,
+    isTrial,
+    evidenceType,
+    confidence,
+    confidenceLabel: label,
+    sender: resolved.fromDomain ? `${resolved.fromDomain}` : from,
+    subject,
+    reason,
+    _evidence: { dateMs },
+  };
 }
