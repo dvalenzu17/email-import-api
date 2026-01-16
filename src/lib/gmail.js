@@ -49,10 +49,23 @@ function extractBodies(payload) {
   return { text: text.trim() || "", html: html.trim() || "" };
 }
 
+/**
+ * IMPORTANT:
+ * Open-world does NOT mean "scan everything and hope".
+ * Gmail search is *free filtering* — use it.
+ *
+ * This query is merchant-agnostic, but transaction-focused.
+ * It massively improves recall and reduces promo noise.
+ */
 function buildQuery(daysBack) {
-  // open-world: DON'T over-filter with keywords (that’s why your mom got 0 results)
-  // we screen aggressively client-side using headers/snippets.
-  return `in:anywhere newer_than:${daysBack}d`;
+  // NOTE: Gmail search supports these operators.
+  // We keep it broad but transactional.
+  const transactional =
+    '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
+
+  // Also include Updates + Purchases category (where most receipts/reminders live)
+  // If a user doesn't have these categories, query still works.
+  return `in:anywhere newer_than:${daysBack}d (${transactional})`;
 }
 
 async function pMap(items, concurrency, fn) {
@@ -64,7 +77,7 @@ async function pMap(items, concurrency, fn) {
       const i = idx++;
       try {
         ret[i] = await fn(items[i], i);
-      } catch (e) {
+      } catch {
         ret[i] = null;
       }
     }
@@ -75,14 +88,24 @@ async function pMap(items, concurrency, fn) {
 }
 
 export async function scanGmail({ accessToken, options, context }) {
-  const daysBack = options.daysBack;
-  const maxMessages = options.maxMessages;
-  const maxCandidates = options.maxCandidates;
+  const daysBack = options.daysBack ?? 730;
+
+  // ---- FIX #1: stop getting cooked by app hardcoding 350 for deep scans ----
+  // If user wants 730d, scanning 350 messages is basically useless for busy inboxes.
+  // We upscale conservatively unless the app explicitly sets a higher value.
+  const requestedMax = Number(options.maxMessages ?? 0) || 0;
+  const deepScanFloor = daysBack >= 365 ? 2000 : 600;
+  const maxMessages = Math.max(requestedMax || deepScanFloor, deepScanFloor);
+
+  const maxCandidates = options.maxCandidates ?? 100;
+  const concurrency = options.concurrency ?? 10;
 
   const q = buildQuery(daysBack);
+
   let pageToken = options.cursor;
   const ids = [];
 
+  // ---- Phase 0: list message ids with pagination ----
   while (ids.length < maxMessages) {
     const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
     url.searchParams.set("q", q);
@@ -106,8 +129,8 @@ export async function scanGmail({ accessToken, options, context }) {
     if (!pageToken) break;
   }
 
-  // Phase 1: metadata screening (cheap)
-  const meta = await pMap(ids, options.concurrency || 10, async (id) => {
+  // ---- Phase 1: metadata screening (cheap) ----
+  const meta = await pMap(ids, concurrency, async (id) => {
     const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
     url.searchParams.set("format", "metadata");
     url.searchParams.set("metadataHeaders", "From");
@@ -135,9 +158,14 @@ export async function scanGmail({ accessToken, options, context }) {
       headerMap: headers.headerMap,
     });
 
+    // ---- FIX #2: never screen everything out ----
+    // If our screen says "weak", we still allow it through if the query was transactional.
+    // Otherwise we'd get "0 results" too often.
+    const ok = screen.ok || screen.reason === "weak_signal";
+
     return {
       id,
-      ok: screen.ok,
+      ok,
       screenReason: screen.reason,
       headers,
       snippet,
@@ -148,15 +176,16 @@ export async function scanGmail({ accessToken, options, context }) {
   const screenedIn = meta.filter((m) => m?.ok);
   const scanned = meta.filter(Boolean).length;
 
-  // Phase 2: fetch FULL only for screened-in messages
+  // ---- Phase 2: full fetch only for screened-in ----
   const rawCandidates = [];
-  const fullFetched = await pMap(screenedIn, options.concurrency || 10, async (m) => {
+  const fullFetched = await pMap(screenedIn, concurrency, async (m) => {
     const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
     const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
     if (!res.ok) return null;
 
     const msg = await res.json();
     const bodies = extractBodies(msg.payload);
+
     const cand = buildCandidate(
       {
         from: m.headers.from,
@@ -187,7 +216,10 @@ export async function scanGmail({ accessToken, options, context }) {
       rawMatched: rawCandidates.length,
       matched: candidates.length,
       daysBack,
-      maxMessages,
+      // report BOTH: requested and effective, so you can debug the app payload
+      maxMessagesRequested: requestedMax || null,
+      maxMessagesEffective: maxMessages,
+      query: q,
     },
     nextCursor: pageToken,
   };
