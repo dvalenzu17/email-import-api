@@ -53,6 +53,7 @@ function extractBodies(payload) {
 }
 
 function buildQuery(daysBack) {
+  // Focus on transactional language to avoid promos/newsletters.
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
   return `in:anywhere newer_than:${daysBack}d (${transactional})`;
@@ -101,17 +102,14 @@ export async function scanGmail({ accessToken, options, context }) {
   const startedAt = Date.now();
 
   const daysBack = Number(options?.daysBack ?? 730);
-  const pageSize = clamp(Number(options?.pageSize ?? 250), 50, 500);
+  const pageSize = clamp(Number(options?.pageSize ?? 200), 50, 500);
   const maxCandidates = clamp(Number(options?.maxCandidates ?? 60), 10, 200);
 
-  // HARD LIMITS to avoid Render timeouts
   const deadlineMs = clamp(Number(options?.deadlineMs ?? 20000), 8000, 45000);
   const deadlineAt = startedAt + deadlineMs;
 
-  // keep concurrency small to reduce per-request load
   const concurrency = clamp(Number(options?.concurrency ?? 5), 2, 8);
 
-  // per-call timeouts (Gmail can hang on some accounts)
   const listTimeoutMs = clamp(Number(options?.timeouts?.listMs ?? 8000), 3000, 15000);
   const metaTimeoutMs = clamp(Number(options?.timeouts?.metaMs ?? 7000), 3000, 15000);
   const fullTimeoutMs = clamp(Number(options?.timeouts?.fullMs ?? 9000), 3000, 20000);
@@ -119,7 +117,7 @@ export async function scanGmail({ accessToken, options, context }) {
   const cursor = options?.cursor || undefined;
   const q = buildQuery(daysBack);
 
-  const shouldStop = () => Date.now() > deadlineAt - 750; // keep buffer for response
+  const shouldStop = () => Date.now() > deadlineAt - 750;
 
   // ---- Step 1: list one page of IDs ----
   const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
@@ -202,7 +200,6 @@ export async function scanGmail({ accessToken, options, context }) {
         headerMap: headers.headerMap,
       });
 
-      // Don’t let “strict” screening produce 0 forever. “weak_signal” may still be a receipt.
       const ok = screen.ok || screen.reason === "weak_signal";
 
       return {
@@ -219,9 +216,8 @@ export async function scanGmail({ accessToken, options, context }) {
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  // ---- Step 3: full fetch only for a small subset (to keep it fast) ----
-  // We don’t need to full-fetch everything; grab enough to produce candidates.
-  const fullCap = clamp(Number(options?.fullFetchCap ?? 40), 10, 80);
+  // ---- Step 3: full fetch only for a small subset ----
+  const fullCap = clamp(Number(options?.fullFetchCap ?? 35), 10, 80);
   const fullTargets = screenedIn.slice(0, fullCap);
 
   const rawCandidates = [];
@@ -260,11 +256,8 @@ export async function scanGmail({ accessToken, options, context }) {
       );
 
       if (cand) rawCandidates.push(cand);
-
-      // Stop early if we already have enough
       if (rawCandidates.length >= maxCandidates) break;
 
-      // tiny yield every few fetches to avoid event-loop stalls
       if (i % 8 === 0) await sleep(10);
     } catch {
       // ignore per-email failures

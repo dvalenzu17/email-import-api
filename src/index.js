@@ -1,23 +1,20 @@
-import "dotenv/config";
+// src/index.js
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
+import "dotenv/config";
 
-import { supabaseAdmin } from "./lib/supabaseAdmin.js";
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
 import { scanGmail } from "./lib/gmail.js";
-import {
-  getMerchantDirectoryCached,
-  getUserOverrides,
-  getUserSubscriptionSignals,
-} from "./lib/merchantData.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
-if (!JWT_SECRET) throw new Error("Missing env SUPABASE_JWT_SECRET");
+if (!JWT_SECRET) {
+  throw new Error("Missing env SUPABASE_JWT_SECRET");
+}
 
 const server = Fastify({
   logger: {
@@ -43,10 +40,7 @@ await server.register(rateLimit, {
   keyGenerator: (req) => req.userId ?? req.ip,
 });
 
-// ---- Public health ----
-server.get("/health", async () => ({ ok: true }));
-
-// ---- Auth hook (required for everything else) ----
+// ---- Auth hook (required) ----
 server.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
 
@@ -64,6 +58,8 @@ server.addHook("preHandler", async (req, reply) => {
     return reply.code(401).send({ error: "invalid_token" });
   }
 });
+
+server.get("/health", async () => ({ ok: true }));
 
 /** --------------------------
  * IMAP: verify + scan
@@ -110,14 +106,13 @@ const ScanBodySchema = z.object({
   auth: AuthSchema,
   options: z
     .object({
-      daysBack: z.number().int().min(1).max(3650).default(730),
-      maxMessages: z.number().int().min(1).max(5000).default(2000),
-      maxCandidates: z.number().int().min(1).max(200).default(80),
+      daysBack: z.number().int().min(1).max(3650).default(180),
+      maxMessages: z.number().int().min(1).max(5000).default(500),
+      maxCandidates: z.number().int().min(1).max(200).default(60),
       cursor: z.string().optional(),
     })
     .default({}),
 });
-
 
 server.post("/v1/email/scan", async (req, reply) => {
   const parsed = ScanBodySchema.safeParse(req.body);
@@ -128,13 +123,7 @@ server.post("/v1/email/scan", async (req, reply) => {
   const { provider, imap, auth, options } = parsed.data;
 
   try {
-    const directory = await getMerchantDirectoryCached();
-    const overrides = await getUserOverrides(req.userId);
-    const knownSubs = await getUserSubscriptionSignals(req.userId);
-
-    const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
-
-
+    const result = await scanImap({ provider, imap, auth, options });
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
     req.log.warn({ err: e, provider }, "imap_scan_failed");
@@ -142,22 +131,40 @@ server.post("/v1/email/scan", async (req, reply) => {
   }
 });
 
-// ---- Gmail OAuth: scan ----
+/** --------------------------
+ * Gmail OAuth: scan (FAST, resumable)
+ * -------------------------- */
 const GmailScanBodySchema = z.object({
   auth: z.object({
     accessToken: z.string().min(10),
   }),
   options: z
     .object({
-      daysBack: z.number().int().min(1).max(3650).default(730),
-      maxMessages: z.number().int().min(1).max(5000).default(2500),
-      maxCandidates: z.number().int().min(1).max(200).default(100),
+      // lookback window
+      daysBack: z.number().int().min(1).max(3650).default(365),
+
+      // legacy field (still accepted)
+      maxCandidates: z.number().int().min(1).max(200).default(80),
+
+      // resumable paging
       cursor: z.string().optional(),
-      concurrency: z.number().int().min(1).max(20).default(10),
+
+      // NEW: keep request cheap + fast
+      pageSize: z.number().int().min(50).max(500).optional(),      // Gmail list page size
+      maxCandidatesPage: z.number().int().min(5).max(200).optional(), // alias if you want (not required)
+      deadlineMs: z.number().int().min(8000).max(45000).optional(), // HARD stop per request
+      fullFetchCap: z.number().int().min(10).max(80).optional(),    // max full bodies per request
+      concurrency: z.number().int().min(2).max(8).optional(),       // parallelism (small!)
+      timeouts: z
+        .object({
+          listMs: z.number().int().min(3000).max(15000).optional(),
+          metaMs: z.number().int().min(3000).max(15000).optional(),
+          fullMs: z.number().int().min(3000).max(20000).optional(),
+        })
+        .optional(),
     })
     .default({}),
 });
-
 
 server.post("/v1/gmail/scan", async (req, reply) => {
   const parsed = GmailScanBodySchema.safeParse(req.body);
@@ -166,16 +173,12 @@ server.post("/v1/gmail/scan", async (req, reply) => {
   }
 
   try {
-    const directory = await getMerchantDirectoryCached();
-    const overrides = await getUserOverrides(req.userId);
-    const knownSubs = await getUserSubscriptionSignals(req.userId);
-
     const result = await scanGmail({
       accessToken: parsed.data.auth.accessToken,
       options: parsed.data.options,
-      context: { directory, overrides, knownSubs },
     });
 
+    // Always respond quickly with partials; app can continue with nextCursor
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
     req.log.warn({ err: e }, "gmail_scan_failed");
@@ -184,69 +187,6 @@ server.post("/v1/gmail/scan", async (req, reply) => {
       error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
     });
   }
-});
-
-/** --------------------------
- * Confirm merchant override
- * -------------------------- */
-const ConfirmMerchantSchema = z.object({
-  from: z.string().optional(), // raw From header like: "WaterLlama <billing@waterllama.com>"
-  senderEmail: z.string().email().optional(),
-  senderDomain: z.string().min(3).optional(),
-  canonicalName: z.string().min(2).max(80),
-});
-
-function extractSender(from) {
-  const s = String(from || "");
-  const m = s.match(/<([^>]+)>/);
-  const email = String(m?.[1] ?? s).trim().toLowerCase();
-  const at = email.lastIndexOf("@");
-  const domain = at === -1 ? null : email.slice(at + 1);
-  return { email: email || null, domain: domain || null };
-}
-
-server.post("/v1/merchant/confirm", async (req, reply) => {
-  const parsed = ConfirmMerchantSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-  }
-
-  const { canonicalName } = parsed.data;
-
-  let senderEmail = parsed.data.senderEmail?.toLowerCase() ?? null;
-  let senderDomain = parsed.data.senderDomain?.toLowerCase() ?? null;
-
-  if ((!senderEmail && !senderDomain) && parsed.data.from) {
-    const derived = extractSender(parsed.data.from);
-    senderEmail = derived.email;
-    senderDomain = derived.domain;
-  }
-
-  if (!senderEmail && !senderDomain) {
-    return reply.code(400).send({ error: "missing_sender", message: "Provide from OR senderEmail OR senderDomain" });
-  }
-
-  // Your rule: gmail.com is NOT a company identity signal
-  if (senderDomain === "gmail.com" || (senderEmail && senderEmail.endsWith("@gmail.com"))) {
-    return reply.code(400).send({ error: "consumer_sender_not_allowed", message: "gmail.com senders cannot be used as merchant identity" });
-  }
-
-  const row = senderEmail
-    ? { user_id: req.userId, sender_email: senderEmail, sender_domain: null, canonical_name: canonicalName }
-    : { user_id: req.userId, sender_email: null, sender_domain: senderDomain, canonical_name: canonicalName };
-
-  const { data, error } = await supabaseAdmin
-    .from("user_merchant_overrides")
-    .upsert(row, { onConflict: senderEmail ? "user_id,sender_email" : "user_id,sender_domain" })
-    .select("id, user_id, sender_email, sender_domain, canonical_name")
-    .single();
-
-  if (error) {
-    req.log.warn({ err: error }, "confirm_merchant_failed");
-    return reply.code(500).send({ error: "confirm_failed" });
-  }
-
-  return { ok: true, override: data };
 });
 
 function mapImapError(e) {
