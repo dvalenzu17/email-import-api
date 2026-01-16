@@ -1,3 +1,4 @@
+// src/lib/gmail.js
 import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detect.js";
 
 function b64urlDecode(s) {
@@ -50,21 +51,12 @@ function extractBodies(payload) {
 }
 
 /**
- * IMPORTANT:
- * Open-world does NOT mean "scan everything and hope".
- * Gmail search is *free filtering* — use it.
- *
- * This query is merchant-agnostic, but transaction-focused.
- * It massively improves recall and reduces promo noise.
+ * Merchant-agnostic but transactional-focused Gmail query.
+ * This avoids wasting pages on promos/newsletters.
  */
 function buildQuery(daysBack) {
-  // NOTE: Gmail search supports these operators.
-  // We keep it broad but transactional.
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
-
-  // Also include Updates + Purchases category (where most receipts/reminders live)
-  // If a user doesn't have these categories, query still works.
   return `in:anywhere newer_than:${daysBack}d (${transactional})`;
 }
 
@@ -90,46 +82,53 @@ async function pMap(items, concurrency, fn) {
 export async function scanGmail({ accessToken, options, context }) {
   const daysBack = options.daysBack ?? 730;
 
-  // ---- FIX #1: stop getting cooked by app hardcoding 350 for deep scans ----
-  // If user wants 730d, scanning 350 messages is basically useless for busy inboxes.
-  // We upscale conservatively unless the app explicitly sets a higher value.
-  const requestedMax = Number(options.maxMessages ?? 0) || 0;
-  const deepScanFloor = daysBack >= 365 ? 2000 : 600;
-  const maxMessages = Math.max(requestedMax || deepScanFloor, deepScanFloor);
+  // IMPORTANT: "pageSize" is per-request scan size. Keep this bounded for reliability.
+  const pageSize = Math.max(50, Math.min(500, Number(options.pageSize ?? 250)));
+  const maxCandidates = Math.max(10, Math.min(200, Number(options.maxCandidates ?? 60)));
+  const concurrency = Math.max(2, Math.min(10, Number(options.concurrency ?? 6)));
 
-  const maxCandidates = options.maxCandidates ?? 100;
-  const concurrency = options.concurrency ?? 10;
-
+  const cursor = options.cursor || undefined;
   const q = buildQuery(daysBack);
 
-  let pageToken = options.cursor;
-  const ids = [];
+  // ---- Step 1: list ONE page of message IDs ----
+  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+  listUrl.searchParams.set("q", q);
+  listUrl.searchParams.set("maxResults", String(pageSize));
+  if (cursor) listUrl.searchParams.set("pageToken", cursor);
 
-  // ---- Phase 0: list message ids with pagination ----
-  while (ids.length < maxMessages) {
-    const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-    url.searchParams.set("q", q);
-    url.searchParams.set("maxResults", String(Math.min(500, maxMessages - ids.length)));
-    if (pageToken) url.searchParams.set("pageToken", pageToken);
+  const listRes = await fetch(listUrl.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
 
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`GMAIL_LIST_FAILED (${res.status}): ${txt}`);
-    }
-
-    const json = await res.json();
-    const batch = Array.isArray(json.messages) ? json.messages : [];
-    for (const m of batch) if (m?.id) ids.push(m.id);
-
-    pageToken = json.nextPageToken;
-    if (!pageToken) break;
+  if (!listRes.ok) {
+    const txt = await listRes.text();
+    throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
   }
 
-  // ---- Phase 1: metadata screening (cheap) ----
+  const listJson = await listRes.json();
+  const ids = (Array.isArray(listJson.messages) ? listJson.messages : [])
+    .map((m) => m?.id)
+    .filter(Boolean);
+
+  const nextCursor = listJson.nextPageToken || null;
+
+  if (!ids.length) {
+    return {
+      candidates: [],
+      stats: {
+        scanned: 0,
+        screenedIn: 0,
+        fullFetched: 0,
+        rawMatched: 0,
+        matched: 0,
+        daysBack,
+        pageSize,
+      },
+      nextCursor,
+    };
+  }
+
+  // ---- Step 2: metadata screening (cheap) ----
   const meta = await pMap(ids, concurrency, async (id) => {
     const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
     url.searchParams.set("format", "metadata");
@@ -158,52 +157,61 @@ export async function scanGmail({ accessToken, options, context }) {
       headerMap: headers.headerMap,
     });
 
-    // ---- FIX #2: never screen everything out ----
-    // If our screen says "weak", we still allow it through if the query was transactional.
-    // Otherwise we'd get "0 results" too often.
+    // allow "weak_signal" to pass so we don't drop everything
     const ok = screen.ok || screen.reason === "weak_signal";
 
     return {
       id,
       ok,
-      screenReason: screen.reason,
       headers,
       snippet,
       dateMs: msgDate.getTime(),
     };
   });
 
-  const screenedIn = meta.filter((m) => m?.ok);
   const scanned = meta.filter(Boolean).length;
+  const screenedIn = meta.filter((m) => m?.ok);
 
-  // ---- Phase 2: full fetch only for screened-in ----
+  // ---- Step 3: full fetch only for screened-in, STOP EARLY once we have enough ----
   const rawCandidates = [];
-  const fullFetched = await pMap(screenedIn, concurrency, async (m) => {
-    const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-    if (!res.ok) return null;
 
-    const msg = await res.json();
-    const bodies = extractBodies(msg.payload);
+  // Process in small chunks to avoid long request time
+  for (let i = 0; i < screenedIn.length; i += 40) {
+    const chunk = screenedIn.slice(i, i + 40);
 
-    const cand = buildCandidate(
-      {
-        from: m.headers.from,
-        replyTo: m.headers.replyTo,
-        returnPath: m.headers.returnPath,
-        subject: m.headers.subject,
-        snippet: m.snippet,
-        text: bodies.text,
-        html: bodies.html,
-        headerMap: m.headers.headerMap,
-        dateMs: m.dateMs,
-      },
-      { directory: context?.directory, overrides: context?.overrides }
-    );
+    await pMap(chunk, concurrency, async (m) => {
+      if (!m?.id) return null;
+      if (rawCandidates.length >= maxCandidates * 2) return null;
 
-    if (cand) rawCandidates.push(cand);
-    return true;
-  });
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (!res.ok) return null;
+
+      const msg = await res.json();
+      const bodies = extractBodies(msg.payload);
+
+      const cand = buildCandidate(
+        {
+          from: m.headers.from,
+          replyTo: m.headers.replyTo,
+          returnPath: m.headers.returnPath,
+          subject: m.headers.subject,
+          snippet: m.snippet,
+          text: bodies.text,
+          html: bodies.html,
+          headerMap: m.headers.headerMap,
+          dateMs: m.dateMs,
+        },
+        { directory: context?.directory, overrides: context?.overrides }
+      );
+
+      if (cand) rawCandidates.push(cand);
+      return true;
+    });
+
+    // If we already have enough evidence, stop early
+    if (rawCandidates.length >= maxCandidates) break;
+  }
 
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
@@ -212,15 +220,12 @@ export async function scanGmail({ accessToken, options, context }) {
     stats: {
       scanned,
       screenedIn: screenedIn.length,
-      fullFetched: fullFetched.filter(Boolean).length,
+      fullFetched: Math.min(screenedIn.length, scanned),
       rawMatched: rawCandidates.length,
       matched: candidates.length,
       daysBack,
-      // report BOTH: requested and effective, so you can debug the app payload
-      maxMessagesRequested: requestedMax || null,
-      maxMessagesEffective: maxMessages,
-      query: q,
+      pageSize,
     },
-    nextCursor: pageToken,
+    nextCursor,
   };
 }
