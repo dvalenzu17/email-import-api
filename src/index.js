@@ -130,7 +130,7 @@ const StartGmailSchema = z.object({
       concurrency: z.number().int().min(2).max(10).default(6),
       maxPages: z.number().int().min(1).max(400).default(120),
       maxCandidates: z.number().int().min(10).max(400).default(200),
-      cursor: z.string().optional(),
+      cursor: z.string().nullable().optional(),
       queryMode: z.enum(["transactions", "broad"]).optional(),
       includePromotions: z.boolean().optional(),
       maxListIds: z.number().int().min(300).max(25000).optional(),
