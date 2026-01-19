@@ -4,7 +4,8 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import "dotenv/config";
-import fastifySSE from "@fastify/sse";
+
+import { FastifySSEPlugin } from "fastify-sse-v2"; // ✅ Fastify v4 compatible :contentReference[oaicite:2]{index=2}
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
@@ -14,9 +15,7 @@ import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
-if (!JWT_SECRET) {
-  throw new Error("Missing env SUPABASE_JWT_SECRET");
-}
+if (!JWT_SECRET) throw new Error("Missing env SUPABASE_JWT_SECRET");
 
 const server = Fastify({
   logger: {
@@ -36,16 +35,19 @@ const server = Fastify({
 });
 
 await server.register(cors, { origin: true, credentials: true });
-await server.register(fastifySSE); // ✅ SSE support :contentReference[oaicite:2]{index=2}
+await server.register(FastifySSEPlugin, {
+  // optional: tweak retry delay the client sees
+  // retryDelay: 3000,
+});
 
-// Global limiter: conservative for “normal” endpoints
+// Global limiter (keep strict for normal endpoints)
 await server.register(rateLimit, {
   max: 30,
   timeWindow: "1 minute",
   keyGenerator: (req) => req.userId ?? req.ip,
 });
 
-// ---- Auth hook (required) ----
+// ---- Auth hook ----
 server.addHook("preHandler", async (req, reply) => {
   if (req.url === "/health") return;
 
@@ -141,7 +143,7 @@ server.post(
 );
 
 /** --------------------------
- * Gmail OAuth: scan (chunked)
+ * Gmail: scan (chunked JSON)
  * -------------------------- */
 const GmailScanBodySchema = z.object({
   auth: z.object({
@@ -152,7 +154,7 @@ const GmailScanBodySchema = z.object({
       daysBack: z.number().int().min(1).max(3650).default(365),
       maxCandidates: z.number().int().min(1).max(200).default(80),
       cursor: z.string().optional(),
-      pageSize: z.number().int().min(50).max(500).optional(), // max 500 :contentReference[oaicite:3]{index=3}
+      pageSize: z.number().int().min(50).max(500).optional(),
       deadlineMs: z.number().int().min(8000).max(45000).optional(),
       fullFetchCap: z.number().int().min(10).max(120).optional(),
       concurrency: z.number().int().min(2).max(10).optional(),
@@ -199,16 +201,17 @@ server.post(
 );
 
 /** --------------------------
- * Gmail OAuth: SSE stream (LIVE results)
+ * Gmail: SSE stream (LIVE progress + candidates)
  * -------------------------- */
 const GmailStreamQuerySchema = z.object({
   cursor: z.string().optional(),
   daysBack: z.coerce.number().int().min(1).max(3650).optional(),
   pageSize: z.coerce.number().int().min(50).max(500).optional(),
-  deadlineMs: z.coerce.number().int().min(8000).max(45000).optional(),
+  // Keep chunks small so UI updates fast
+  chunkMs: z.coerce.number().int().min(8000).max(20000).optional(),
   fullFetchCap: z.coerce.number().int().min(10).max(120).optional(),
   concurrency: z.coerce.number().int().min(2).max(10).optional(),
-  maxPages: z.coerce.number().int().min(1).max(60).optional(),
+  maxPages: z.coerce.number().int().min(1).max(120).optional(),
 });
 
 server.get(
@@ -231,59 +234,77 @@ server.get(
     const baseOptions = {
       daysBack: parsed.data.daysBack ?? 365,
       pageSize: parsed.data.pageSize ?? 500,
-      deadlineMs: parsed.data.deadlineMs ?? 25000,
-      fullFetchCap: parsed.data.fullFetchCap ?? 70,
+      deadlineMs: parsed.data.chunkMs ?? 9000, // ✅ frequent UI updates
+      fullFetchCap: parsed.data.fullFetchCap ?? 35,
       concurrency: parsed.data.concurrency ?? 6,
-      maxCandidates: 120,
+      maxCandidates: 200,
     };
 
     let cursor = parsed.data.cursor ?? null;
     let pages = 0;
-    const maxPages = parsed.data.maxPages ?? 30;
+    const maxPages = parsed.data.maxPages ?? 60;
 
-    let totalFound = 0;
-    let totalScanned = 0;
+    let foundTotal = 0;
+    let scannedTotal = 0;
 
-    return reply.sse((async function* () {
-      yield { event: "hello", data: { ok: true } };
+    let closed = false;
+    req.socket.on("close", () => {
+      closed = true;
+    });
 
-      try {
-        while (pages < maxPages) {
-          pages += 1;
+    // ✅ Streaming via AsyncIterable source :contentReference[oaicite:3]{index=3}
+    return reply.sse(
+      (async function* source() {
+        yield { event: "hello", data: JSON.stringify({ ok: true }) };
 
-          const result = await scanGmail({
-            accessToken,
-            options: { ...baseOptions, cursor: cursor || undefined },
-            context: { directory, overrides },
-          });
+        try {
+          while (!closed && pages < maxPages) {
+            pages += 1;
 
-          cursor = result?.nextCursor ?? null;
-          totalFound += (result?.candidates?.length || 0);
-          totalScanned += Number(result?.stats?.scanned || 0);
+            const result = await scanGmail({
+              accessToken,
+              options: { ...baseOptions, cursor: cursor || undefined },
+              context: { directory, overrides },
+            });
 
-          yield {
-            event: "progress",
-            data: {
-              ...result.stats,
-              pages,
-              scannedTotal: totalScanned,
-              foundTotal: totalFound,
-              cursor,
-            },
-          };
+            cursor = result?.nextCursor ?? null;
 
-          if (result?.candidates?.length) {
-            yield { event: "candidates", data: { candidates: result.candidates } };
+            scannedTotal += Number(result?.stats?.scanned || 0);
+            foundTotal += (result?.candidates?.length || 0);
+
+            yield {
+              event: "progress",
+              data: JSON.stringify({
+                ...result.stats,
+                pages,
+                cursor,
+                scannedTotal,
+                foundTotal,
+              }),
+            };
+
+            if (result?.candidates?.length) {
+              yield {
+                event: "candidates",
+                data: JSON.stringify({ candidates: result.candidates }),
+              };
+            }
+
+            if (!cursor) break;
           }
 
-          if (!cursor) break;
+          yield {
+            event: "done",
+            data: JSON.stringify({ ok: true, pages, cursor, scannedTotal, foundTotal }),
+          };
+        } catch (e) {
+          yield {
+            event: "error",
+            data: JSON.stringify({ ok: false, message: String(e?.message ?? e) }),
+          };
         }
-
-        yield { event: "done", data: { ok: true, pages, scannedTotal: totalScanned, foundTotal: totalFound } };
-      } catch (e) {
-        yield { event: "error", data: { ok: false, message: String(e?.message ?? e) } };
-      }
-    })());
+      })()
+    );
   }
 );
 
