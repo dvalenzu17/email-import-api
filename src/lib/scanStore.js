@@ -1,4 +1,5 @@
 // src/lib/scanStore.js
+
 export async function createScanSession({ supabase, userId, provider, cursor, options }) {
     const { data, error } = await supabase
       .from("scan_sessions")
@@ -16,17 +17,19 @@ export async function createScanSession({ supabase, userId, provider, cursor, op
     return data;
   }
   
+  /**
+   * If userId is provided, enforce ownership.
+   * If not provided (worker use), just fetch by id.
+   */
   export async function getScanSession({ supabase, sessionId, userId }) {
-    const { data, error } = await supabase
-      .from("scan_sessions")
-      .select("*")
-      .eq("id", sessionId)
-      .eq("user_id", userId)
-      .maybeSingle();
+    let q = supabase.from("scan_sessions").select("*").eq("id", sessionId);
+    if (userId) q = q.eq("user_id", userId);
   
+    const { data, error } = await q.maybeSingle();
     if (error) throw new Error(`getScanSession: ${error.message}`);
     return data;
   }
+  
   
   export async function cancelScanSession({ supabase, sessionId, userId }) {
     const { error } = await supabase
@@ -41,7 +44,6 @@ export async function createScanSession({ supabase, userId, provider, cursor, op
   }
   
   export async function leaseNextQueuedSession({ supabase, instanceId, leaseSeconds = 30 }) {
-    // Claim one queued session by transitioning to running + setting lease
     const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
   
     const { data, error } = await supabase
@@ -61,12 +63,14 @@ export async function createScanSession({ supabase, userId, provider, cursor, op
   
   export async function renewLease({ supabase, sessionId, instanceId, leaseSeconds = 30 }) {
     const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+  
     const { error } = await supabase
       .from("scan_sessions")
       .update({ lease_expires_at: leaseExpiresAt })
       .eq("id", sessionId)
       .eq("leased_by", instanceId)
       .eq("status", "running");
+  
     if (error) throw new Error(`renewLease: ${error.message}`);
   }
   
@@ -77,38 +81,14 @@ export async function createScanSession({ supabase, userId, provider, cursor, op
       .eq("id", sessionId)
       .select("*")
       .single();
+  
     if (error) throw new Error(`updateSessionProgress: ${error.message}`);
     return data;
-  }
-  
-  export async function writeEvent({ supabase, sessionId, userId, type, payload }) {
-    const { error } = await supabase.from("scan_events").insert({
-      session_id: sessionId,
-      user_id: userId,
-      event_type: type,
-      payload: payload ?? {},
-    });
-    if (error) throw new Error(`writeEvent: ${error.message}`);
-  }
-  
-  export async function listNewEvents({ supabase, sessionId, userId, afterId, limit }) {
-    const { data, error } = await supabase
-      .from("scan_events")
-      .select("id,event_type,payload")
-      .eq("session_id", sessionId)
-      .eq("user_id", userId)
-      .gt("id", afterId)
-      .order("id", { ascending: true })
-      .limit(limit);
-  
-    if (error) throw new Error(`listNewEvents: ${error.message}`);
-    return data || [];
   }
   
   export async function upsertCandidates({ supabase, sessionId, userId, candidates }) {
     if (!candidates?.length) return { inserted: 0 };
   
-    // dedupe client-side just in case
     const seen = new Set();
     const rows = [];
     for (const c of candidates) {
@@ -129,7 +109,6 @@ export async function createScanSession({ supabase, userId, provider, cursor, op
       .upsert(rows, { onConflict: "session_id,fingerprint", ignoreDuplicates: true });
   
     if (error) throw new Error(`upsertCandidates: ${error.message}`);
-  
     return { inserted: rows.length };
   }
   
