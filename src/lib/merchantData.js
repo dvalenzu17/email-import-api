@@ -10,7 +10,7 @@ export async function getMerchantDirectoryCached() {
   // Keep this conservative so we don’t explode if columns aren’t there.
   const { data, error } = await supabaseAdmin
     .from("merchant_directory")
-    .select("canonical_name, sender_emails, sender_domains");
+    .select("canonical_name, sender_emails, sender_domains, keywords");
 
   if (error) throw error;
   cache = { at: now, data: data ?? [] };

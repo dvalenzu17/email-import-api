@@ -2,6 +2,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
+import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
 import { z } from "zod";
 import "dotenv/config";
 
@@ -115,20 +116,9 @@ const ScanBodySchema = z.object({
 });
 
 server.post("/v1/email/scan", async (req, reply) => {
-  const parsed = ScanBodySchema.safeParse(req.body);
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-  }
-
-  const { provider, imap, auth, options } = parsed.data;
-
-  try {
-    const result = await scanImap({ provider, imap, auth, options });
-    return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
-  } catch (e) {
-    req.log.warn({ err: e, provider }, "imap_scan_failed");
-    return reply.code(400).send({ ok: false, error: mapImapError(e) });
-  }
+  // ...
+  const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
+  return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
 });
 
 /** --------------------------
@@ -173,12 +163,15 @@ server.post("/v1/gmail/scan", async (req, reply) => {
   }
 
   try {
+    const directory = await getMerchantDirectoryCached();
+    const overrides = await getUserOverrides(req.userId);
+
     const result = await scanGmail({
       accessToken: parsed.data.auth.accessToken,
       options: parsed.data.options,
+      context: { directory, overrides },
     });
 
-    // Always respond quickly with partials; app can continue with nextCursor
     return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
   } catch (e) {
     req.log.warn({ err: e }, "gmail_scan_failed");
