@@ -1,8 +1,11 @@
 // src/lib/gmail.js
 import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detect.js";
 
-const ENGINE_VERSION = "gmail-scan-v99-deadline-20s";
+const ENGINE_VERSION = "gmail-scan-v105-multipage-attachments-retry";
 
+/** -----------------------
+ * Helpers
+ * ---------------------- */
 function b64urlDecode(s) {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
   return Buffer.from(padded, "base64").toString("utf8");
@@ -29,29 +32,6 @@ function pickHeaders(headers = []) {
   };
 }
 
-function extractBodies(payload) {
-  let text = "";
-  let html = "";
-
-  function walk(node) {
-    if (!node) return;
-    const mt = node.mimeType;
-    const data = node.body?.data;
-
-    if (data && typeof data === "string") {
-      const decoded = b64urlDecode(data);
-      if (mt === "text/plain") text += `\n${decoded}`;
-      if (mt === "text/html") html += `\n${decoded}`;
-    }
-
-    const parts = node.parts;
-    if (Array.isArray(parts)) parts.forEach(walk);
-  }
-
-  walk(payload);
-  return { text: text.trim() || "", html: html.trim() || "" };
-}
-
 function buildQuery(daysBack) {
   // Focus on transactional language to avoid promos/newsletters.
   const transactional =
@@ -67,14 +47,34 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function jitter(ms) {
+  return ms + Math.floor(Math.random() * 120);
+}
+
 async function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
-    return res;
+    return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(t);
+  }
+}
+
+async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
+  let attempt = 0;
+  while (true) {
+    if (shouldStop?.()) throw new Error("DEADLINE");
+    const res = await fetchWithTimeout(url, init, timeoutMs);
+
+    // retry on quota/rate hiccups
+    if ((res.status === 429 || res.status === 403) && attempt < tries - 1) {
+      attempt++;
+      const backoff = jitter(250 * Math.pow(2, attempt));
+      await sleep(backoff);
+      continue;
+    }
+    return res;
   }
 }
 
@@ -98,83 +98,144 @@ async function pMap(items, concurrency, fn, shouldStop) {
   return ret;
 }
 
+/** -----------------------
+ * Attachment + body extract
+ * ---------------------- */
+async function getAttachment({ accessToken, messageId, attachmentId, timeoutMs, shouldStop }) {
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`;
+  const res = await fetchRetry(
+    url,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    timeoutMs,
+    shouldStop
+  );
+  if (!res.ok) return null;
+  const json = await res.json().catch(() => null);
+  if (!json || typeof json.data !== "string") return null;
+  return b64urlDecode(json.data);
+}
+
+async function extractBodiesFull({
+  accessToken,
+  messageId,
+  payload,
+  timeoutMs,
+  attachTimeoutMs,
+  shouldStop,
+  capBytes = 250_000,
+}) {
+  let text = "";
+  let html = "";
+
+  async function walk(node) {
+    if (!node) return;
+    const mt = node.mimeType;
+    const body = node.body || {};
+
+    if (mt === "text/plain" || mt === "text/html") {
+      if (typeof body.data === "string") {
+        const decoded = b64urlDecode(body.data);
+        if (mt === "text/plain") text += `\n${decoded}`;
+        else html += `\n${decoded}`;
+      } else if (body.attachmentId) {
+        const size = Number(body.size ?? 0);
+        if (Number.isFinite(size) && size > 0 && size <= capBytes) {
+          const decoded = await getAttachment({
+            accessToken,
+            messageId,
+            attachmentId: body.attachmentId,
+            timeoutMs: attachTimeoutMs ?? timeoutMs,
+            shouldStop,
+          });
+          if (decoded) {
+            if (mt === "text/plain") text += `\n${decoded}`;
+            else html += `\n${decoded}`;
+          }
+        }
+      }
+    }
+
+    const parts = node.parts;
+    if (Array.isArray(parts)) {
+      for (const p of parts) await walk(p);
+    }
+  }
+
+  await walk(payload);
+  return { text: text.trim() || "", html: html.trim() || "" };
+}
+
+/** -----------------------
+ * Public: scanGmail
+ * ---------------------- */
 export async function scanGmail({ accessToken, options, context }) {
   const startedAt = Date.now();
 
   const daysBack = Number(options?.daysBack ?? 730);
-  const pageSize = clamp(Number(options?.pageSize ?? 200), 50, 500);
-  const maxCandidates = clamp(Number(options?.maxCandidates ?? 60), 10, 200);
+  const pageSize = clamp(Number(options?.pageSize ?? 500), 50, 500);
+  const maxCandidates = clamp(Number(options?.maxCandidates ?? 80), 10, 200);
 
-  const deadlineMs = clamp(Number(options?.deadlineMs ?? 20000), 8000, 45000);
+  const deadlineMs = clamp(Number(options?.deadlineMs ?? 35000), 8000, 45000);
   const deadlineAt = startedAt + deadlineMs;
 
-  const concurrency = clamp(Number(options?.concurrency ?? 5), 2, 8);
+  const concurrency = clamp(Number(options?.concurrency ?? 6), 2, 10);
 
-  const listTimeoutMs = clamp(Number(options?.timeouts?.listMs ?? 8000), 3000, 15000);
-  const metaTimeoutMs = clamp(Number(options?.timeouts?.metaMs ?? 7000), 3000, 15000);
-  const fullTimeoutMs = clamp(Number(options?.timeouts?.fullMs ?? 9000), 3000, 20000);
+  const listTimeoutMs = clamp(Number(options?.timeouts?.listMs ?? 9000), 3000, 15000);
+  const metaTimeoutMs = clamp(Number(options?.timeouts?.metaMs ?? 8000), 3000, 15000);
+  const fullTimeoutMs = clamp(Number(options?.timeouts?.fullMs ?? 12000), 3000, 20000);
+  const attachTimeoutMs = clamp(Number(options?.timeouts?.attachMs ?? 12000), 3000, 20000);
 
   const cursor = options?.cursor || undefined;
   const q = buildQuery(daysBack);
 
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
-// ---- Step 1: list pages until deadline or enough IDs ----
-let pageToken = cursor || undefined;
-let estimatedTotal = null;
+  // debug counters (feeds the UI + helps you not go blind again)
+  const statsRef = { nullReasons: Object.create(null) };
 
-while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per call
-  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-  listUrl.searchParams.set("q", q);
-  listUrl.searchParams.set("maxResults", String(pageSize)); // up to 500 :contentReference[oaicite:5]{index=5}
-  listUrl.searchParams.set("fields", "messages/id,nextPageToken,resultSizeEstimate"); // smaller payload
-  if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
+  /** -----------------------
+   * Step 1: list MULTIPLE pages (until deadline)
+   * ---------------------- */
+  const ids = []; // ✅ defined once, used everywhere
+  let estimatedTotal = null;
+  let pageToken = cursor || undefined;
 
-  const listRes = await fetchRetry(
-    listUrl.toString(),
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-    listTimeoutMs,
-    shouldStop
-  );
+  while (!shouldStop() && ids.length < pageSize * 3) {
+    const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+    listUrl.searchParams.set("q", q);
+    listUrl.searchParams.set("maxResults", String(pageSize));
+    listUrl.searchParams.set("fields", "messages/id,nextPageToken,resultSizeEstimate");
+    if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
 
-  if (!listRes.ok) {
-    const txt = await listRes.text().catch(() => "");
-    throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
+    const listRes = await fetchRetry(
+      listUrl.toString(),
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      listTimeoutMs,
+      shouldStop
+    );
+
+    if (!listRes.ok) {
+      const txt = await listRes.text().catch(() => "");
+      throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
+    }
+
+    const listJson = await listRes.json();
+
+    if (typeof listJson.resultSizeEstimate === "number") {
+      estimatedTotal = listJson.resultSizeEstimate;
+    }
+
+    const pageIds = (Array.isArray(listJson.messages) ? listJson.messages : [])
+      .map((m) => m?.id)
+      .filter(Boolean);
+
+    ids.push(...pageIds);
+
+    pageToken = listJson.nextPageToken || null;
+    if (!pageToken) break;
   }
 
-  const listJson = await listRes.json();
-  if (typeof listJson.resultSizeEstimate === "number") estimatedTotal = listJson.resultSizeEstimate;
-
-  const pageIds = (listJson.messages || []).map((m) => m?.id).filter(Boolean);
-  ids.push(...pageIds);
-
-  pageToken = listJson.nextPageToken || null;
-  if (!pageToken) break;
-}
-
-  // ---- Step 1: list one page of IDs ----
-  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-  listUrl.searchParams.set("q", q);
-  listUrl.searchParams.set("maxResults", String(pageSize));
-  if (cursor) listUrl.searchParams.set("pageToken", cursor);
-
-  const listRes = await fetchWithTimeout(
-    listUrl.toString(),
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-    listTimeoutMs
-  );
-
-  if (!listRes.ok) {
-    const txt = await listRes.text().catch(() => "");
-    throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
-  }
-
-  const listJson = await listRes.json();
-  const ids = (Array.isArray(listJson.messages) ? listJson.messages : [])
-    .map((m) => m?.id)
-    .filter(Boolean);
-
-  const nextCursor = listJson.nextPageToken || null;
+  const nextCursor = pageToken || null;
 
   if (!ids.length) {
     return {
@@ -184,10 +245,14 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
         engineVersion: ENGINE_VERSION,
         daysBack,
         pageSize,
+        estimatedTotal,
+        listed: 0,
         scanned: 0,
         screenedIn: 0,
         fullFetched: 0,
+        rawMatched: 0,
         matched: 0,
+        nullReasons: statsRef.nullReasons,
         deadlineMs,
         tookMs: Date.now() - startedAt,
         query: q,
@@ -195,7 +260,9 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
     };
   }
 
-  // ---- Step 2: metadata screening ----
+  /** -----------------------
+   * Step 2: metadata screening
+   * ---------------------- */
   const meta = await pMap(
     ids,
     concurrency,
@@ -204,6 +271,7 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
 
       const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
       url.searchParams.set("format", "metadata");
+      url.searchParams.set("fields", "id,snippet,internalDate,payload/headers");
       url.searchParams.set("metadataHeaders", "From");
       url.searchParams.set("metadataHeaders", "Subject");
       url.searchParams.set("metadataHeaders", "Date");
@@ -214,10 +282,11 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
       url.searchParams.set("metadataHeaders", "Precedence");
       url.searchParams.set("metadataHeaders", "Auto-Submitted");
 
-      const res = await fetchWithTimeout(
+      const res = await fetchRetry(
         url.toString(),
         { headers: { Authorization: `Bearer ${accessToken}` } },
-        metaTimeoutMs
+        metaTimeoutMs,
+        shouldStop
       );
       if (!res.ok) return null;
 
@@ -233,15 +302,10 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
         headerMap: headers.headerMap,
       });
 
+      // keep “weak_signal” in, but still needs real proof later
       const ok = screen.ok || screen.reason === "weak_signal";
 
-      return {
-        id,
-        ok,
-        headers,
-        snippet,
-        dateMs: msgDate.getTime(),
-      };
+      return { id, ok, headers, snippet, dateMs: msgDate.getTime() };
     },
     shouldStop
   );
@@ -249,8 +313,10 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  // ---- Step 3: full fetch only for a small subset ----
-  const fullCap = clamp(Number(options?.fullFetchCap ?? 35), 10, 80);
+  /** -----------------------
+   * Step 3: full fetch only for a bounded subset
+   * ---------------------- */
+  const fullCap = clamp(Number(options?.fullFetchCap ?? 50), 10, 120);
   const fullTargets = screenedIn.slice(0, fullCap);
 
   const rawCandidates = [];
@@ -261,18 +327,27 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
 
     const m = fullTargets[i];
     try {
-      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`;
-      const res = await fetchWithTimeout(
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full&fields=id,internalDate,payload,snippet`;
+      const res = await fetchRetry(
         url,
         { headers: { Authorization: `Bearer ${accessToken}` } },
-        fullTimeoutMs
+        fullTimeoutMs,
+        shouldStop
       );
       if (!res.ok) continue;
 
       const msg = await res.json();
       fullFetched++;
 
-      const bodies = extractBodies(msg.payload);
+      const bodies = await extractBodiesFull({
+        accessToken,
+        messageId: m.id,
+        payload: msg.payload,
+        timeoutMs: fullTimeoutMs,
+        attachTimeoutMs,
+        shouldStop,
+      });
+
       const cand = buildCandidate(
         {
           from: m.headers.from,
@@ -285,7 +360,11 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
           headerMap: m.headers.headerMap,
           dateMs: m.dateMs,
         },
-        { directory: context?.directory, overrides: context?.overrides }
+        {
+          directory: context?.directory,
+          overrides: context?.overrides,
+          stats: statsRef, // ✅ enables nullReasons tracking
+        }
       );
 
       if (cand) rawCandidates.push(cand);
@@ -296,24 +375,7 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
       // ignore per-email failures
     }
   }
-  function jitter(ms) { return ms + Math.floor(Math.random() * 120); }
 
-  async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
-    let attempt = 0;
-    while (true) {
-      if (shouldStop?.()) throw new Error("DEADLINE");
-      const res = await fetchWithTimeout(url, init, timeoutMs);
-  
-      // retry on quota/rate hiccups
-      if ((res.status === 429 || res.status === 403) && attempt < tries - 1) {
-        attempt++;
-        const backoff = jitter(250 * Math.pow(2, attempt));
-        await sleep(backoff);
-        continue;
-      }
-      return res;
-    }
-  }
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
   return {
@@ -323,11 +385,14 @@ while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per cal
       engineVersion: ENGINE_VERSION,
       daysBack,
       pageSize,
+      estimatedTotal,
+      listed: ids.length,
       scanned,
       screenedIn: screenedIn.length,
       fullFetched,
       rawMatched: rawCandidates.length,
       matched: candidates.length,
+      nullReasons: statsRef.nullReasons,
       deadlineMs,
       fullFetchCap: fullCap,
       tookMs: Date.now() - startedAt,
