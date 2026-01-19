@@ -29,11 +29,21 @@ function pickHeaders(headers = []) {
   };
 }
 
-function buildQuery(daysBack) {
+function buildQuery({ daysBack, queryMode = "transactions", includePromotions = false }) {
+  // queryMode:
+  // - "transactions": fast + low-noise (default)
+  // - "broad": scans *everything* in the time window (slower, noisier)
+  const base = `in:anywhere newer_than:${daysBack}d -in:spam -in:trash`;
+  const promoFilter = includePromotions ? "" : " -category:promotions -category:social";
+
+  if (queryMode === "broad") {
+    return `${base}${promoFilter}`;
+  }
+
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
-  // reduce garbage
-  return `in:anywhere newer_than:${daysBack}d -category:promotions -category:social (${transactional})`;
+
+  return `${base}${promoFilter} (${transactional})`;
 }
 
 function clamp(n, min, max) {
@@ -150,6 +160,9 @@ export async function scanGmail({ accessToken, options, context }) {
   const pageSize = clamp(Number(options?.pageSize ?? 500), 50, 500);
   const maxCandidates = clamp(Number(options?.maxCandidates ?? 200), 10, 400);
 
+  const queryMode = options?.queryMode ?? "transactions";
+  const includePromotions = Boolean(options?.includePromotions ?? false);
+
   const deadlineMs = clamp(Number(options?.deadlineMs ?? 9000), 8000, 45000);
   const deadlineAt = startedAt + deadlineMs;
 
@@ -161,7 +174,7 @@ export async function scanGmail({ accessToken, options, context }) {
   const attachTimeoutMs = clamp(Number(options?.timeouts?.attachMs ?? 12000), 3000, 20000);
 
   const cursor = options?.cursor || undefined;
-  const q = buildQuery(daysBack);
+  const q = buildQuery({ daysBack, queryMode, includePromotions });
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
   const statsRef = { nullReasons: Object.create(null) };
@@ -171,7 +184,11 @@ export async function scanGmail({ accessToken, options, context }) {
   let estimatedTotal = null;
   let pageToken = cursor || undefined;
 
-  while (!shouldStop() && ids.length < pageSize * 3) {
+  // ✅ How many ids we try to list per chunk.
+  // Bigger = more meta screening = higher throughput, but can cost quota.
+  const maxListIds = clamp(Number(options?.maxListIds ?? pageSize * 10), pageSize * 2, pageSize * 25);
+
+  while (!shouldStop() && ids.length < maxListIds) {
     const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
     listUrl.searchParams.set("q", q);
     listUrl.searchParams.set("maxResults", String(pageSize));
@@ -205,6 +222,9 @@ export async function scanGmail({ accessToken, options, context }) {
         engineVersion: ENGINE_VERSION,
         daysBack,
         pageSize,
+        queryMode,
+        includePromotions,
+        maxListIds,
         estimatedTotal,
         listed: 0,
         scanned: 0,
@@ -319,6 +339,9 @@ export async function scanGmail({ accessToken, options, context }) {
       engineVersion: ENGINE_VERSION,
       daysBack,
       pageSize,
+      queryMode,
+      includePromotions,
+      maxListIds,
       estimatedTotal,
       listed: ids.length,
       scanned,

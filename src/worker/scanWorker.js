@@ -131,11 +131,20 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
     const chunkOptions = {
       daysBack: Number(opts.daysBack ?? 365),
       pageSize: Number(opts.pageSize ?? 500),
-      deadlineMs: Number(opts.chunkMs ?? 9000),
+
+      // Bigger budget per chunk -> more list pages + meta fetches -> higher throughput.
+      // Keep it under typical reverse-proxy limits (we still stream progress via events).
+      deadlineMs: Number(opts.chunkMs ?? 15000),
+
       fullFetchCap: Number(opts.fullFetchCap ?? 25),
       concurrency: Number(opts.concurrency ?? 6),
       maxCandidates: Math.min(200, maxCandidates),
       cursor: cursor || undefined,
+
+      // NEW: scan scope + listing throughput
+      queryMode: opts.queryMode ?? "transactions", // "transactions" | "broad"
+      includePromotions: Boolean(opts.includePromotions ?? false),
+      maxListIds: Number(opts.maxListIds ?? (Number(opts.pageSize ?? 500) * 10)),
     };
 
     const startedAt = Date.now();
@@ -163,6 +172,7 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
       cursor,
       scannedTotal,
       foundTotal,
+      estimatedTotal: result?.stats?.estimatedTotal ?? null,
       tookMs,
       stats: result.stats,
     };
