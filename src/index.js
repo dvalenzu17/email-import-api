@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import "dotenv/config";
+import fastifySSE from "@fastify/sse";
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
@@ -23,6 +24,7 @@ const server = Fastify({
     redact: {
       paths: [
         "req.headers.authorization",
+        "req.headers.x-gmail-access-token",
         "req.body.auth.pass",
         "req.body.auth.password",
         "req.body.auth.accessToken",
@@ -34,8 +36,9 @@ const server = Fastify({
 });
 
 await server.register(cors, { origin: true, credentials: true });
+await server.register(fastifySSE); // ✅ SSE support :contentReference[oaicite:2]{index=2}
 
-// Global limiter: keep conservative for “normal” endpoints
+// Global limiter: conservative for “normal” endpoints
 await server.register(rateLimit, {
   max: 30,
   timeWindow: "1 minute",
@@ -116,7 +119,6 @@ const ScanBodySchema = z.object({
     .default({}),
 });
 
-// Scan routes get higher rate limits (chunked scanning needs it)
 server.post(
   "/v1/email/scan",
   { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
@@ -139,7 +141,7 @@ server.post(
 );
 
 /** --------------------------
- * Gmail OAuth: scan (FAST, resumable)
+ * Gmail OAuth: scan (chunked)
  * -------------------------- */
 const GmailScanBodySchema = z.object({
   auth: z.object({
@@ -147,20 +149,13 @@ const GmailScanBodySchema = z.object({
   }),
   options: z
     .object({
-      // lookback window
       daysBack: z.number().int().min(1).max(3650).default(365),
-
-      // legacy field (still accepted)
       maxCandidates: z.number().int().min(1).max(200).default(80),
-
-      // resumable paging
       cursor: z.string().optional(),
-
-      // chunk tuning
-      pageSize: z.number().int().min(50).max(500).optional(), // Gmail list page size
-      deadlineMs: z.number().int().min(8000).max(45000).optional(), // HARD stop per request
-      fullFetchCap: z.number().int().min(10).max(120).optional(), // max full bodies per request
-      concurrency: z.number().int().min(2).max(10).optional(), // parallelism (small!)
+      pageSize: z.number().int().min(50).max(500).optional(), // max 500 :contentReference[oaicite:3]{index=3}
+      deadlineMs: z.number().int().min(8000).max(45000).optional(),
+      fullFetchCap: z.number().int().min(10).max(120).optional(),
+      concurrency: z.number().int().min(2).max(10).optional(),
       timeouts: z
         .object({
           listMs: z.number().int().min(3000).max(15000).optional(),
@@ -200,6 +195,95 @@ server.post(
         error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
       });
     }
+  }
+);
+
+/** --------------------------
+ * Gmail OAuth: SSE stream (LIVE results)
+ * -------------------------- */
+const GmailStreamQuerySchema = z.object({
+  cursor: z.string().optional(),
+  daysBack: z.coerce.number().int().min(1).max(3650).optional(),
+  pageSize: z.coerce.number().int().min(50).max(500).optional(),
+  deadlineMs: z.coerce.number().int().min(8000).max(45000).optional(),
+  fullFetchCap: z.coerce.number().int().min(10).max(120).optional(),
+  concurrency: z.coerce.number().int().min(2).max(10).optional(),
+  maxPages: z.coerce.number().int().min(1).max(60).optional(),
+});
+
+server.get(
+  "/v1/gmail/scan/stream",
+  { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const parsed = GmailStreamQuerySchema.safeParse(req.query || {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    const accessToken = req.headers["x-gmail-access-token"];
+    if (!accessToken || typeof accessToken !== "string" || accessToken.length < 10) {
+      return reply.code(400).send({ error: "missing_x_gmail_access_token" });
+    }
+
+    const directory = await getMerchantDirectoryCached();
+    const overrides = await getUserOverrides(req.userId);
+
+    const baseOptions = {
+      daysBack: parsed.data.daysBack ?? 365,
+      pageSize: parsed.data.pageSize ?? 500,
+      deadlineMs: parsed.data.deadlineMs ?? 25000,
+      fullFetchCap: parsed.data.fullFetchCap ?? 70,
+      concurrency: parsed.data.concurrency ?? 6,
+      maxCandidates: 120,
+    };
+
+    let cursor = parsed.data.cursor ?? null;
+    let pages = 0;
+    const maxPages = parsed.data.maxPages ?? 30;
+
+    let totalFound = 0;
+    let totalScanned = 0;
+
+    return reply.sse((async function* () {
+      yield { event: "hello", data: { ok: true } };
+
+      try {
+        while (pages < maxPages) {
+          pages += 1;
+
+          const result = await scanGmail({
+            accessToken,
+            options: { ...baseOptions, cursor: cursor || undefined },
+            context: { directory, overrides },
+          });
+
+          cursor = result?.nextCursor ?? null;
+          totalFound += (result?.candidates?.length || 0);
+          totalScanned += Number(result?.stats?.scanned || 0);
+
+          yield {
+            event: "progress",
+            data: {
+              ...result.stats,
+              pages,
+              scannedTotal: totalScanned,
+              foundTotal: totalFound,
+              cursor,
+            },
+          };
+
+          if (result?.candidates?.length) {
+            yield { event: "candidates", data: { candidates: result.candidates } };
+          }
+
+          if (!cursor) break;
+        }
+
+        yield { event: "done", data: { ok: true, pages, scannedTotal: totalScanned, foundTotal: totalFound } };
+      } catch (e) {
+        yield { event: "error", data: { ok: false, message: String(e?.message ?? e) } };
+      }
+    })());
   }
 );
 
