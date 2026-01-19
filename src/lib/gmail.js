@@ -281,7 +281,7 @@ export async function scanGmail({ accessToken, options, context }) {
   const clusterCandidates = buildClusterCandidates(screenedIn, context, Math.min(clusterCap, maxCandidates));
 
   // Step 3: bounded full fetch
-  const fullCap = clamp(Number(options?.fullFetchCap ?? 25), 10, 120);
+  const fullCap = clamp(Number(options?.fullFetchCap ?? 25), 0, 120);
   const fullTargets = screenedIn.slice(0, fullCap);
 
   const rawCandidates = [];
