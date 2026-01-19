@@ -1,5 +1,6 @@
 // API/src/lib/gmail.js
 import { buildCandidate, buildClusterCandidates, aggregateCandidates, quickScreenMessage } from "./detect.js";
+import { buildImprovedCandidate } from "./candidateScoring.js";
 
 const ENGINE_VERSION = "gmail.v7.cluster-first";
 
@@ -348,8 +349,24 @@ export async function scanGmail({ accessToken, options, context }) {
     if (merged.length >= maxCandidates) break;
   }
 
+  // Post-process: normalize merchant + classify event type + rescore confidence.
+  // Safe defaults: if context doesn't include directory/overrides, we still run rules.
+  const directory = Array.isArray(context?.directory) ? context.directory : [];
+  const overrides = Array.isArray(context?.overrides) ? context.overrides : [];
+  const improved = [];
+  let dropped = 0;
+  for (const c of merged) {
+    const out = buildImprovedCandidate({ rawCandidate: c, directory, overrides });
+    if (out.drop) {
+      dropped += 1;
+      continue;
+    }
+    improved.push(out.candidate);
+    if (improved.length >= maxCandidates) break;
+  }
+
   return {
-    candidates: merged,
+    candidates: improved,
     nextCursor,
     stats: {
       engineVersion: ENGINE_VERSION,
@@ -361,7 +378,8 @@ export async function scanGmail({ accessToken, options, context }) {
       screenedIn: screenedIn.length,
       fullFetched,
       rawMatched: rawCandidates.length,
-      matched: merged.length,
+      matched: improved.length,
+      dropped,
       matchedFromBodies: candidates.length,
       matchedFromClusters: clusterCandidates.length,
       nullReasons: statsRef.nullReasons,

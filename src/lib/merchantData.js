@@ -8,12 +8,23 @@ export async function getMerchantDirectoryCached() {
   if (cache.data && now - cache.at < TTL_MS) return cache.data;
 
   // Keep this conservative so we don’t explode if columns aren’t there.
+  // Note: table uses sender_emails + sender_domain (singular) in your schema.
+  // We normalize it later to the shape expected by merchantResolver.
   const { data, error } = await supabaseAdmin
     .from("merchant_directory")
-    .select("canonical_name, sender_emails, sender_domains, keywords");
+    .select("canonical_name, sender_emails, sender_domain, keywords");
 
   if (error) throw error;
-  cache = { at: now, data: data ?? [] };
+  // Normalize to arrays to match resolver expectations.
+  const normalized = (data ?? []).map((r) => ({
+    ...r,
+    sender_emails: Array.isArray(r.sender_emails) ? r.sender_emails : (r.sender_emails ? [r.sender_emails] : []),
+    sender_domains: Array.isArray(r.sender_domains)
+      ? r.sender_domains
+      : (r.sender_domain ? [r.sender_domain] : []),
+  }));
+
+  cache = { at: now, data: normalized };
   return cache.data;
 }
 
