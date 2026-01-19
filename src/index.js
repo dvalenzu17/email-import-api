@@ -234,13 +234,13 @@ server.post("/v1/gmail/scan/run", async (req, reply) => {
   const { sessionId } = req.body || {};
   if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
 
-  const session = await scanStore.createScanSession({ supabase: supabaseAdmin, userId, provider: "gmail", cursor: null, options: {} });
-
-  if (!session || session.user_id !== userId) return reply.code(404).send({ error: "not_found" });
+  const session = await getScanSession({ supabase: supabaseAdmin, sessionId, userId });
+  if (!session) return reply.code(404).send({ error: "not_found" });
 
   await enqueueScanChunk({ sessionId });
   return { ok: true };
 });
+
 
 /** ---------------------------
  * IMAP verify + scan (non-job)

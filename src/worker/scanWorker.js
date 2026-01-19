@@ -1,160 +1,141 @@
-// src/worker/scanWorker.js
-import { nanoid } from "nanoid";
-import {
-  leaseNextQueuedSession,
-  renewLease,
-  updateSessionProgress,
-  upsertCandidates,
-  getScanSession,
-} from "../lib/scanStore.js";
+// api/src/worker/scanWorker.js
+import { Worker } from "bullmq";
+import { redis } from "../queue/redis.js";
+import { supabaseAdmin } from "../lib/supabaseAdmin.js";
+import { getGoogleTokens } from "../lib/tokenStore.js";
 import { scanGmail } from "../lib/gmail.js";
 import { writeEvent } from "../lib/eventStore.js";
+import { getScanSession, updateSessionProgress, upsertCandidates } from "../lib/scanStore.js";
+import { enqueueScanChunk } from "../queue/scanQueue.js";
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-export function startScanWorker({ server, supabase, getDirectory, getOverrides }) {
-  const instanceId = `api-${nanoid(8)}`;
-  server.log.info({ instanceId }, "scanWorker starting");
-
-  let stopping = false;
-  server.addHook("onClose", async () => {
-    stopping = true;
+async function failSession(session, code, message) {
+  await updateSessionProgress({
+    supabase: supabaseAdmin,
+    sessionId: session.id,
+    patch: { status: "error", error_code: code, error_message: message },
   });
+  await writeEvent({
+    supabase: supabaseAdmin,
+    sessionId: session.id,
+    userId: session.user_id,
+    type: "scan_failed",
+    payload: { code, message },
+  });
+}
 
-  (async () => {
-    while (!stopping) {
-      try {
-        const session = await leaseNextQueuedSession({ supabase, instanceId, leaseSeconds: 30 });
-        if (!session) {
-          await sleep(600);
-          continue;
-        }
-        if (session.provider !== "gmail") {
-          await updateSessionProgress({
-            supabase,
-            sessionId: session.id,
-            patch: { status: "error", error_code: "UNSUPPORTED_PROVIDER", error_message: "Only gmail supported." },
-          });
-          await writeEvent({ supabase, sessionId: session.id, userId: session.user_id, type: "error", payload: { ok: false } });
-          continue;
-        }
+export const scanWorker = new Worker(
+  "scan",
+  async (job) => {
+    const { sessionId } = job.data || {};
+    if (!sessionId) return;
 
-        await runGmailSession({ server, supabase, instanceId, session, getDirectory, getOverrides });
-      } catch (e) {
-        server.log.error({ err: e }, "scanWorker loop error");
-        await sleep(800);
-      }
+    const supabase = supabaseAdmin;
+
+    const session = await getScanSession({ supabase, sessionId });
+    if (!session) return;
+
+    if (["done", "failed", "canceled", "error"].includes(session.status)) return;
+
+    // Mark running on first chunk
+    if (session.status === "queued") {
+      await updateSessionProgress({ supabase, sessionId, patch: { status: "running" } });
+      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "progress", payload: { phase: "starting" } });
     }
-  })();
-}
 
-export async function runScanWorker({ server, sessionId, logger }) {
-  const supabase = server?.supabaseAdmin;
-  if (!supabase) throw new Error("server.supabaseAdmin missing");
-
-  const getDirectory = server?.getMerchantDirectory;
-  const getOverrides = server?.getUserOverrides;
-  if (typeof getDirectory !== "function" || typeof getOverrides !== "function") {
-    throw new Error("server.getMerchantDirectory / server.getUserOverrides missing");
-  }
-
-  const session = await getScanSession({ supabase, sessionId }); // ✅ userId optional now
-  if (!session) throw new Error("Session not found");
-
-  const instanceId = `api-${nanoid(8)}`;
-  logger?.info?.({ instanceId, sessionId }, "runScanWorker start");
-
-  if (session.provider !== "gmail") {
-    await updateSessionProgress({
-      supabase,
-      sessionId: session.id,
-      patch: { status: "error", error_code: "UNSUPPORTED_PROVIDER", error_message: "Only gmail supported." },
-    });
-    await writeEvent({ supabase, sessionId: session.id, userId: session.user_id, type: "error", payload: { ok: false } });
-    return;
-  }
-
-  await runGmailSession({ server, supabase, instanceId, session, getDirectory, getOverrides });
-  logger?.info?.({ sessionId }, "runScanWorker done");
-}
-
-async function runGmailSession({ server, supabase, instanceId, session, getDirectory, getOverrides }) {
-  const sessionId = session.id;
-  const userId = session.user_id;
-
-  const accessToken = server.scanTokenCache?.get(sessionId);
-  if (!accessToken) {
-    await updateSessionProgress({
-      supabase,
-      sessionId,
-      patch: { status: "error", error_code: "MISSING_TOKEN", error_message: "Restart scan (token missing)." },
-    });
-    await writeEvent({ supabase, sessionId, userId, type: "error", payload: { ok: false, message: "Missing access token." } });
-    return;
-  }
-
-  const directory = await getDirectory();
-  const overrides = await getOverrides(userId);
-
-  const opts = session.options || {};
-  const maxPages = Number(opts.maxPages || 120);
-  const maxCandidates = Number(opts.maxCandidates || 200);
-
-  let cursor = session.cursor || null;
-  let pages = Number(session.pages || 0);
-  let scannedTotal = Number(session.scanned_total || 0);
-  let foundTotal = Number(session.found_total || 0);
-
-  await writeEvent({ supabase, sessionId, userId, type: "progress", payload: { phase: "starting", pages, scannedTotal, foundTotal } });
-
-  while (pages < maxPages) {
-    const current = await getScanSession({ supabase, sessionId, userId });
-    if (!current || current.status === "canceled") {
-      await writeEvent({ supabase, sessionId, userId, type: "done", payload: { ok: true, canceled: true } });
-      await updateSessionProgress({ supabase, sessionId, patch: { status: "canceled" } });
+    // Token: prefer stored access token; refresh token is a bonus, not a requirement for the first hour.
+    const tokens = await getGoogleTokens({ supabase, userId: session.user_id }).catch(() => null);
+    const accessToken = tokens?.accessToken;
+    if (!accessToken) {
+      await failSession(session, "MISSING_TOKEN", "Missing Google token. Reconnect Gmail.");
       return;
     }
 
-    pages += 1;
-    await renewLease({ supabase, sessionId, instanceId, leaseSeconds: 30 });
+    const opts = session.options || {};
+    const maxPages = clamp(Number(opts.maxPages ?? 120), 1, 400);
+    const maxCandidates = clamp(Number(opts.maxCandidates ?? 200), 10, 400);
 
+    const pages = Number(session.pages || 0);
+    const scannedTotal = Number(session.scanned_total || 0);
+    const foundTotal = Number(session.found_total || 0);
+
+    // One chunk per job (bounded by deadlineMs)
     const result = await scanGmail({
       accessToken,
       options: {
-        daysBack: Number(opts.daysBack ?? 365),
+        daysBack: Number(opts.daysBack ?? 90),
         pageSize: Number(opts.pageSize ?? 500),
         deadlineMs: Number(opts.chunkMs ?? 9000),
-        fullFetchCap: Number(opts.fullFetchCap ?? 25),
+        fullFetchCap: Number(opts.fullFetchCap ?? 12),
         concurrency: Number(opts.concurrency ?? 6),
-        maxCandidates: Math.min(200, maxCandidates),
-        cursor: cursor || undefined,
         queryMode: opts.queryMode ?? "transactions",
         includePromotions: Boolean(opts.includePromotions ?? false),
-        maxListIds: opts.maxListIds ? Number(opts.maxListIds) : undefined,
-        clusterCap: opts.clusterCap ? Number(opts.clusterCap) : undefined,
+        maxListIds: Number(opts.maxListIds ?? 800),
+        clusterCap: Number(opts.clusterCap ?? 40),
+        cursor: session.cursor || undefined,
         debug: Boolean(opts.debug ?? false),
       },
-      context: { directory, overrides },
+      context: {
+        directory: null,
+        overrides: null,
+      },
     });
 
-    cursor = result.nextCursor ?? null;
-    scannedTotal += Number(result.stats?.scanned || 0);
+    const scannedDelta = Number(result?.stats?.scanned || 0);
+    const up = await upsertCandidates({ supabase, sessionId, userId: session.user_id, candidates: result.candidates || [] });
+    const foundDelta = up.inserted;
 
-    const up = await upsertCandidates({ supabase, sessionId, userId, candidates: result.candidates || [] });
-    foundTotal += up.inserted;
+    const nextPages = pages + 1;
+    const nextScanned = scannedTotal + scannedDelta;
+    const nextFound = foundTotal + foundDelta;
+    const nextCursor = result.nextCursor ?? null;
 
-    const payload = { phase: "running", pages, cursor, scannedTotal, foundTotal, stats: result.stats };
-    await updateSessionProgress({ supabase, sessionId, patch: { cursor, pages, scanned_total: scannedTotal, found_total: foundTotal, last_stats: payload } });
-    await writeEvent({ supabase, sessionId, userId, type: "progress", payload });
+    const progressPayload = {
+      phase: "running",
+      pages: nextPages,
+      cursor: nextCursor,
+      scannedTotal: nextScanned,
+      foundTotal: nextFound,
+      stats: result.stats,
+    };
 
-    if (up.inserted > 0) await writeEvent({ supabase, sessionId, userId, type: "candidates", payload: { candidates: result.candidates || [] } });
+    await updateSessionProgress({
+      supabase,
+      sessionId,
+      patch: {
+        pages: nextPages,
+        cursor: nextCursor,
+        scanned_total: nextScanned,
+        found_total: nextFound,
+        last_stats: progressPayload,
+      },
+    });
 
-    if (!cursor || foundTotal >= maxCandidates) break;
-    await sleep(120);
-  }
+    await writeEvent({ supabase, sessionId, userId: session.user_id, type: "progress", payload: progressPayload });
+    if (foundDelta > 0) {
+      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "candidates", payload: { candidates: result.candidates || [] } });
+    }
 
-  await updateSessionProgress({ supabase, sessionId, patch: { status: "done" } });
-  await writeEvent({ supabase, sessionId, userId, type: "done", payload: { ok: true, pages, scannedTotal, foundTotal } });
-}
+    const done =
+      !nextCursor ||
+      nextPages >= maxPages ||
+      nextFound >= maxCandidates;
+
+    if (done) {
+      await updateSessionProgress({ supabase, sessionId, patch: { status: "done" } });
+      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "done", payload: { ok: true, pages: nextPages, scannedTotal: nextScanned, foundTotal: nextFound } });
+      return;
+    }
+
+    // schedule next chunk
+    await enqueueScanChunk({ sessionId });
+  },
+  { connection: redis }
+);
+
+scanWorker.on("failed", (job, err) => {
+  console.error("scan job failed", { jobId: job?.id, err: err?.message || String(err) });
+});
