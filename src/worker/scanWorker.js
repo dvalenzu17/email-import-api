@@ -10,6 +10,14 @@ import {
 } from "../lib/scanStore.js";
 import { scanGmail } from "../lib/gmail.js";
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Background loop worker: continuously leases queued sessions and processes them.
+ * Useful if you run a dedicated worker instance.
+ */
 export function startScanWorker({ server, supabase, getDirectory, getOverrides }) {
   const instanceId = `api-${nanoid(8)}`;
   server.log.info({ instanceId }, "scanWorker starting");
@@ -28,7 +36,6 @@ export function startScanWorker({ server, supabase, getDirectory, getOverrides }
           continue;
         }
 
-        // Only Gmail implemented in this “100/100 drop”
         if (session.provider !== "gmail") {
           await updateSessionProgress({
             supabase,
@@ -58,6 +65,60 @@ export function startScanWorker({ server, supabase, getDirectory, getOverrides }
   };
 
   loop();
+}
+
+/**
+ * One-shot worker runner: process exactly one sessionId.
+ * This is what your /v1/gmail/scan/run endpoint should call.
+ */
+export async function runScanWorker({ server, sessionId, logger }) {
+  const supabase = server?.supabaseAdmin;
+  if (!supabase) throw new Error("server.supabaseAdmin missing (attach supabaseAdmin to server)");
+
+  const getDirectory = server?.getMerchantDirectory;
+  const getOverrides = server?.getUserOverrides;
+
+  if (typeof getDirectory !== "function" || typeof getOverrides !== "function") {
+    throw new Error("server.getMerchantDirectory / server.getUserOverrides missing");
+  }
+
+  // Fetch session (no userId required here, scanStore should validate ownership at stream layer)
+  const session = await getScanSession({ supabase, sessionId });
+  if (!session) throw new Error("Session not found");
+
+  const instanceId = `api-${nanoid(8)}`;
+  logger?.info?.({ instanceId, sessionId }, "runScanWorker start");
+
+  if (session.provider !== "gmail") {
+    await updateSessionProgress({
+      supabase,
+      sessionId: session.id,
+      patch: {
+        status: "error",
+        error_code: "UNSUPPORTED_PROVIDER",
+        error_message: "Only gmail sessions are supported by this worker.",
+      },
+    });
+    await writeEvent({
+      supabase,
+      sessionId: session.id,
+      userId: session.user_id,
+      type: "error",
+      payload: { ok: false, message: "Unsupported provider" },
+    });
+    return;
+  }
+
+  await runGmailSession({
+    server,
+    supabase,
+    instanceId,
+    session,
+    getDirectory,
+    getOverrides,
+  });
+
+  logger?.info?.({ sessionId }, "runScanWorker done");
 }
 
 async function runGmailSession({ server, supabase, instanceId, session, getDirectory, getOverrides }) {
@@ -98,24 +159,15 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
   let scannedTotal = Number(session.scanned_total || 0);
   let foundTotal = Number(session.found_total || 0);
 
-  // server-side foundTotal should be DB-unique count, not “added lengths”
-  // We'll track via upsert count and set-based dedupe is enforced by DB unique index.
   await writeEvent({
     supabase,
     sessionId,
     userId,
     type: "progress",
-    payload: {
-      phase: "starting",
-      pages,
-      cursor,
-      scannedTotal,
-      foundTotal,
-    },
+    payload: { phase: "starting", pages, cursor, scannedTotal, foundTotal },
   });
 
   while (pages < maxPages) {
-    // cancel check
     const current = await getScanSession({ supabase, sessionId, userId });
     if (!current || current.status === "canceled") {
       await writeEvent({ supabase, sessionId, userId, type: "done", payload: { ok: true, canceled: true } });
@@ -125,7 +177,6 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
 
     pages += 1;
 
-    // renew lease
     await renewLease({ supabase, sessionId, instanceId, leaseSeconds: 30 });
 
     const chunkOptions = {
@@ -139,6 +190,7 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
       queryMode: opts.queryMode ?? "transactions",
       includePromotions: Boolean(opts.includePromotions ?? false),
       maxListIds: opts.maxListIds ? Number(opts.maxListIds) : undefined,
+      clusterCap: opts.clusterCap ? Number(opts.clusterCap) : undefined,
       debug: Boolean(opts.debug ?? false),
     };
 
@@ -155,10 +207,7 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
     cursor = result.nextCursor ?? null;
     scannedTotal += Number(result.stats?.scanned || 0);
 
-    // write candidates (deduped)
     const up = await upsertCandidates({ supabase, sessionId, userId, candidates: result.candidates || [] });
-
-    // update foundTotal via count query? keep it cheap: increment by attempted inserts, and occasionally correct.
     foundTotal += up.inserted;
 
     const progressPayload = {
@@ -186,7 +235,6 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
     await writeEvent({ supabase, sessionId, userId, type: "progress", payload: progressPayload });
 
     if (up.inserted > 0) {
-      // stream only the candidates we just processed (client can merge/dedupe by fingerprint)
       await writeEvent({
         supabase,
         sessionId,
@@ -199,14 +247,9 @@ async function runGmailSession({ server, supabase, instanceId, session, getDirec
     if (!cursor) break;
     if (foundTotal >= maxCandidates) break;
 
-    // tiny delay to avoid bursty quota behavior
     await sleep(120);
   }
 
   await updateSessionProgress({ supabase, sessionId, patch: { status: "done" } });
   await writeEvent({ supabase, sessionId, userId, type: "done", payload: { ok: true, pages, scannedTotal, foundTotal } });
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
