@@ -28,6 +28,35 @@ function bumpNullReason(context, key) {
   } catch {}
 }
 
+function maybePushNearMiss(context, sample) {
+  try {
+    const arr = context?.stats?.nearMisses;
+    if (!arr) return;
+    if (arr.length >= 25) return;
+
+    // Keep samples low-PII and small.
+    const safe = {
+      dropReason: String(sample?.dropReason || "unknown"),
+      fromDomain: String(sample?.fromDomain || ""),
+      merchantGuess: sample?.merchantGuess ? String(sample.merchantGuess).slice(0, 80) : null,
+      resolverConfidence: Number(sample?.resolverConfidence || 0),
+      confidence: Number(sample?.confidence || 0),
+      floor: Number(sample?.floor || 0),
+      evidenceType: String(sample?.evidenceType || ""),
+      hasAmount: Boolean(sample?.hasAmount),
+      hasNextRenewal: Boolean(sample?.hasNextRenewal),
+      hasCadence: Boolean(sample?.hasCadence),
+      pos: Number(sample?.pos || 0),
+      neg: Number(sample?.neg || 0),
+      bulkHeader: Boolean(sample?.bulkHeader),
+      subject: sample?.subject ? String(sample.subject).slice(0, 140) : "",
+      snippet: sample?.snippet ? String(sample.snippet).slice(0, 160) : "",
+    };
+
+    arr.push(safe);
+  } catch {}
+}
+
 // ---------- link domain extraction ----------
 function extractLinkDomains({ text = "", html = "" }) {
   const domains = new Set();
@@ -385,6 +414,23 @@ export function buildCandidate(message, context) {
   // HARD SKIP: marketing heavy with no transactional evidence
   if (classifier.marketingHeavy && !classifier.likelyTransactional) {
     bumpNullReason(context, "marketingHeavy");
+    maybePushNearMiss(context, {
+      dropReason: "marketingHeavy",
+      fromDomain: resolved.fromDomain || "",
+      merchantGuess: resolved.pretty || resolved.canonical || null,
+      resolverConfidence: resolved.confidence || 0,
+      confidence: 0,
+      floor: 0,
+      evidenceType: "marketing",
+      hasAmount: false,
+      hasNextRenewal: false,
+      hasCadence: false,
+      pos: classifier.pos,
+      neg: classifier.neg,
+      bulkHeader: classifier.bulkHeader,
+      subject,
+      snippet,
+    });
     return null;
   }
 
@@ -482,12 +528,46 @@ export function buildCandidate(message, context) {
   // If still no merchant and not trial, drop (now that we’ve given it a chance)
   if (!merchant && !isTrial) {
     bumpNullReason(context, "noMerchant");
+    maybePushNearMiss(context, {
+      dropReason: "noMerchant",
+      fromDomain,
+      merchantGuess: resolved.pretty || resolved.canonical || null,
+      resolverConfidence: resolved.confidence || 0,
+      confidence,
+      floor: 45,
+      evidenceType,
+      hasAmount: !!amount,
+      hasNextRenewal: !!nextRenewal,
+      hasCadence: !!cadence,
+      pos: classifier.pos,
+      neg: classifier.neg,
+      bulkHeader: classifier.bulkHeader,
+      subject,
+      snippet,
+    });
     return null;
   }
 
   const floor = isTrial ? 35 : 45;
   if (confidence < floor) {
     bumpNullReason(context, "lowConfidence");
+    maybePushNearMiss(context, {
+      dropReason: "lowConfidence",
+      fromDomain,
+      merchantGuess: merchant || resolved.pretty || resolved.canonical || null,
+      resolverConfidence: resolved.confidence || 0,
+      confidence,
+      floor,
+      evidenceType,
+      hasAmount: !!amount,
+      hasNextRenewal: !!nextRenewal,
+      hasCadence: !!cadence,
+      pos: classifier.pos,
+      neg: classifier.neg,
+      bulkHeader: classifier.bulkHeader,
+      subject,
+      snippet,
+    });
     return null;
   }
 

@@ -69,11 +69,14 @@ const StartGmailSchema = z.object({
       concurrency: z.number().int().min(2).max(10).default(6),
       maxPages: z.number().int().min(1).max(400).default(120),
       maxCandidates: z.number().int().min(10).max(400).default(200),
-      // NEW: scan scope + listing throughput
+      cursor: z.string().optional(),
+      // Scan scope controls
       queryMode: z.enum(["transactions", "broad"]).default("transactions"),
       includePromotions: z.boolean().default(false),
+      // Listing throughput (more IDs per chunk)
       maxListIds: z.number().int().min(100).max(10000).optional(),
-      cursor: z.string().optional(),
+      // Debug: include nearMiss samples in stats
+      debug: z.boolean().default(false),
     })
     .default({}),
 });

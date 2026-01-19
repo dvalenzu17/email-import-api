@@ -30,9 +30,6 @@ function pickHeaders(headers = []) {
 }
 
 function buildQuery({ daysBack, queryMode = "transactions", includePromotions = false }) {
-  // queryMode:
-  // - "transactions": fast + low-noise (default)
-  // - "broad": scans *everything* in the time window (slower, noisier)
   const base = `in:anywhere newer_than:${daysBack}d -in:spam -in:trash`;
   const promoFilter = includePromotions ? "" : " -category:promotions -category:social";
 
@@ -42,8 +39,20 @@ function buildQuery({ daysBack, queryMode = "transactions", includePromotions = 
 
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
-
   return `${base}${promoFilter} (${transactional})`;
+}
+
+function extractDomainFromFromHeader(from) {
+  const s = String(from || "");
+  const m = s.match(/@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/);
+  return m?.[1] ? m[1].toLowerCase() : "";
+}
+
+function topNFromMap(map, n = 20) {
+  return [...map.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([k, v]) => ({ domain: k, count: v }));
 }
 
 function clamp(n, min, max) {
@@ -160,9 +169,6 @@ export async function scanGmail({ accessToken, options, context }) {
   const pageSize = clamp(Number(options?.pageSize ?? 500), 50, 500);
   const maxCandidates = clamp(Number(options?.maxCandidates ?? 200), 10, 400);
 
-  const queryMode = options?.queryMode ?? "transactions";
-  const includePromotions = Boolean(options?.includePromotions ?? false);
-
   const deadlineMs = clamp(Number(options?.deadlineMs ?? 9000), 8000, 45000);
   const deadlineAt = startedAt + deadlineMs;
 
@@ -174,19 +180,23 @@ export async function scanGmail({ accessToken, options, context }) {
   const attachTimeoutMs = clamp(Number(options?.timeouts?.attachMs ?? 12000), 3000, 20000);
 
   const cursor = options?.cursor || undefined;
+  const queryMode = options?.queryMode ?? "transactions";
+  const includePromotions = Boolean(options?.includePromotions ?? false);
+  const maxListIds = clamp(Number(options?.maxListIds ?? (pageSize * 10)), pageSize * 2, pageSize * 25);
   const q = buildQuery({ daysBack, queryMode, includePromotions });
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
-  const statsRef = { nullReasons: Object.create(null) };
+  const statsRef = {
+    nullReasons: Object.create(null),
+    nearMisses: [],
+    screenReasons: Object.create(null),
+    topFromDomains: [],
+  };
 
   // Step 1: list multiple pages quickly
   const ids = [];
   let estimatedTotal = null;
   let pageToken = cursor || undefined;
-
-  // ✅ How many ids we try to list per chunk.
-  // Bigger = more meta screening = higher throughput, but can cost quota.
-  const maxListIds = clamp(Number(options?.maxListIds ?? pageSize * 10), pageSize * 2, pageSize * 25);
 
   while (!shouldStop() && ids.length < maxListIds) {
     const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
@@ -222,9 +232,6 @@ export async function scanGmail({ accessToken, options, context }) {
         engineVersion: ENGINE_VERSION,
         daysBack,
         pageSize,
-        queryMode,
-        includePromotions,
-        maxListIds,
         estimatedTotal,
         listed: 0,
         scanned: 0,
@@ -241,6 +248,7 @@ export async function scanGmail({ accessToken, options, context }) {
   }
 
   // Step 2: metadata screening
+  const fromDomainCounts = new Map();
   const meta = await pMap(
     ids,
     concurrency,
@@ -268,7 +276,11 @@ export async function scanGmail({ accessToken, options, context }) {
       const snippet = msg.snippet || "";
       const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
 
+      const fromDomain = extractDomainFromFromHeader(headers.from);
+      if (fromDomain) fromDomainCounts.set(fromDomain, (fromDomainCounts.get(fromDomain) || 0) + 1);
+
       const screen = quickScreenMessage({ from: headers.from, subject: headers.subject, snippet, headerMap: headers.headerMap });
+      statsRef.screenReasons[screen.reason] = (statsRef.screenReasons[screen.reason] || 0) + 1;
       const ok = screen.ok || screen.reason === "weak_signal";
 
       return { id, ok, headers, snippet, dateMs: msgDate.getTime() };
@@ -278,6 +290,8 @@ export async function scanGmail({ accessToken, options, context }) {
 
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
+
+  statsRef.topFromDomains = topNFromMap(fromDomainCounts, 20);
 
   // Step 3: bounded full fetch
   const fullCap = clamp(Number(options?.fullFetchCap ?? 25), 10, 120);
@@ -332,6 +346,10 @@ export async function scanGmail({ accessToken, options, context }) {
 
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
+  // Debug samples can be noisy/PII-adjacent; only include them when explicitly requested.
+  const debugEnabled = Boolean(options?.debug ?? false);
+  const nearMissesOut = debugEnabled ? statsRef.nearMisses : [];
+
   return {
     candidates,
     nextCursor,
@@ -350,6 +368,11 @@ export async function scanGmail({ accessToken, options, context }) {
       rawMatched: rawCandidates.length,
       matched: candidates.length,
       nullReasons: statsRef.nullReasons,
+      screenReasons: statsRef.screenReasons,
+      topFromDomains: statsRef.topFromDomains,
+      nearMisses: nearMissesOut,
+      directoryCount: Array.isArray(context?.directory) ? context.directory.length : null,
+      overridesCount: Array.isArray(context?.overrides) ? context.overrides.length : null,
       deadlineMs,
       fullFetchCap: fullCap,
       tookMs: Date.now() - startedAt,
