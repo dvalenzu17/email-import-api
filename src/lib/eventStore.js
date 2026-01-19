@@ -3,13 +3,9 @@
 // Used by SSE stream: writeEvent() + streamEvents().
 
 export async function writeEvent({ supabase, sessionId, userId, type, payload }) {
-    const row = {
-      session_id: sessionId,
-      user_id: userId,
-      type,
-      payload,
-    };
-  
+    const row = { session_id, user_id, event_type: type, payload };
+await supabase.from("scan_events").insert(row);
+
     const { data, error } = await supabase.from("scan_events").insert(row).select("id").single();
     if (error) throw error;
     return data;
@@ -24,7 +20,7 @@ export async function writeEvent({ supabase, sessionId, userId, type, payload })
     while (!isClosed) {
       const { data, error } = await supabase
         .from("scan_events")
-        .select("id,type,payload,created_at")
+        .select("id,event_type,payload,created_at")
         .eq("session_id", sessionId)
         .eq("user_id", userId)
         .gt("id", cursor)
@@ -32,7 +28,7 @@ export async function writeEvent({ supabase, sessionId, userId, type, payload })
         .limit(200);
   
       if (error) {
-        write({ type: "error", payload: { message: error.message } });
+        write({ type: evt.event_type, payload: evt.payload });
         return;
       }
   
