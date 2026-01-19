@@ -1,40 +1,26 @@
-// src/index.js
+// API/src/index.js
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
-import "dotenv/config";
-import { FastifySSEPlugin } from "fastify-sse-v2";
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { supabaseAdmin } from "./lib/supabaseAdmin.js";
-import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
-import {
-  createScanSession,
-  getScanSession,
-  cancelScanSession,
-  listNewEvents,
-  writeEvent,
-} from "./lib/scanStore.js";
-import { startScanWorker } from "./worker/scanWorker.js";
+import { getMerchantDirectoryCached, getUserOverrides, getUserSubscriptionSignals } from "./lib/merchantData.js";
+import { scanGmail } from "./lib/gmail.js";
+import { createScanSession, getScanSession, updateScanSession } from "./lib/scanStore.js";
+import { writeEvent, streamEvents } from "./lib/eventStore.js";
+import { runScanWorker } from "./worker/scanWorker.js";
 
-const PORT = Number(process.env.PORT ?? 8787);
+const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
-if (!JWT_SECRET) throw new Error("Missing env SUPABASE_JWT_SECRET");
 
-const server = Fastify({
-  logger: { level: process.env.LOG_LEVEL ?? "info" },
-});
+const server = Fastify({ logger: true });
 
-await server.register(cors, { origin: true, credentials: true });
-await server.register(FastifySSEPlugin);
+await server.register(cors, { origin: true });
+await server.register(rateLimit, { global: true, max: 200, timeWindow: "1 minute" });
 
-await server.register(rateLimit, {
-  max: 60,
-  timeWindow: "1 minute",
-  keyGenerator: (req) => req.userId ?? req.ip,
-});
-
+// auth hook
 server.addHook("preHandler", async (req, reply) => {
   if (req.url.startsWith("/health")) return;
 
@@ -56,6 +42,83 @@ server.addHook("preHandler", async (req, reply) => {
 server.get("/health", async () => ({ ok: true }));
 
 /** ---------------------------
+ * Merchant confirm (human-in-the-loop training)
+ * -------------------------- */
+const ConfirmMerchantSchema = z.object({
+  canonicalName: z.string().min(2),
+  // optional helpers
+  from: z.string().optional(),
+  senderEmail: z.string().email().optional(),
+  senderDomain: z.string().min(3).optional(),
+});
+
+function parseSenderEmail(fromHeader = "") {
+  const m = String(fromHeader).match(/<([^>]+)>/);
+  const email = (m?.[1] || fromHeader).trim();
+  if (!email.includes("@")) return null;
+  return email.replace(/^mailto:/i, "").trim();
+}
+
+function parseSenderDomain(fromHeader = "") {
+  const email = parseSenderEmail(fromHeader);
+  if (!email) return null;
+  return email.split("@").pop()?.toLowerCase() || null;
+}
+
+server.post(
+  "/v1/merchant/confirm",
+  { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const parsed = ConfirmMerchantSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+    const userId = req.userId;
+    const canonicalName = String(parsed.data.canonicalName).trim();
+    const from = String(parsed.data.from || "");
+
+    const senderEmail = (parsed.data.senderEmail || parseSenderEmail(from) || "").trim() || null;
+    const senderDomain = (parsed.data.senderDomain || parseSenderDomain(from) || "").trim().toLowerCase() || null;
+
+    if (!senderEmail && !senderDomain) {
+      return reply.code(400).send({ error: "missing_sender", message: "Provide senderEmail/senderDomain or a parsable from." });
+    }
+
+    // Store both (when available).
+    const ops = [];
+    if (senderEmail) {
+      ops.push(
+        supabaseAdmin
+          .from("user_merchant_overrides")
+          .upsert(
+            { user_id: userId, sender_email: senderEmail, sender_domain: null, canonical_name: canonicalName },
+            { onConflict: "user_id,sender_email" }
+          )
+      );
+    }
+    if (senderDomain) {
+      ops.push(
+        supabaseAdmin
+          .from("user_merchant_overrides")
+          .upsert(
+            { user_id: userId, sender_email: null, sender_domain: senderDomain, canonical_name: canonicalName },
+            { onConflict: "user_id,sender_domain" }
+          )
+      );
+    }
+
+    const results = await Promise.all(ops);
+    for (const r of results) {
+      if (r?.error) {
+        req.log.warn({ err: r.error }, "merchant_confirm_failed");
+        return reply.code(400).send({ ok: false, error: "db_error", message: r.error.message });
+      }
+    }
+
+    return { ok: true, canonicalName, senderEmail, senderDomain };
+  }
+);
+
+/** ---------------------------
  * Gmail job: start/status/cancel
  * -------------------------- */
 const StartGmailSchema = z.object({
@@ -70,13 +133,10 @@ const StartGmailSchema = z.object({
       maxPages: z.number().int().min(1).max(400).default(120),
       maxCandidates: z.number().int().min(10).max(400).default(200),
       cursor: z.string().optional(),
-      // Scan scope controls
-      queryMode: z.enum(["transactions", "broad"]).default("transactions"),
-      includePromotions: z.boolean().default(false),
-      // Listing throughput (more IDs per chunk)
-      maxListIds: z.number().int().min(100).max(10000).optional(),
-      // Debug: include nearMiss samples in stats
-      debug: z.boolean().default(false),
+      queryMode: z.enum(["transactions", "broad"]).optional(),
+      includePromotions: z.boolean().optional(),
+      maxListIds: z.number().int().min(300).max(25000).optional(),
+      clusterCap: z.number().int().min(10).max(200).optional(),
     })
     .default({}),
 });
@@ -94,19 +154,13 @@ server.post(
       userId,
       provider: "gmail",
       cursor: parsed.data.options.cursor ?? null,
-      options: {
-        ...parsed.data.options,
-        // store token in-memory only? nope. keep it in session options? also nope.
-        // we do NOT store access tokens in DB. we pass it via events start and keep in worker cache.
-      },
+      options: { ...parsed.data.options },
     });
 
-    // Store access token in memory for worker (per-session)
-    // (worker reads this cache; if process restarts, client must restart the job)
+    // token cache for worker lifetime
     server.scanTokenCache ??= new Map();
     server.scanTokenCache.set(session.id, parsed.data.auth.accessToken);
 
-    // seed hello event so UI updates instantly
     await writeEvent({
       supabase: supabaseAdmin,
       sessionId: session.id,
@@ -119,96 +173,42 @@ server.post(
   }
 );
 
-server.get(
-  "/v1/gmail/scan/status",
-  { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
-  async (req, reply) => {
-    const sessionId = String(req.query?.sessionId || "");
-    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
+server.get("/v1/gmail/scan/stream", async (req, reply) => {
+  const userId = req.userId;
+  const sessionId = String(req.query?.sessionId || "");
+  const afterId = Number(req.query?.afterId || 0);
 
-    const session = await getScanSession({ supabase: supabaseAdmin, sessionId, userId: req.userId });
-    if (!session) return reply.code(404).send({ error: "not_found" });
+  if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
 
-    return { ok: true, session };
-  }
-);
+  reply.raw.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
 
-server.post(
-  "/v1/gmail/scan/cancel",
-  { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
-  async (req, reply) => {
-    const sessionId = String(req.body?.sessionId || "");
-    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
-
-    const ok = await cancelScanSession({ supabase: supabaseAdmin, sessionId, userId: req.userId });
-    return { ok };
-  }
-);
-
-/** ---------------------------
- * Gmail job: SSE stream
- * -------------------------- */
-server.get(
-  "/v1/gmail/scan/stream",
-  { config: { rateLimit: { max: 240, timeWindow: "1 minute" } } },
-  async (req, reply) => {
-    const sessionId = String(req.query?.sessionId || "");
-    const afterId = Number(req.query?.afterId || 0);
-
-    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
-
-    // anti-buffer headers
-    reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
-    reply.raw.setHeader("Connection", "keep-alive");
-    reply.raw.setHeader("X-Accel-Buffering", "no");
-
-    let closed = false;
-    req.socket.on("close", () => (closed = true));
-
-    return reply.sse(
-      (async function* () {
-        let cursor = afterId;
-        let lastPing = 0;
-
-        while (!closed) {
-          const now = Date.now();
-          if (now - lastPing > 2000) {
-            lastPing = now;
-            yield { event: "ping", data: JSON.stringify({ t: now }) };
-          }
-
-          const batch = await listNewEvents({
-            supabase: supabaseAdmin,
-            sessionId,
-            userId: req.userId,
-            afterId: cursor,
-            limit: 100,
-          });
-
-          if (batch.length) {
-            for (const ev of batch) {
-              cursor = ev.id;
-              yield { event: ev.event_type, data: JSON.stringify({ id: ev.id, ...ev.payload }) };
-            }
-
-            const last = batch[batch.length - 1];
-            if (last.event_type === "done" || last.event_type === "error") break;
-          }
-
-          await new Promise((r) => setTimeout(r, 350));
-        }
-      })()
-    );
-  }
-);
-
-// ---- Boot worker ----
-startScanWorker({
-  server,
-  supabase: supabaseAdmin,
-  getDirectory: getMerchantDirectoryCached,
-  getOverrides: getUserOverrides,
+  await streamEvents({
+    supabase: supabaseAdmin,
+    sessionId,
+    userId,
+    afterId,
+    write: (evt) => {
+      reply.raw.write(`event: ${evt.type}\n`);
+      reply.raw.write(`data: ${JSON.stringify(evt.payload)}\n\n`);
+    },
+  });
 });
 
-await server.listen({ port: PORT, host: "0.0.0.0" });
-server.log.info({ port: PORT }, "email-import-api listening");
+server.post("/v1/gmail/scan/run", async (req, reply) => {
+  // worker trigger endpoint (optional) — if you use cron/queue you can remove this
+  const { sessionId } = req.body || {};
+  if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
+
+  const session = await getScanSession({ supabase: supabaseAdmin, sessionId });
+  if (!session) return reply.code(404).send({ error: "not_found" });
+
+  // kick worker inline
+  runScanWorker({ server, sessionId, logger: server.log }).catch((e) => server.log.error(e));
+  return { ok: true };
+});
+
+server.listen({ port: PORT, host: "0.0.0.0" });

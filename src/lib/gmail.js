@@ -1,20 +1,16 @@
-// src/lib/gmail.js
-import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detect.js";
+// API/src/lib/gmail.js
+import { buildCandidate, buildClusterCandidates, aggregateCandidates, quickScreenMessage } from "./detect.js";
 
-const ENGINE_VERSION = "gmail-scan-v105-multipage-attachments-retry";
-
-function b64urlDecode(s) {
-  const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
-  return Buffer.from(padded, "base64").toString("utf8");
-}
+const ENGINE_VERSION = "gmail.v7.cluster-first";
 
 function headersToMap(headers = []) {
-  const map = {};
+  const out = {};
   for (const h of headers || []) {
-    if (!h?.name) continue;
-    map[String(h.name).toLowerCase()] = String(h.value || "");
+    const name = String(h?.name || "").toLowerCase();
+    if (!name) continue;
+    out[name] = String(h?.value || "");
   }
-  return map;
+  return out;
 }
 
 function pickHeaders(headers = []) {
@@ -30,29 +26,15 @@ function pickHeaders(headers = []) {
 }
 
 function buildQuery({ daysBack, queryMode = "transactions", includePromotions = false }) {
-  const base = `in:anywhere newer_than:${daysBack}d -in:spam -in:trash`;
+  // "transactions" = narrower + faster
+  const transactional =
+    '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation" OR "manage subscription" OR "cancel subscription")';
+
+  const base = `in:anywhere newer_than:${daysBack}d -in:chats`;
   const promoFilter = includePromotions ? "" : " -category:promotions -category:social";
 
-  if (queryMode === "broad") {
-    return `${base}${promoFilter}`;
-  }
-
-  const transactional =
-    '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
+  if (queryMode === "broad") return `${base}${promoFilter}`;
   return `${base}${promoFilter} (${transactional})`;
-}
-
-function extractDomainFromFromHeader(from) {
-  const s = String(from || "");
-  const m = s.match(/@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/);
-  return m?.[1] ? m[1].toLowerCase() : "";
-}
-
-function topNFromMap(map, n = 20) {
-  return [...map.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([k, v]) => ({ domain: k, count: v }));
 }
 
 function clamp(n, min, max) {
@@ -82,84 +64,103 @@ async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
   while (true) {
     if (shouldStop?.()) throw new Error("DEADLINE");
     const res = await fetchWithTimeout(url, init, timeoutMs);
+    if (res.ok) return res;
 
-    if ((res.status === 429 || res.status === 403) && attempt < tries - 1) {
-      attempt++;
-      await sleep(jitter(250 * Math.pow(2, attempt)));
+    // retry some transient cases
+    if ([429, 500, 502, 503, 504].includes(res.status) && attempt < tries - 1) {
+      attempt += 1;
+      await sleep(jitter(250 * attempt));
       continue;
     }
     return res;
   }
 }
 
-async function pMap(items, concurrency, fn, shouldStop) {
-  const ret = new Array(items.length);
+async function parallelMap(items, worker, concurrency, shouldStop) {
+  const out = new Array(items.length);
   let idx = 0;
 
-  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
-    while (idx < items.length) {
-      if (shouldStop?.()) break;
+  async function run() {
+    while (true) {
+      if (shouldStop?.()) return;
       const i = idx++;
-      try {
-        ret[i] = await fn(items[i], i);
-      } catch {
-        ret[i] = null;
-      }
-    }
-  });
-
-  await Promise.all(workers);
-  return ret;
-}
-
-async function getAttachment({ accessToken, messageId, attachmentId, timeoutMs, shouldStop }) {
-  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`;
-  const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, timeoutMs, shouldStop);
-  if (!res.ok) return null;
-  const json = await res.json().catch(() => null);
-  if (!json || typeof json.data !== "string") return null;
-  return b64urlDecode(json.data);
-}
-
-async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, attachTimeoutMs, shouldStop, capBytes = 250_000 }) {
-  let text = "";
-  let html = "";
-
-  async function walk(node) {
-    if (!node) return;
-    const mt = node.mimeType;
-    const body = node.body || {};
-
-    if (mt === "text/plain" || mt === "text/html") {
-      if (typeof body.data === "string") {
-        const decoded = b64urlDecode(body.data);
-        if (mt === "text/plain") text += `\n${decoded}`;
-        else html += `\n${decoded}`;
-      } else if (body.attachmentId) {
-        const size = Number(body.size ?? 0);
-        if (Number.isFinite(size) && size > 0 && size <= capBytes) {
-          const decoded = await getAttachment({
-            accessToken,
-            messageId,
-            attachmentId: body.attachmentId,
-            timeoutMs: attachTimeoutMs ?? timeoutMs,
-            shouldStop,
-          });
-          if (decoded) {
-            if (mt === "text/plain") text += `\n${decoded}`;
-            else html += `\n${decoded}`;
-          }
-        }
-      }
-    }
-
-    if (Array.isArray(node.parts)) {
-      for (const p of node.parts) await walk(p);
+      if (i >= items.length) return;
+      out[i] = await worker(items[i], i).catch(() => null);
     }
   }
 
-  await walk(payload);
-  return { text: text.trim() || "", html: html.trim() || "" };
+  const runners = [];
+  for (let i = 0; i < concurrency; i++) runners.push(run());
+  await Promise.all(runners);
+  return out;
+}
+
+function flattenParts(payload) {
+  const out = [];
+  const stack = [payload].filter(Boolean);
+  while (stack.length) {
+    const p = stack.pop();
+    if (!p) continue;
+    out.push(p);
+    const kids = p.parts || [];
+    for (const k of kids) stack.push(k);
+  }
+  return out;
+}
+
+function decodeBase64Url(data) {
+  if (!data) return "";
+  const b64 = data.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+  return Buffer.from(b64 + pad, "base64").toString("utf8");
+}
+
+async function fetchAttachment({ accessToken, messageId, attachmentId, timeoutMs, shouldStop }) {
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`;
+  const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, timeoutMs, shouldStop);
+  if (!res.ok) return "";
+  const j = await res.json().catch(() => null);
+  return decodeBase64Url(j?.data || "");
+}
+
+async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, attachTimeoutMs, shouldStop }) {
+  let text = "";
+  let html = "";
+  const parts = flattenParts(payload);
+
+  for (const p of parts) {
+    const mime = String(p?.mimeType || "").toLowerCase();
+    const body = p?.body || {};
+    const data = body?.data || null;
+    const attId = body?.attachmentId || null;
+    const size = Number(body?.size || 0);
+
+    // inline data
+    if (data && size <= 1024 * 1024) {
+      const decoded = decodeBase64Url(data);
+      if (mime.includes("text/plain")) text += `\n${decoded}`;
+      else if (mime.includes("text/html")) html += `\n${decoded}`;
+      continue;
+    }
+
+    // attachment fetch (bounded)
+    if (attId && size > 0 && size <= 1024 * 512) {
+      const decoded = await fetchAttachment({
+        accessToken,
+        messageId,
+        attachmentId: attId,
+        timeoutMs: attachTimeoutMs,
+        shouldStop,
+      });
+      if (mime.includes("text/plain")) text += `\n${decoded}`;
+      else if (mime.includes("text/html")) html += `\n${decoded}`;
+    }
+  }
+
+  // fallback: payload.body might exist
+  if (!text && payload?.body?.data) text = decodeBase64Url(payload.body.data);
+
+  return { text: text.trim(), html: html.trim() };
 }
 
 export async function scanGmail({ accessToken, options, context }) {
@@ -180,18 +181,18 @@ export async function scanGmail({ accessToken, options, context }) {
   const attachTimeoutMs = clamp(Number(options?.timeouts?.attachMs ?? 12000), 3000, 20000);
 
   const cursor = options?.cursor || undefined;
-  const queryMode = options?.queryMode ?? "transactions";
-  const includePromotions = Boolean(options?.includePromotions ?? false);
-  const maxListIds = clamp(Number(options?.maxListIds ?? (pageSize * 10)), pageSize * 2, pageSize * 25);
-  const q = buildQuery({ daysBack, queryMode, includePromotions });
+  const q = buildQuery({
+    daysBack,
+    queryMode: options?.queryMode || "transactions",
+    includePromotions: !!options?.includePromotions,
+  });
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
-  const statsRef = {
-    nullReasons: Object.create(null),
-    nearMisses: [],
-    screenReasons: Object.create(null),
-    topFromDomains: [],
-  };
+  const statsRef = { nullReasons: Object.create(null) };
+
+  // How many message IDs we allow per chunk.
+  // If you run broad scans, this should be larger; if you run transactional-only, smaller is fine.
+  const maxListIds = clamp(Number(options?.maxListIds ?? pageSize * 3), pageSize, 25000);
 
   // Step 1: list multiple pages quickly
   const ids = [];
@@ -247,51 +248,37 @@ export async function scanGmail({ accessToken, options, context }) {
     };
   }
 
-  // Step 2: metadata screening
-  const fromDomainCounts = new Map();
-  const meta = await pMap(
+  // Step 2: fetch metadata (headers/snippet/date) with bounded concurrency
+  const meta = await parallelMap(
     ids,
-    concurrency,
     async (id) => {
       if (shouldStop()) return null;
 
-      const url = new URL(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}`);
-      url.searchParams.set("format", "metadata");
-      url.searchParams.set("fields", "id,snippet,internalDate,payload/headers");
-      url.searchParams.set("metadataHeaders", "From");
-      url.searchParams.set("metadataHeaders", "Subject");
-      url.searchParams.set("metadataHeaders", "Date");
-      url.searchParams.set("metadataHeaders", "Reply-To");
-      url.searchParams.set("metadataHeaders", "Return-Path");
-      url.searchParams.set("metadataHeaders", "List-Unsubscribe");
-      url.searchParams.set("metadataHeaders", "List-Id");
-      url.searchParams.set("metadataHeaders", "Precedence");
-      url.searchParams.set("metadataHeaders", "Auto-Submitted");
-
-      const res = await fetchRetry(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } }, metaTimeoutMs, shouldStop);
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Reply-To&metadataHeaders=Return-Path&fields=id,internalDate,snippet,payload/headers`;
+      const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, metaTimeoutMs, shouldStop);
       if (!res.ok) return null;
 
       const msg = await res.json();
-      const headers = pickHeaders(msg.payload?.headers ?? []);
-      const snippet = msg.snippet || "";
-      const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
+      const headers = pickHeaders(msg?.payload?.headers || []);
+      const snippet = msg?.snippet || "";
+      const dateMs = Number(msg?.internalDate || 0) || null;
 
-      const fromDomain = extractDomainFromFromHeader(headers.from);
-      if (fromDomain) fromDomainCounts.set(fromDomain, (fromDomainCounts.get(fromDomain) || 0) + 1);
-
-      const screen = quickScreenMessage({ from: headers.from, subject: headers.subject, snippet, headerMap: headers.headerMap });
-      statsRef.screenReasons[screen.reason] = (statsRef.screenReasons[screen.reason] || 0) + 1;
+      const screen = quickScreenMessage({ headers, snippet });
+      // Keep weak-signal for clustering.
       const ok = screen.ok || screen.reason === "weak_signal";
-
-      return { id, ok, headers, snippet, dateMs: msgDate.getTime() };
+      return { id, headers, snippet, dateMs, ok, screenReason: screen.reason };
     },
+    concurrency,
     shouldStop
   );
 
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  statsRef.topFromDomains = topNFromMap(fromDomainCounts, 20);
+  // Step 2.5: cluster-first suspects (metadata only)
+  // This is the "never return 0" engine: even if directory misses, we can still surface likely subscriptions.
+  const clusterCap = clamp(Number(options?.clusterCap ?? 60), 10, 200);
+  const clusterCandidates = buildClusterCandidates(screenedIn, context, Math.min(clusterCap, maxCandidates));
 
   // Step 3: bounded full fetch
   const fullCap = clamp(Number(options?.fullFetchCap ?? 25), 10, 120);
@@ -324,16 +311,16 @@ export async function scanGmail({ accessToken, options, context }) {
       const cand = buildCandidate(
         {
           from: m.headers.from,
-          replyTo: m.headers.replyTo,
-          returnPath: m.headers.returnPath,
           subject: m.headers.subject,
-          snippet: m.snippet,
+          snippet: msg?.snippet || m.snippet || "",
           text: bodies.text,
           html: bodies.html,
           headerMap: m.headers.headerMap,
-          dateMs: m.dateMs,
+          replyTo: m.headers.replyTo,
+          returnPath: m.headers.returnPath,
+          dateMs: Number(msg?.internalDate || m.dateMs || 0) || null,
         },
-        { directory: context?.directory, overrides: context?.overrides, stats: statsRef }
+        { ...context, stats: statsRef }
       );
 
       if (cand) rawCandidates.push(cand);
@@ -346,33 +333,38 @@ export async function scanGmail({ accessToken, options, context }) {
 
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
-  // Debug samples can be noisy/PII-adjacent; only include them when explicitly requested.
-  const debugEnabled = Boolean(options?.debug ?? false);
-  const nearMissesOut = debugEnabled ? statsRef.nearMisses : [];
+  // Merge: prefer fully-parsed candidates, then fill remaining slots with cluster suspects
+  const merged = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    if (!c?.fingerprint || seen.has(c.fingerprint)) continue;
+    seen.add(c.fingerprint);
+    merged.push(c);
+  }
+  for (const c of clusterCandidates) {
+    if (!c?.fingerprint || seen.has(c.fingerprint)) continue;
+    seen.add(c.fingerprint);
+    merged.push(c);
+    if (merged.length >= maxCandidates) break;
+  }
 
   return {
-    candidates,
+    candidates: merged,
     nextCursor,
     stats: {
       engineVersion: ENGINE_VERSION,
       daysBack,
       pageSize,
-      queryMode,
-      includePromotions,
-      maxListIds,
       estimatedTotal,
       listed: ids.length,
       scanned,
       screenedIn: screenedIn.length,
       fullFetched,
       rawMatched: rawCandidates.length,
-      matched: candidates.length,
+      matched: merged.length,
+      matchedFromBodies: candidates.length,
+      matchedFromClusters: clusterCandidates.length,
       nullReasons: statsRef.nullReasons,
-      screenReasons: statsRef.screenReasons,
-      topFromDomains: statsRef.topFromDomains,
-      nearMisses: nearMissesOut,
-      directoryCount: Array.isArray(context?.directory) ? context.directory.length : null,
-      overridesCount: Array.isArray(context?.overrides) ? context.overrides.length : null,
       deadlineMs,
       fullFetchCap: fullCap,
       tookMs: Date.now() - startedAt,
