@@ -2,13 +2,13 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
 import { z } from "zod";
 import "dotenv/config";
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
 import { scanGmail } from "./lib/gmail.js";
+import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
@@ -35,6 +35,7 @@ const server = Fastify({
 
 await server.register(cors, { origin: true, credentials: true });
 
+// Global limiter: keep conservative for “normal” endpoints
 await server.register(rateLimit, {
   max: 30,
   timeWindow: "1 minute",
@@ -115,11 +116,27 @@ const ScanBodySchema = z.object({
     .default({}),
 });
 
-server.post("/v1/email/scan", async (req, reply) => {
-  // ...
-  const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
-  return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
-});
+// Scan routes get higher rate limits (chunked scanning needs it)
+server.post(
+  "/v1/email/scan",
+  { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const parsed = ScanBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    const { provider, imap, auth, options } = parsed.data;
+
+    try {
+      const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
+      return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
+    } catch (e) {
+      req.log.warn({ err: e }, "imap_scan_failed");
+      return reply.code(400).send({ ok: false, error: mapImapError(e) });
+    }
+  }
+);
 
 /** --------------------------
  * Gmail OAuth: scan (FAST, resumable)
@@ -139,48 +156,52 @@ const GmailScanBodySchema = z.object({
       // resumable paging
       cursor: z.string().optional(),
 
-      // NEW: keep request cheap + fast
-      pageSize: z.number().int().min(50).max(500).optional(),      // Gmail list page size
-      maxCandidatesPage: z.number().int().min(5).max(200).optional(), // alias if you want (not required)
+      // chunk tuning
+      pageSize: z.number().int().min(50).max(500).optional(), // Gmail list page size
       deadlineMs: z.number().int().min(8000).max(45000).optional(), // HARD stop per request
-      fullFetchCap: z.number().int().min(10).max(80).optional(),    // max full bodies per request
-      concurrency: z.number().int().min(2).max(8).optional(),       // parallelism (small!)
+      fullFetchCap: z.number().int().min(10).max(120).optional(), // max full bodies per request
+      concurrency: z.number().int().min(2).max(10).optional(), // parallelism (small!)
       timeouts: z
         .object({
           listMs: z.number().int().min(3000).max(15000).optional(),
           metaMs: z.number().int().min(3000).max(15000).optional(),
           fullMs: z.number().int().min(3000).max(20000).optional(),
+          attachMs: z.number().int().min(3000).max(20000).optional(),
         })
         .optional(),
     })
     .default({}),
 });
 
-server.post("/v1/gmail/scan", async (req, reply) => {
-  const parsed = GmailScanBodySchema.safeParse(req.body);
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+server.post(
+  "/v1/gmail/scan",
+  { config: { rateLimit: { max: 180, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const parsed = GmailScanBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+    }
+
+    try {
+      const directory = await getMerchantDirectoryCached();
+      const overrides = await getUserOverrides(req.userId);
+
+      const result = await scanGmail({
+        accessToken: parsed.data.auth.accessToken,
+        options: parsed.data.options,
+        context: { directory, overrides },
+      });
+
+      return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
+    } catch (e) {
+      req.log.warn({ err: e }, "gmail_scan_failed");
+      return reply.code(400).send({
+        ok: false,
+        error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
+      });
+    }
   }
-
-  try {
-    const directory = await getMerchantDirectoryCached();
-    const overrides = await getUserOverrides(req.userId);
-
-    const result = await scanGmail({
-      accessToken: parsed.data.auth.accessToken,
-      options: parsed.data.options,
-      context: { directory, overrides },
-    });
-
-    return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
-  } catch (e) {
-    req.log.warn({ err: e }, "gmail_scan_failed");
-    return reply.code(400).send({
-      ok: false,
-      error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
-    });
-  }
-});
+);
 
 function mapImapError(e) {
   const msg = String(e?.message ?? e);

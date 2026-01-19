@@ -117,7 +117,40 @@ export async function scanGmail({ accessToken, options, context }) {
   const cursor = options?.cursor || undefined;
   const q = buildQuery(daysBack);
 
-  const shouldStop = () => Date.now() > deadlineAt - 750;
+  const shouldStop = () => Date.now() > deadlineAt - 900;
+
+// ---- Step 1: list pages until deadline or enough IDs ----
+let pageToken = cursor || undefined;
+let estimatedTotal = null;
+
+while (!shouldStop() && ids.length < pageSize * 3) { // pull a few pages per call
+  const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+  listUrl.searchParams.set("q", q);
+  listUrl.searchParams.set("maxResults", String(pageSize)); // up to 500 :contentReference[oaicite:5]{index=5}
+  listUrl.searchParams.set("fields", "messages/id,nextPageToken,resultSizeEstimate"); // smaller payload
+  if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
+
+  const listRes = await fetchRetry(
+    listUrl.toString(),
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    listTimeoutMs,
+    shouldStop
+  );
+
+  if (!listRes.ok) {
+    const txt = await listRes.text().catch(() => "");
+    throw new Error(`GMAIL_LIST_FAILED (${listRes.status}): ${txt}`);
+  }
+
+  const listJson = await listRes.json();
+  if (typeof listJson.resultSizeEstimate === "number") estimatedTotal = listJson.resultSizeEstimate;
+
+  const pageIds = (listJson.messages || []).map((m) => m?.id).filter(Boolean);
+  ids.push(...pageIds);
+
+  pageToken = listJson.nextPageToken || null;
+  if (!pageToken) break;
+}
 
   // ---- Step 1: list one page of IDs ----
   const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
@@ -263,7 +296,24 @@ export async function scanGmail({ accessToken, options, context }) {
       // ignore per-email failures
     }
   }
+  function jitter(ms) { return ms + Math.floor(Math.random() * 120); }
 
+  async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
+    let attempt = 0;
+    while (true) {
+      if (shouldStop?.()) throw new Error("DEADLINE");
+      const res = await fetchWithTimeout(url, init, timeoutMs);
+  
+      // retry on quota/rate hiccups
+      if ((res.status === 429 || res.status === 403) && attempt < tries - 1) {
+        attempt++;
+        const backoff = jitter(250 * Math.pow(2, attempt));
+        await sleep(backoff);
+        continue;
+      }
+      return res;
+    }
+  }
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
   return {

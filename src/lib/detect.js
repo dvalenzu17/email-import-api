@@ -20,7 +20,15 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-// ---------- link domain extraction (adds intelligence without hardcoding) ----------
+function bumpNullReason(context, key) {
+  try {
+    const map = context?.stats?.nullReasons;
+    if (!map) return;
+    map[key] = (map[key] || 0) + 1;
+  } catch {}
+}
+
+// ---------- link domain extraction ----------
 function extractLinkDomains({ text = "", html = "" }) {
   const domains = new Set();
   const scan = `${text}\n${html}`;
@@ -76,17 +84,19 @@ const NEGATIVE_SIGNAL_PHRASES = [
   "update",
 ];
 
+// ✅ FIX: don’t treat List-Unsubscribe as “bulk” (too many legit receipts have it)
 function headerIsBulk(headerMap = {}) {
   const h = {};
   for (const [k, v] of Object.entries(headerMap)) h[safeLower(k)] = String(v || "");
   const precedence = safeLower(h["precedence"] || "");
   const autoSubmitted = safeLower(h["auto-submitted"] || "");
   const listId = safeLower(h["list-id"] || "");
-  const listUnsub = safeLower(h["list-unsubscribe"] || "");
+
   const bulk = precedence.includes("bulk") || precedence.includes("list") || precedence.includes("junk");
   const auto = autoSubmitted.includes("auto-generated") || autoSubmitted.includes("auto-replied");
-  const hasList = !!(listId || listUnsub);
-  return bulk || auto || hasList;
+  const hasListId = !!listId;
+
+  return bulk || auto || hasListId;
 }
 
 function classifyEmail({ subject = "", text = "", snippet = "", headerMap = {}, fromDomain = "" }) {
@@ -234,22 +244,20 @@ function inferCadenceFromDates(dates) {
   return null;
 }
 
-// ---------- plan/product extraction (reduces “Subscription” generic junk) ----------
+// ---------- plan/product extraction ----------
 function extractPlan({ subject = "", text = "" }) {
   const s = normalizeTextForParsing(`${subject}\n${text}`);
 
-  // patterns across a bunch of receipts
   const p1 = s.match(/\b(Plan|Membership|Subscription)\b\s*[:\-]\s*([^\n]{2,80})/i);
   if (p1?.[2]) return p1[2].trim();
 
-  // apple reminders often show: “LinkedIn Premium (Monthly)” etc
   const p2 = s.match(/\b([A-Z][A-Za-z0-9+&()'’.\- ]{2,60})\s*\((Monthly|Yearly|Annual|Weekly)\)/);
   if (p2?.[0]) return p2[0].trim();
 
   return null;
 }
 
-// ---------- platform receipts: extract real merchant when sender is aggregator ----------
+// ---------- platform receipts ----------
 function extractAppleLineItemMerchant({ subject = "", text = "", html = "" }) {
   const s = normalizeTextForParsing(`${subject}\n${text}`);
 
@@ -258,85 +266,54 @@ function extractAppleLineItemMerchant({ subject = "", text = "", html = "" }) {
   const provider = s.match(/\b(Content Provider|Developer)\b\s*[:\-]?\s*([^\n]{2,80})/i);
 
   const candidate = (app && app[1]) || (sub && sub[1]) || (provider && provider[2]);
-  if (!candidate) return null;
-
-  return candidate
-    .replace(/\s{2,}.+$/, "")
-    .replace(/\b(total|tax|vat)\b.+$/i, "")
-    .trim();
+  return candidate ? candidate.trim() : null;
 }
 
 function extractPayPalMerchant({ subject = "", text = "" }) {
   const s = normalizeTextForParsing(`${subject}\n${text}`);
-
-  // examples: “You paid $X USD to MERCHANT”
-  const m1 = s.match(/\byou paid\b[^\n]{0,80}\bto\b\s*([^\n]{2,80})/i);
-  if (m1?.[1]) return m1[1].trim();
-
-  // “Receipt for MERCHANT”
-  const m2 = s.match(/\breceipt for\b\s*([^\n]{2,80})/i);
-  if (m2?.[1]) return m2[1].trim();
-
-  return null;
+  const m = s.match(/\bto\b\s+([A-Z][A-Za-z0-9&'’.\- ]{2,60})\b/);
+  return m?.[1] ? m[1].trim() : null;
 }
 
 function extractGooglePlayMerchant({ subject = "", text = "" }) {
   const s = normalizeTextForParsing(`${subject}\n${text}`);
-
-  // “Your Google Play subscription to X”
-  const m1 = s.match(/\b(subscription|subscribed)\b[^\n]{0,40}\bto\b\s*([^\n]{2,80})/i);
-  if (m1?.[2]) return m1[2].trim();
-
-  // “Item: X” sometimes works
-  const m2 = s.match(/\bItem\b\s*[:\-]\s*([^\n]{2,80})/i);
-  if (m2?.[1]) return m2[1].trim();
-
-  return null;
+  const m = s.match(/\bfor\b\s+([A-Z][A-Za-z0-9&'’.\- ]{2,60})\b/);
+  return m?.[1] ? m[1].trim() : null;
 }
 
-// ---------- quick screen (used before fetching full bodies) ----------
-export function quickScreenMessage(message) {
-  const subject = message.subject || "";
-  const snippet = message.snippet || "";
-  const from = message.from || "";
+// ---------- public: quickScreenMessage ----------
+export function quickScreenMessage({ from = "", subject = "", snippet = "", headerMap = {} }) {
+  const s = safeLower(`${from}\n${subject}\n${snippet}`);
 
-  const headerMap = message.headerMap || {};
-  const fromDomain = (from.match(/@([^>\s]+)/)?.[1] || "").toLowerCase();
+  const hardNo = /(porn|sex|viagra|casino|loan|crypto giveaway|airdrop)/i.test(s);
+  if (hardNo) return { ok: false, reason: "hard_no" };
 
-  const c = classifyEmail({ subject, snippet, text: "", headerMap, fromDomain });
+  const weak = /(receipt|invoice|charged|subscription|renew|trial ends|payment)/i.test(s);
+  if (!weak) return { ok: false, reason: "weak_signal" };
 
-  // if bulk+marketing and no transactional hints: hard skip
-  if (c.marketingHeavy && !c.likelyTransactional) {
-    return { ok: false, reason: "marketing_heavy" };
-  }
+  const bulk = headerIsBulk(headerMap);
+  if (bulk && /(newsletter|promo|offer|discount|sale)/i.test(s)) return { ok: false, reason: "marketing" };
 
-  // if it has transactional hints, keep it
-  if (c.likelyTransactional) return { ok: true, reason: "transactional_hint" };
-
-  // otherwise: keep only if subject has any money/billing keyword
-  if (/(receipt|invoice|charged|payment|renew|subscription|trial ends|expires)/i.test(subject)) {
-    return { ok: true, reason: "subject_hint" };
-  }
-
-  return { ok: false, reason: "weak_signal" };
+  return { ok: true, reason: "ok" };
 }
 
-// ---------- aggregation (dedupe + cadence inference + confidence smoothing) ----------
-export function aggregateCandidates(rawCandidates, maxCandidates = 50) {
+// ---------- aggregation ----------
+export function aggregateCandidates(raw, maxCandidates = 80) {
   const groups = new Map();
 
-  for (const c of rawCandidates) {
-    const merchantKey = safeLower(c.merchant || "unknown");
-    const planKey = safeLower(c.plan || "");
-    const amountKey = c.amount ? String(Math.round(c.amount * 100) / 100) : "";
-    const key = `${merchantKey}|${planKey}|${c.currency || ""}|${amountKey}`;
+  for (const c of raw || []) {
+    const key = `${safeLower(c.merchant || "")}::${safeLower(c.plan || "")}`;
+    const prev = groups.get(key);
 
-    if (!groups.has(key)) groups.set(key, { best: c, dates: [], evidence: [] });
+    if (!prev) {
+      groups.set(key, { best: c, dates: c.dateMs ? [c.dateMs] : [], evidence: [c] });
+      continue;
+    }
 
-    const g = groups.get(key);
-    if (c._evidence?.dateMs) g.dates.push(c._evidence.dateMs);
-    g.evidence.push(c);
-    if ((c.confidence || 0) > (g.best.confidence || 0)) g.best = c;
+    prev.evidence.push(c);
+    if (c.dateMs) prev.dates.push(c.dateMs);
+
+    if ((c.confidence || 0) > (prev.best.confidence || 0)) prev.best = c;
   }
 
   const out = [];
@@ -353,13 +330,11 @@ export function aggregateCandidates(rawCandidates, maxCandidates = 50) {
 
     merged.eventCount = evidence.length;
 
-    // boost confidence if we saw repeat billing events (real subscription evidence)
     if (dates.length >= 2 && inferredCadence) {
       merged.confidence = clamp((merged.confidence || 0) + 10, 0, 100);
       merged.reason = [...(merged.reason || []), `Cadence inferred from ${dates.length} emails`];
     }
 
-    // if it's a one-off purchase with weak cadence and no renewal -> cap confidence
     if (dates.length <= 1 && !merged.nextRenewal && !merged.cadence) {
       merged.confidence = Math.min(merged.confidence || 0, 70);
       merged.reason = [...(merged.reason || []), "Single email evidence (capped confidence)"];
@@ -390,7 +365,6 @@ export function buildCandidate(message, context) {
   const dateMs = message.dateMs || null;
 
   const linkDomains = message.linkDomains || extractLinkDomains({ text, html });
-
   const haystack = `${subject}\n${text}\n${snippet}`.slice(0, 20000);
 
   const resolved = resolveMerchant({
@@ -409,9 +383,12 @@ export function buildCandidate(message, context) {
   });
 
   // HARD SKIP: marketing heavy with no transactional evidence
-  if (classifier.marketingHeavy && !classifier.likelyTransactional) return null;
+  if (classifier.marketingHeavy && !classifier.likelyTransactional) {
+    bumpNullReason(context, "marketingHeavy");
+    return null;
+  }
 
-  // platform/aggregator logic: Apple/PayPal/GooglePlay -> extract real merchant
+  // platform/aggregator logic
   let merchant = resolved.canonical || null;
   const fromDomain = resolved.fromDomain || "";
 
@@ -428,10 +405,9 @@ export function buildCandidate(message, context) {
     merchant = platformExtract;
   }
 
-  // require a merchant for non-trials; else ignore
   const isTrial = /\btrial\b/i.test(`${subject}\n${text}`) && !/extend your trial/i.test(`${subject}\n${text}`);
-  if (!merchant && !isTrial) return null;
 
+  // require a merchant for non-trials (unless we later upgrade confidence)
   const money = extractAmount({ subject, text, html });
   const amount = money?.amount ?? null;
   const currency = money?.currency ?? "USD";
@@ -439,55 +415,50 @@ export function buildCandidate(message, context) {
   const nextRenewal = extractNextRenewal({ subject, text, html });
   const plan = extractPlan({ subject, text });
 
-  // cadence is ONLY accepted if we have strong evidence
   let cadence = extractCadence({ subject, text, html });
 
-  // evidence type
   const evidenceType =
     isTrial ? "trial" :
     classifier.appleReceiptHint ? "platform_receipt" :
     classifier.likelyTransactional ? "transactional" :
     "unknown";
 
-  // Confidence: deterministic with ceilings to avoid fake certainty
   let confidence = 0;
   const reason = [];
 
-  // core merchant confidence from resolver
   confidence += Math.min(60, resolved.confidence || 0);
   if (resolved.reason) reason.push(`Resolver: ${resolved.reason}`);
 
-  // content signals
   if (classifier.likelyTransactional) {
     confidence += 12;
     reason.push("Transactional language");
   }
+
   if (classifier.bulkHeader) {
     confidence -= 10;
     reason.push("Bulk/list header detected");
   }
+
   if (resolved.signals?.personalSenderDomain) {
     confidence -= 15;
     reason.push("Sender domain looks consumer");
   }
+
   if (platformExtract) {
     confidence += 10;
     reason.push("Extracted merchant from platform email");
   }
 
-  // amount is strong, but only if transactional-ish
   if (amount && classifier.likelyTransactional) {
     confidence += 10;
     reason.push("Found amount near billing keywords");
   }
 
-  // renewal date is a strong subscription indicator
   if (nextRenewal) {
     confidence += 8;
     reason.push("Found renewal/expiry date");
   }
 
-  // cadence: only trust if renewal exists OR multiple events later (aggregation)
   if (cadence && (nextRenewal || classifier.likelyTransactional)) {
     confidence += 4;
     reason.push("Detected cadence");
@@ -495,16 +466,30 @@ export function buildCandidate(message, context) {
     cadence = null;
   }
 
-  // Floors / ceilings
+  // ✅ Open-world upgrade: allow fallback-domain merchants if billing proof is strong
+  const strongBillingProof = (!!amount && classifier.likelyTransactional) || !!nextRenewal;
+  if (resolved.reason === "fallback-domain" && strongBillingProof) {
+    confidence += 18;
+    reason.push("Fallback merchant accepted due to strong billing proof");
+    if (!merchant) merchant = resolved.canonical || resolved.pretty || merchant;
+  }
+
   confidence = clamp(confidence, 0, 100);
 
-  // If we’re missing amount + missing renewal + missing cadence and not trial: too weak
   const weak = !amount && !nextRenewal && !cadence && !isTrial;
   if (weak) confidence = Math.min(confidence, 55);
 
-  // Final guard: avoid low-confidence spam
+  // If still no merchant and not trial, drop (now that we’ve given it a chance)
+  if (!merchant && !isTrial) {
+    bumpNullReason(context, "noMerchant");
+    return null;
+  }
+
   const floor = isTrial ? 35 : 45;
-  if (confidence < floor) return null;
+  if (confidence < floor) {
+    bumpNullReason(context, "lowConfidence");
+    return null;
+  }
 
   const label = confidence >= 80 ? "High" : confidence >= 55 ? "Medium" : "Low";
 
@@ -519,9 +504,7 @@ export function buildCandidate(message, context) {
     evidenceType,
     confidence,
     confidenceLabel: label,
-    sender: resolved.fromDomain ? `${resolved.fromDomain}` : from,
-    subject,
+    dateMs,
     reason,
-    _evidence: { dateMs },
   };
 }

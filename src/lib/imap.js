@@ -42,6 +42,8 @@ export async function scanImap({ provider, imap, auth, options, userId }) {
   const directory = await getMerchantDirectoryCached();
   const overrides = userId ? await getUserOverrides(userId) : [];
 
+  const statsRef = { nullReasons: Object.create(null) };
+
   await client.connect();
   try {
     const lock = await client.getMailboxLock("INBOX");
@@ -66,12 +68,12 @@ export async function scanImap({ provider, imap, auth, options, userId }) {
           ? formatAddress(header.envelope.from[0].name, header.envelope.from[0].address)
           : "";
 
-        // Conservative but not blind: always pull full for non-bulk-ish subjects
-        // (IMAP doesn’t easily give list-unsub without full, so we keep it simple)
+        // Quick skip for obvious marketing (cheap pre-filter)
         const looksMarketing = /(promo|newsletter|offer|discount|sale|recommended|update)/i.test(`${subject} ${from}`);
         if (looksMarketing) {
           scanned += 1;
           lastProcessedUid = uid;
+          statsRef.nullReasons.marketingPrefilter = (statsRef.nullReasons.marketingPrefilter || 0) + 1;
           continue;
         }
 
@@ -96,7 +98,7 @@ export async function scanImap({ provider, imap, auth, options, userId }) {
             headerMap,
             dateMs: msgDate.getTime(),
           },
-          { directory, overrides }
+          { directory, overrides, stats: statsRef }
         );
 
         scanned += 1;
@@ -112,7 +114,13 @@ export async function scanImap({ provider, imap, auth, options, userId }) {
 
       return {
         candidates,
-        stats: { scanned, fullFetched, rawMatched: raw.length, matched: candidates.length },
+        stats: {
+          scanned,
+          fullFetched,
+          rawMatched: raw.length,
+          matched: candidates.length,
+          nullReasons: statsRef.nullReasons,
+        },
         nextCursor,
       };
     } finally {
