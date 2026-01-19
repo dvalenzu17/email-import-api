@@ -3,9 +3,6 @@ import { buildCandidate, aggregateCandidates, quickScreenMessage } from "./detec
 
 const ENGINE_VERSION = "gmail-scan-v105-multipage-attachments-retry";
 
-/** -----------------------
- * Helpers
- * ---------------------- */
 function b64urlDecode(s) {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=");
   return Buffer.from(padded, "base64").toString("utf8");
@@ -33,10 +30,10 @@ function pickHeaders(headers = []) {
 }
 
 function buildQuery(daysBack) {
-  // Focus on transactional language to avoid promos/newsletters.
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation")';
-  return `in:anywhere newer_than:${daysBack}d (${transactional})`;
+  // reduce garbage
+  return `in:anywhere newer_than:${daysBack}d -category:promotions -category:social (${transactional})`;
 }
 
 function clamp(n, min, max) {
@@ -67,11 +64,9 @@ async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
     if (shouldStop?.()) throw new Error("DEADLINE");
     const res = await fetchWithTimeout(url, init, timeoutMs);
 
-    // retry on quota/rate hiccups
     if ((res.status === 429 || res.status === 403) && attempt < tries - 1) {
       attempt++;
-      const backoff = jitter(250 * Math.pow(2, attempt));
-      await sleep(backoff);
+      await sleep(jitter(250 * Math.pow(2, attempt)));
       continue;
     }
     return res;
@@ -98,32 +93,16 @@ async function pMap(items, concurrency, fn, shouldStop) {
   return ret;
 }
 
-/** -----------------------
- * Attachment + body extract
- * ---------------------- */
 async function getAttachment({ accessToken, messageId, attachmentId, timeoutMs, shouldStop }) {
   const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`;
-  const res = await fetchRetry(
-    url,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-    timeoutMs,
-    shouldStop
-  );
+  const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, timeoutMs, shouldStop);
   if (!res.ok) return null;
   const json = await res.json().catch(() => null);
   if (!json || typeof json.data !== "string") return null;
   return b64urlDecode(json.data);
 }
 
-async function extractBodiesFull({
-  accessToken,
-  messageId,
-  payload,
-  timeoutMs,
-  attachTimeoutMs,
-  shouldStop,
-  capBytes = 250_000,
-}) {
+async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, attachTimeoutMs, shouldStop, capBytes = 250_000 }) {
   let text = "";
   let html = "";
 
@@ -155,9 +134,8 @@ async function extractBodiesFull({
       }
     }
 
-    const parts = node.parts;
-    if (Array.isArray(parts)) {
-      for (const p of parts) await walk(p);
+    if (Array.isArray(node.parts)) {
+      for (const p of node.parts) await walk(p);
     }
   }
 
@@ -165,17 +143,14 @@ async function extractBodiesFull({
   return { text: text.trim() || "", html: html.trim() || "" };
 }
 
-/** -----------------------
- * Public: scanGmail
- * ---------------------- */
 export async function scanGmail({ accessToken, options, context }) {
   const startedAt = Date.now();
 
-  const daysBack = Number(options?.daysBack ?? 730);
+  const daysBack = Number(options?.daysBack ?? 365);
   const pageSize = clamp(Number(options?.pageSize ?? 500), 50, 500);
-  const maxCandidates = clamp(Number(options?.maxCandidates ?? 80), 10, 200);
+  const maxCandidates = clamp(Number(options?.maxCandidates ?? 200), 10, 400);
 
-  const deadlineMs = clamp(Number(options?.deadlineMs ?? 35000), 8000, 45000);
+  const deadlineMs = clamp(Number(options?.deadlineMs ?? 9000), 8000, 45000);
   const deadlineAt = startedAt + deadlineMs;
 
   const concurrency = clamp(Number(options?.concurrency ?? 6), 2, 10);
@@ -187,16 +162,12 @@ export async function scanGmail({ accessToken, options, context }) {
 
   const cursor = options?.cursor || undefined;
   const q = buildQuery(daysBack);
-
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
-  // debug counters (feeds the UI + helps you not go blind again)
   const statsRef = { nullReasons: Object.create(null) };
 
-  /** -----------------------
-   * Step 1: list MULTIPLE pages (until deadline)
-   * ---------------------- */
-  const ids = []; // ✅ defined once, used everywhere
+  // Step 1: list multiple pages quickly
+  const ids = [];
   let estimatedTotal = null;
   let pageToken = cursor || undefined;
 
@@ -207,12 +178,7 @@ export async function scanGmail({ accessToken, options, context }) {
     listUrl.searchParams.set("fields", "messages/id,nextPageToken,resultSizeEstimate");
     if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
 
-    const listRes = await fetchRetry(
-      listUrl.toString(),
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-      listTimeoutMs,
-      shouldStop
-    );
+    const listRes = await fetchRetry(listUrl.toString(), { headers: { Authorization: `Bearer ${accessToken}` } }, listTimeoutMs, shouldStop);
 
     if (!listRes.ok) {
       const txt = await listRes.text().catch(() => "");
@@ -220,15 +186,9 @@ export async function scanGmail({ accessToken, options, context }) {
     }
 
     const listJson = await listRes.json();
+    if (typeof listJson.resultSizeEstimate === "number") estimatedTotal = listJson.resultSizeEstimate;
 
-    if (typeof listJson.resultSizeEstimate === "number") {
-      estimatedTotal = listJson.resultSizeEstimate;
-    }
-
-    const pageIds = (Array.isArray(listJson.messages) ? listJson.messages : [])
-      .map((m) => m?.id)
-      .filter(Boolean);
-
+    const pageIds = (Array.isArray(listJson.messages) ? listJson.messages : []).map((m) => m?.id).filter(Boolean);
     ids.push(...pageIds);
 
     pageToken = listJson.nextPageToken || null;
@@ -260,9 +220,7 @@ export async function scanGmail({ accessToken, options, context }) {
     };
   }
 
-  /** -----------------------
-   * Step 2: metadata screening
-   * ---------------------- */
+  // Step 2: metadata screening
   const meta = await pMap(
     ids,
     concurrency,
@@ -282,12 +240,7 @@ export async function scanGmail({ accessToken, options, context }) {
       url.searchParams.set("metadataHeaders", "Precedence");
       url.searchParams.set("metadataHeaders", "Auto-Submitted");
 
-      const res = await fetchRetry(
-        url.toString(),
-        { headers: { Authorization: `Bearer ${accessToken}` } },
-        metaTimeoutMs,
-        shouldStop
-      );
+      const res = await fetchRetry(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } }, metaTimeoutMs, shouldStop);
       if (!res.ok) return null;
 
       const msg = await res.json();
@@ -295,14 +248,7 @@ export async function scanGmail({ accessToken, options, context }) {
       const snippet = msg.snippet || "";
       const msgDate = headers.date ? new Date(headers.date) : new Date(Number(msg.internalDate || Date.now()));
 
-      const screen = quickScreenMessage({
-        from: headers.from,
-        subject: headers.subject,
-        snippet,
-        headerMap: headers.headerMap,
-      });
-
-      // keep “weak_signal” in, but still needs real proof later
+      const screen = quickScreenMessage({ from: headers.from, subject: headers.subject, snippet, headerMap: headers.headerMap });
       const ok = screen.ok || screen.reason === "weak_signal";
 
       return { id, ok, headers, snippet, dateMs: msgDate.getTime() };
@@ -313,10 +259,8 @@ export async function scanGmail({ accessToken, options, context }) {
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  /** -----------------------
-   * Step 3: full fetch only for a bounded subset
-   * ---------------------- */
-  const fullCap = clamp(Number(options?.fullFetchCap ?? 50), 10, 120);
+  // Step 3: bounded full fetch
+  const fullCap = clamp(Number(options?.fullFetchCap ?? 25), 10, 120);
   const fullTargets = screenedIn.slice(0, fullCap);
 
   const rawCandidates = [];
@@ -328,12 +272,7 @@ export async function scanGmail({ accessToken, options, context }) {
     const m = fullTargets[i];
     try {
       const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full&fields=id,internalDate,payload,snippet`;
-      const res = await fetchRetry(
-        url,
-        { headers: { Authorization: `Bearer ${accessToken}` } },
-        fullTimeoutMs,
-        shouldStop
-      );
+      const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, fullTimeoutMs, shouldStop);
       if (!res.ok) continue;
 
       const msg = await res.json();
@@ -360,19 +299,14 @@ export async function scanGmail({ accessToken, options, context }) {
           headerMap: m.headers.headerMap,
           dateMs: m.dateMs,
         },
-        {
-          directory: context?.directory,
-          overrides: context?.overrides,
-          stats: statsRef, // ✅ enables nullReasons tracking
-        }
+        { directory: context?.directory, overrides: context?.overrides, stats: statsRef }
       );
 
       if (cand) rawCandidates.push(cand);
       if (rawCandidates.length >= maxCandidates) break;
-
       if (i % 8 === 0) await sleep(10);
     } catch {
-      // ignore per-email failures
+      // ignore
     }
   }
 

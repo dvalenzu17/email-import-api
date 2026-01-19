@@ -4,52 +4,39 @@ import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import { z } from "zod";
 import "dotenv/config";
-
-import { FastifySSEPlugin } from "fastify-sse-v2"; // ✅ Fastify v4 compatible :contentReference[oaicite:2]{index=2}
+import { FastifySSEPlugin } from "fastify-sse-v2";
 
 import { verifySupabaseJwt } from "./lib/jwt.js";
-import { verifyImapConnection, scanImap } from "./lib/imap.js";
-import { scanGmail } from "./lib/gmail.js";
+import { supabaseAdmin } from "./lib/supabaseAdmin.js";
 import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
+import {
+  createScanSession,
+  getScanSession,
+  cancelScanSession,
+  listNewEvents,
+  writeEvent,
+} from "./lib/scanStore.js";
+import { startScanWorker } from "./worker/scanWorker.js";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
-
 if (!JWT_SECRET) throw new Error("Missing env SUPABASE_JWT_SECRET");
 
 const server = Fastify({
-  logger: {
-    level: process.env.LOG_LEVEL ?? "info",
-    redact: {
-      paths: [
-        "req.headers.authorization",
-        "req.headers.x-gmail-access-token",
-        "req.body.auth.pass",
-        "req.body.auth.password",
-        "req.body.auth.accessToken",
-        "req.body.auth.refreshToken",
-      ],
-      remove: true,
-    },
-  },
+  logger: { level: process.env.LOG_LEVEL ?? "info" },
 });
 
 await server.register(cors, { origin: true, credentials: true });
-await server.register(FastifySSEPlugin, {
-  // optional: tweak retry delay the client sees
-  // retryDelay: 3000,
-});
+await server.register(FastifySSEPlugin);
 
-// Global limiter (keep strict for normal endpoints)
 await server.register(rateLimit, {
-  max: 30,
+  max: 60,
   timeWindow: "1 minute",
   keyGenerator: (req) => req.userId ?? req.ip,
 });
 
-// ---- Auth hook ----
 server.addHook("preHandler", async (req, reply) => {
-  if (req.url === "/health") return;
+  if (req.url.startsWith("/health")) return;
 
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
@@ -68,260 +55,153 @@ server.addHook("preHandler", async (req, reply) => {
 
 server.get("/health", async () => ({ ok: true }));
 
-/** --------------------------
- * IMAP: verify + scan
+/** ---------------------------
+ * Gmail job: start/status/cancel
  * -------------------------- */
-const ProviderSchema = z.enum(["icloud", "yahoo", "aol", "other"]);
-
-const ImapSchema = z.object({
-  host: z.string().min(1),
-  port: z.number().int().min(1).max(65535),
-  secure: z.boolean(),
-});
-
-const AuthSchema = z.object({
-  user: z.string().min(3),
-  pass: z.string().min(3),
-});
-
-const VerifyBodySchema = z.object({
-  provider: ProviderSchema,
-  imap: ImapSchema,
-  auth: AuthSchema,
-});
-
-server.post("/v1/email/verify", async (req, reply) => {
-  const parsed = VerifyBodySchema.safeParse(req.body);
-  if (!parsed.success) {
-    return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-  }
-
-  const { provider, imap, auth } = parsed.data;
-
-  try {
-    const result = await verifyImapConnection({ provider, imap, auth });
-    return { ok: true, mailbox: result.mailbox, capabilities: result.capabilities };
-  } catch (e) {
-    req.log.warn({ err: e, provider }, "imap_verify_failed");
-    return reply.code(400).send({ ok: false, error: mapImapError(e) });
-  }
-});
-
-const ScanBodySchema = z.object({
-  provider: ProviderSchema,
-  imap: ImapSchema,
-  auth: AuthSchema,
-  options: z
-    .object({
-      daysBack: z.number().int().min(1).max(3650).default(180),
-      maxMessages: z.number().int().min(1).max(5000).default(500),
-      maxCandidates: z.number().int().min(1).max(200).default(60),
-      cursor: z.string().optional(),
-    })
-    .default({}),
-});
-
-server.post(
-  "/v1/email/scan",
-  { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
-  async (req, reply) => {
-    const parsed = ScanBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
-
-    const { provider, imap, auth, options } = parsed.data;
-
-    try {
-      const result = await scanImap({ provider, imap, auth, options, userId: req.userId });
-      return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
-    } catch (e) {
-      req.log.warn({ err: e }, "imap_scan_failed");
-      return reply.code(400).send({ ok: false, error: mapImapError(e) });
-    }
-  }
-);
-
-/** --------------------------
- * Gmail: scan (chunked JSON)
- * -------------------------- */
-const GmailScanBodySchema = z.object({
-  auth: z.object({
-    accessToken: z.string().min(10),
-  }),
+const StartGmailSchema = z.object({
+  auth: z.object({ accessToken: z.string().min(10) }),
   options: z
     .object({
       daysBack: z.number().int().min(1).max(3650).default(365),
-      maxCandidates: z.number().int().min(1).max(200).default(80),
+      pageSize: z.number().int().min(50).max(500).default(500),
+      chunkMs: z.number().int().min(8000).max(20000).default(9000),
+      fullFetchCap: z.number().int().min(10).max(120).default(25),
+      concurrency: z.number().int().min(2).max(10).default(6),
+      maxPages: z.number().int().min(1).max(400).default(120),
+      maxCandidates: z.number().int().min(10).max(400).default(200),
       cursor: z.string().optional(),
-      pageSize: z.number().int().min(50).max(500).optional(),
-      deadlineMs: z.number().int().min(8000).max(45000).optional(),
-      fullFetchCap: z.number().int().min(10).max(120).optional(),
-      concurrency: z.number().int().min(2).max(10).optional(),
-      timeouts: z
-        .object({
-          listMs: z.number().int().min(3000).max(15000).optional(),
-          metaMs: z.number().int().min(3000).max(15000).optional(),
-          fullMs: z.number().int().min(3000).max(20000).optional(),
-          attachMs: z.number().int().min(3000).max(20000).optional(),
-        })
-        .optional(),
     })
     .default({}),
 });
 
 server.post(
-  "/v1/gmail/scan",
-  { config: { rateLimit: { max: 180, timeWindow: "1 minute" } } },
+  "/v1/gmail/scan/start",
+  { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
   async (req, reply) => {
-    const parsed = GmailScanBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    const parsed = StartGmailSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
 
-    try {
-      const directory = await getMerchantDirectoryCached();
-      const overrides = await getUserOverrides(req.userId);
+    const userId = req.userId;
+    const session = await createScanSession({
+      supabase: supabaseAdmin,
+      userId,
+      provider: "gmail",
+      cursor: parsed.data.options.cursor ?? null,
+      options: {
+        ...parsed.data.options,
+        // store token in-memory only? nope. keep it in session options? also nope.
+        // we do NOT store access tokens in DB. we pass it via events start and keep in worker cache.
+      },
+    });
 
-      const result = await scanGmail({
-        accessToken: parsed.data.auth.accessToken,
-        options: parsed.data.options,
-        context: { directory, overrides },
-      });
+    // Store access token in memory for worker (per-session)
+    // (worker reads this cache; if process restarts, client must restart the job)
+    server.scanTokenCache ??= new Map();
+    server.scanTokenCache.set(session.id, parsed.data.auth.accessToken);
 
-      return { ok: true, stats: result.stats, candidates: result.candidates, nextCursor: result.nextCursor };
-    } catch (e) {
-      req.log.warn({ err: e }, "gmail_scan_failed");
-      return reply.code(400).send({
-        ok: false,
-        error: { code: "GMAIL_SCAN_FAILED", message: String(e?.message ?? e) },
-      });
-    }
+    // seed hello event so UI updates instantly
+    await writeEvent({
+      supabase: supabaseAdmin,
+      sessionId: session.id,
+      userId,
+      type: "hello",
+      payload: { ok: true, sessionId: session.id },
+    });
+
+    return { ok: true, sessionId: session.id, status: session.status };
   }
 );
 
-/** --------------------------
- * Gmail: SSE stream (LIVE progress + candidates)
- * -------------------------- */
-const GmailStreamQuerySchema = z.object({
-  cursor: z.string().optional(),
-  daysBack: z.coerce.number().int().min(1).max(3650).optional(),
-  pageSize: z.coerce.number().int().min(50).max(500).optional(),
-  // Keep chunks small so UI updates fast
-  chunkMs: z.coerce.number().int().min(8000).max(20000).optional(),
-  fullFetchCap: z.coerce.number().int().min(10).max(120).optional(),
-  concurrency: z.coerce.number().int().min(2).max(10).optional(),
-  maxPages: z.coerce.number().int().min(1).max(120).optional(),
-});
-
 server.get(
-  "/v1/gmail/scan/stream",
+  "/v1/gmail/scan/status",
+  { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const sessionId = String(req.query?.sessionId || "");
+    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
+
+    const session = await getScanSession({ supabase: supabaseAdmin, sessionId, userId: req.userId });
+    if (!session) return reply.code(404).send({ error: "not_found" });
+
+    return { ok: true, session };
+  }
+);
+
+server.post(
+  "/v1/gmail/scan/cancel",
   { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
   async (req, reply) => {
-    const parsed = GmailStreamQuerySchema.safeParse(req.query || {});
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-    }
+    const sessionId = String(req.body?.sessionId || "");
+    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
 
-    const accessToken = req.headers["x-gmail-access-token"];
-    if (!accessToken || typeof accessToken !== "string" || accessToken.length < 10) {
-      return reply.code(400).send({ error: "missing_x_gmail_access_token" });
-    }
+    const ok = await cancelScanSession({ supabase: supabaseAdmin, sessionId, userId: req.userId });
+    return { ok };
+  }
+);
 
-    const directory = await getMerchantDirectoryCached();
-    const overrides = await getUserOverrides(req.userId);
+/** ---------------------------
+ * Gmail job: SSE stream
+ * -------------------------- */
+server.get(
+  "/v1/gmail/scan/stream",
+  { config: { rateLimit: { max: 240, timeWindow: "1 minute" } } },
+  async (req, reply) => {
+    const sessionId = String(req.query?.sessionId || "");
+    const afterId = Number(req.query?.afterId || 0);
 
-    const baseOptions = {
-      daysBack: parsed.data.daysBack ?? 365,
-      pageSize: parsed.data.pageSize ?? 500,
-      deadlineMs: parsed.data.chunkMs ?? 9000, // ✅ frequent UI updates
-      fullFetchCap: parsed.data.fullFetchCap ?? 35,
-      concurrency: parsed.data.concurrency ?? 6,
-      maxCandidates: 200,
-    };
+    if (!sessionId) return reply.code(400).send({ error: "missing_sessionId" });
 
-    let cursor = parsed.data.cursor ?? null;
-    let pages = 0;
-    const maxPages = parsed.data.maxPages ?? 60;
-
-    let foundTotal = 0;
-    let scannedTotal = 0;
+    // anti-buffer headers
+    reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+    reply.raw.setHeader("Connection", "keep-alive");
+    reply.raw.setHeader("X-Accel-Buffering", "no");
 
     let closed = false;
-    req.socket.on("close", () => {
-      closed = true;
-    });
+    req.socket.on("close", () => (closed = true));
 
-    // ✅ Streaming via AsyncIterable source :contentReference[oaicite:3]{index=3}
     return reply.sse(
-      (async function* source() {
-        yield { event: "hello", data: JSON.stringify({ ok: true }) };
+      (async function* () {
+        let cursor = afterId;
+        let lastPing = 0;
 
-        try {
-          while (!closed && pages < maxPages) {
-            pages += 1;
-
-            const result = await scanGmail({
-              accessToken,
-              options: { ...baseOptions, cursor: cursor || undefined },
-              context: { directory, overrides },
-            });
-
-            cursor = result?.nextCursor ?? null;
-
-            scannedTotal += Number(result?.stats?.scanned || 0);
-            foundTotal += (result?.candidates?.length || 0);
-
-            yield {
-              event: "progress",
-              data: JSON.stringify({
-                ...result.stats,
-                pages,
-                cursor,
-                scannedTotal,
-                foundTotal,
-              }),
-            };
-
-            if (result?.candidates?.length) {
-              yield {
-                event: "candidates",
-                data: JSON.stringify({ candidates: result.candidates }),
-              };
-            }
-
-            if (!cursor) break;
+        while (!closed) {
+          const now = Date.now();
+          if (now - lastPing > 2000) {
+            lastPing = now;
+            yield { event: "ping", data: JSON.stringify({ t: now }) };
           }
 
-          yield {
-            event: "done",
-            data: JSON.stringify({ ok: true, pages, cursor, scannedTotal, foundTotal }),
-          };
-        } catch (e) {
-          yield {
-            event: "error",
-            data: JSON.stringify({ ok: false, message: String(e?.message ?? e) }),
-          };
+          const batch = await listNewEvents({
+            supabase: supabaseAdmin,
+            sessionId,
+            userId: req.userId,
+            afterId: cursor,
+            limit: 100,
+          });
+
+          if (batch.length) {
+            for (const ev of batch) {
+              cursor = ev.id;
+              yield { event: ev.event_type, data: JSON.stringify({ id: ev.id, ...ev.payload }) };
+            }
+
+            const last = batch[batch.length - 1];
+            if (last.event_type === "done" || last.event_type === "error") break;
+          }
+
+          await new Promise((r) => setTimeout(r, 350));
         }
       })()
     );
   }
 );
 
-function mapImapError(e) {
-  const msg = String(e?.message ?? e);
-
-  if (/AUTHENTICATIONFAILED|Invalid credentials|Login failed/i.test(msg)) {
-    return { code: "AUTH_FAILED", message: "Login failed. Check email + app password." };
-  }
-  if (/Application-specific password|app password|2-step|two-factor|2fa/i.test(msg)) {
-    return { code: "NEEDS_APP_PASSWORD", message: "Provider requires an app-specific password." };
-  }
-  if (/timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(msg)) {
-    return { code: "NETWORK_ERROR", message: "Network error connecting to mail server." };
-  }
-  return { code: "UNKNOWN", message: "Could not connect. Try again or check server settings." };
-}
+// ---- Boot worker ----
+startScanWorker({
+  server,
+  supabase: supabaseAdmin,
+  getDirectory: getMerchantDirectoryCached,
+  getOverrides: getUserOverrides,
+});
 
 await server.listen({ port: PORT, host: "0.0.0.0" });
-server.log.info({ port: PORT }, "sublytics-email-import-api listening");
+server.log.info({ port: PORT }, "email-import-api listening");
