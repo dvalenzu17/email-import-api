@@ -4,6 +4,8 @@ import "./worker/scanWorker.js";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
+import observability from "./plugins/observability.js";
+
 import { z } from "zod";
 
 // --- auth / supabase ---
@@ -31,10 +33,17 @@ const JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
 await startOtel().catch(() => {}); // don’t crash if OTEL not configured
 
-const server = Fastify({ logger: true });
+const server = Fastify({ logger: { level: process.env.LOG_LEVEL || "info" } });
+
+await server.register(observability);
+
+server.get("/metrics", metricsHandler);
+server.get("/health", async () => ({ ok: true }));
 
 await server.register(cors, { origin: true });
 await server.register(rateLimit, { global: true, max: 200, timeWindow: "1 minute" });
+await server.listen({ port: Number(process.env.PORT || 8787), host: "0.0.0.0" });
+
 
 // Attach shared deps
 server.supabaseAdmin = supabaseAdmin;
