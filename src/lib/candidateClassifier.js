@@ -1,48 +1,133 @@
 // src/lib/candidateClassifier.js
+// Event-type classification + negative filters.
+// Fixes: "TOTAL:" (Udemy course brand) false positives by requiring *money-like* patterns for receipts.
 
-const POS_BILLING = [
-    "receipt", "invoice", "payment", "paid", "charged", "order", "renewal",
-    "subscription", "membership", "billing", "statement", "your plan",
-    "total:", "amount", "tax", "subtotal", "transaction id",
+const EVENT_RULES = [
+    {
+      type: "payment_failed",
+      hits: [
+        "payment was unsuccessful",
+        "payment failed",
+        "problem with your payment",
+        "card declined",
+        "update your card",
+        "unable to process",
+        "past due",
+        "action required to keep",
+      ],
+    },
+    {
+      type: "paused",
+      hits: ["membership is paused", "subscription is paused", "your membership is paused", "pause end date", "pause start date"],
+    },
+    {
+      type: "cancellation",
+      hits: ["canceled", "cancelled", "subscription ended", "membership ended", "has been cancelled", "sorry to see you go"],
+    },
+    { type: "trial", hits: ["free trial", "trial ends", "trial will end", "trial ending", "start your trial", "your trial"] },
+    {
+      type: "renewal",
+      hits: ["renewal", "will renew", "renews on", "auto-renew", "auto renew", "next billing", "billing date", "your plan renews"],
+    },
   ];
   
   const NEG_MARKETING = [
-    "announcement", "newsletter", "new course", "recommended", "thinking about",
-    "enroll", "enrollments", "instructor", "course", "certificate path",
-    "promotion", "sale", "discount", "offer", "last chance", "watch now",
+    "announcement",
+    "newsletter",
+    "recommended",
+    "digest",
+    "top picks",
+    "watch now",
+    "new episode",
+    "new course",
+    "instructor",
+    "enroll",
+    "enrollments",
+    "course",
+    "certification",
+    "promotion",
+    "sale",
+    "discount",
+    "offer",
+    "deal",
+    "limited time",
+    "last chance",
+    "introducing",
   ];
   
-  const EVENT_KEYWORDS = [
-    { type: "payment_failed", hits: ["payment was unsuccessful", "payment failed", "problem with your payment", "card declined", "update your card"] },
-    { type: "paused", hits: ["membership is paused", "paused", "pause end date", "pause start date"] },
-    { type: "cancellation", hits: ["canceled", "cancelled", "has been cancelled", "subscription ended"] },
-    { type: "trial", hits: ["trial", "free trial", "trial ends", "trial will end"] },
-    { type: "renewal", hits: ["renewal", "will renew", "renews on", "next billing", "billing date", "auto-renew"] },
-    { type: "receipt", hits: ["receipt", "invoice", "thank you for your purchase", "order confirmation", "payment received"] },
+  const POS_BILLING = [
+    "receipt",
+    "invoice",
+    "charged",
+    "charge",
+    "payment",
+    "paid",
+    "billing",
+    "subscription",
+    "membership",
+    "renew",
+    "auto-renew",
+    "order confirmation",
+    "transaction id",
+    "payment received",
+    "thank you for your purchase",
   ];
   
-  function norm(s) {
-    return String(s || "").toLowerCase();
+  function normText({ subject, snippet, from }) {
+    return `${subject || ""}\n${snippet || ""}\n${from || ""}`.toLowerCase();
+  }
+  
+  // Broad currency/amount detector
+  function hasMoney(text) {
+    const re =
+      /(\$|usd|eur|gbp|mxn|cad|aud|brl|cop|pen|ars|clp|b\/\.|₡|₲|₱|¥|₹|₩|₦)\s*\d{1,6}([.,]\d{2})?|\d{1,6}([.,]\d{2})?\s*(usd|eur|gbp|mxn|cad|aud|brl|cop|pen|ars|clp)/i;
+    return re.test(text);
   }
   
   export function classifyEventType({ subject, snippet, from }) {
-    const text = `${subject || ""}\n${snippet || ""}\n${from || ""}`.toLowerCase();
+    const text = normText({ subject, snippet, from });
   
-    for (const rule of EVENT_KEYWORDS) {
-      if (rule.hits.some((h) => text.includes(h))) return rule.type;
+    // Marketing override: multiple marketing terms + no money + no invoice/receipt => marketing
+    const marketingScore = NEG_MARKETING.reduce((acc, k) => acc + (text.includes(k) ? 1 : 0), 0);
+    if (marketingScore >= 2 && !hasMoney(text) && !text.includes("invoice") && !text.includes("receipt")) {
+      return "marketing";
     }
   
-    const billingScore = POS_BILLING.reduce((acc, k) => acc + (text.includes(k) ? 1 : 0), 0);
-    const marketingScore = NEG_MARKETING.reduce((acc, k) => acc + (text.includes(k) ? 1 : 0), 0);
+    // Hard rules first
+    for (const r of EVENT_RULES) {
+      if (r.hits.some((h) => text.includes(h))) return r.type;
+    }
   
-    if (marketingScore >= 2 && billingScore === 0) return "marketing";
-    if (billingScore >= 2) return "billing_signal";
+    // Receipt requires money OR explicit invoice/receipt phrasing (avoids Udemy TOTAL:)
+    const looksReceipt =
+      text.includes("receipt") ||
+      text.includes("invoice") ||
+      text.includes("order confirmation") ||
+      text.includes("payment received") ||
+      text.includes("thank you for your purchase");
+  
+    if (looksReceipt && (hasMoney(text) || text.includes("invoice"))) return "receipt";
+  
+    // Fallback scoring
+    const billingScore = POS_BILLING.reduce((acc, k) => acc + (text.includes(k) ? 1 : 0), 0);
+    if (billingScore >= 2) return hasMoney(text) ? "billing_signal" : "billing_signal_no_amount";
+    if (marketingScore >= 2) return "marketing";
   
     return "unknown";
   }
   
-  export function shouldDropCandidate(eventType) {
-    // For YC demo: drop pure marketing/noise. Keep paused/payment_failed but classify them.
-    return eventType === "marketing";
+  export function shouldDropCandidate(eventType, evidence) {
+    if (eventType === "marketing") return true;
+  
+    // Hard-drop education/newsletters with no money/receipt
+    const t = normText(evidence || {});
+    const eduNoMoney =
+      (t.includes("course") || t.includes("instructor") || t.includes("certification")) &&
+      !hasMoney(t) &&
+      !t.includes("invoice") &&
+      !t.includes("receipt");
+    if (eduNoMoney) return true;
+  
+    return false;
   }
   

@@ -1,8 +1,12 @@
-// API/src/lib/gmail.js
+// src/lib/gmail.js
 import { buildCandidate, buildClusterCandidates, aggregateCandidates, quickScreenMessage } from "./detect.js";
 import { buildImprovedCandidate } from "./candidateScoring.js";
+import { enrichTopCandidates } from "./extractBilling.js";
+import { dedupeBestPerMerchant } from "./merchantDedupe.js";
+
 
 const ENGINE_VERSION = "gmail.v7.cluster-first";
+
 
 function headersToMap(headers = []) {
   const out = {};
@@ -27,7 +31,6 @@ function pickHeaders(headers = []) {
 }
 
 function buildQuery({ daysBack, queryMode = "transactions", includePromotions = false }) {
-  // "transactions" = narrower + faster
   const transactional =
     '(receipt OR invoice OR billed OR billing OR charged OR "payment" OR "payment successful" OR renewal OR renews OR "next billing" OR subscription OR "trial ends" OR expiring OR "purchase confirmed" OR "order confirmation" OR "manage subscription" OR "cancel subscription")';
 
@@ -67,7 +70,6 @@ async function fetchRetry(url, init, timeoutMs, shouldStop, tries = 3) {
     const res = await fetchWithTimeout(url, init, timeoutMs);
     if (res.ok) return res;
 
-    // retry some transient cases
     if ([429, 500, 502, 503, 504].includes(res.status) && attempt < tries - 1) {
       attempt += 1;
       await sleep(jitter(250 * attempt));
@@ -136,7 +138,6 @@ async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, a
     const attId = body?.attachmentId || null;
     const size = Number(body?.size || 0);
 
-    // inline data
     if (data && size <= 1024 * 1024) {
       const decoded = decodeBase64Url(data);
       if (mime.includes("text/plain")) text += `\n${decoded}`;
@@ -144,7 +145,6 @@ async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, a
       continue;
     }
 
-    // attachment fetch (bounded)
     if (attId && size > 0 && size <= 1024 * 512) {
       const decoded = await fetchAttachment({
         accessToken,
@@ -158,10 +158,27 @@ async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, a
     }
   }
 
-  // fallback: payload.body might exist
   if (!text && payload?.body?.data) text = decodeBase64Url(payload.body.data);
-
   return { text: text.trim(), html: html.trim() };
+}
+
+// Used by top-25 enrichment to full-fetch bodies quickly.
+async function fetchGmailMessageText({ accessToken, messageId, fullTimeoutMs, attachTimeoutMs, shouldStop }) {
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full&fields=id,internalDate,payload,snippet`;
+  const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, fullTimeoutMs, shouldStop);
+  if (!res.ok) return "";
+
+  const msg = await res.json().catch(() => null);
+  const bodies = await extractBodiesFull({
+    accessToken,
+    messageId,
+    payload: msg?.payload,
+    timeoutMs: fullTimeoutMs,
+    attachTimeoutMs,
+    shouldStop,
+  });
+
+  return `${msg?.snippet || ""}\n${bodies.text || ""}\n${bodies.html || ""}`.trim();
 }
 
 export async function scanGmail({ accessToken, options, context }) {
@@ -187,12 +204,12 @@ export async function scanGmail({ accessToken, options, context }) {
     queryMode: options?.queryMode || "transactions",
     includePromotions: !!options?.includePromotions,
   });
+
+  // Keep time for enrichment too
   const shouldStop = () => Date.now() > deadlineAt - 900;
 
   const statsRef = { nullReasons: Object.create(null) };
 
-  // How many message IDs we allow per chunk.
-  // If you run broad scans, this should be larger; if you run transactional-only, smaller is fine.
   const maxListIds = clamp(Number(options?.maxListIds ?? pageSize * 3), pageSize, 25000);
 
   // Step 1: list multiple pages quickly
@@ -207,7 +224,12 @@ export async function scanGmail({ accessToken, options, context }) {
     listUrl.searchParams.set("fields", "messages/id,nextPageToken,resultSizeEstimate");
     if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
 
-    const listRes = await fetchRetry(listUrl.toString(), { headers: { Authorization: `Bearer ${accessToken}` } }, listTimeoutMs, shouldStop);
+    const listRes = await fetchRetry(
+      listUrl.toString(),
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      listTimeoutMs,
+      shouldStop
+    );
 
     if (!listRes.ok) {
       const txt = await listRes.text().catch(() => "");
@@ -249,7 +271,7 @@ export async function scanGmail({ accessToken, options, context }) {
     };
   }
 
-  // Step 2: fetch metadata (headers/snippet/date) with bounded concurrency
+  // Step 2: fetch metadata with bounded concurrency
   const meta = await parallelMap(
     ids,
     async (id) => {
@@ -265,7 +287,6 @@ export async function scanGmail({ accessToken, options, context }) {
       const dateMs = Number(msg?.internalDate || 0) || null;
 
       const screen = quickScreenMessage({ headers, snippet });
-      // Keep weak-signal for clustering.
       const ok = screen.ok || screen.reason === "weak_signal";
       return { id, headers, snippet, dateMs, ok, screenReason: screen.reason };
     },
@@ -276,8 +297,7 @@ export async function scanGmail({ accessToken, options, context }) {
   const scanned = meta.filter(Boolean).length;
   const screenedIn = meta.filter((m) => m?.ok);
 
-  // Step 2.5: cluster-first suspects (metadata only)
-  // This is the "never return 0" engine: even if directory misses, we can still surface likely subscriptions.
+  // Step 2.5: cluster suspects (metadata only)
   const clusterCap = clamp(Number(options?.clusterCap ?? 60), 10, 200);
   const clusterCandidates = buildClusterCandidates(screenedIn, context, Math.min(clusterCap, maxCandidates));
 
@@ -334,9 +354,10 @@ export async function scanGmail({ accessToken, options, context }) {
 
   const candidates = aggregateCandidates(rawCandidates, maxCandidates);
 
-  // Merge: prefer fully-parsed candidates, then fill remaining slots with cluster suspects
+  // Merge: parsed candidates first, then cluster suspects
   const merged = [];
   const seen = new Set();
+
   for (const c of candidates) {
     if (!c?.fingerprint || seen.has(c.fingerprint)) continue;
     seen.add(c.fingerprint);
@@ -350,23 +371,48 @@ export async function scanGmail({ accessToken, options, context }) {
   }
 
   // Post-process: normalize merchant + classify event type + rescore confidence.
-  // Safe defaults: if context doesn't include directory/overrides, we still run rules.
   const directory = Array.isArray(context?.directory) ? context.directory : [];
   const overrides = Array.isArray(context?.overrides) ? context.overrides : [];
+
   const improved = [];
   let dropped = 0;
+
+  // Ensure evidence includes messageId for later enrichment
   for (const c of merged) {
-    const out = buildImprovedCandidate({ rawCandidate: c, directory, overrides });
-    if (out.drop) {
-      dropped += 1;
-      continue;
-    }
-    improved.push(out.candidate);
-    if (improved.length >= maxCandidates) break;
+    const ev = c?.evidence || {};
+    // If the candidate was built from a real message, attach messageId when missing.
+    // Prefer existing ev.messageId if detect.js already set it.
+    if (!ev.messageId && ev.id) ev.messageId = ev.id; // safe fallback
+    c.evidence = { ...ev };
   }
 
-  return {
+  for (const c of merged) {
+    const out = buildImprovedCandidate({ rawCandidate: c, directory, overrides });
+    if (!out.drop) improved.push(out.candidate);
+    else dropped++;
+  }
+
+  // Enrich top 25 (best-effort) for amount/cadence
+  const enriched = await enrichTopCandidates({
+    
     candidates: improved,
+    topN: 25,
+    shouldStop,
+    fetchMessageText: async (messageId) =>
+      await fetchGmailMessageText({
+        accessToken,
+        messageId,
+        fullTimeoutMs,
+        attachTimeoutMs,
+        shouldStop,
+      }),
+  });
+
+  const finalCandidates = dedupeBestPerMerchant(enriched, { max: options?.maxMerchants ?? 60 });
+
+
+  return {
+    candidates: finalCandidates,
     nextCursor,
     stats: {
       engineVersion: ENGINE_VERSION,
@@ -378,7 +424,7 @@ export async function scanGmail({ accessToken, options, context }) {
       screenedIn: screenedIn.length,
       fullFetched,
       rawMatched: rawCandidates.length,
-      matched: improved.length,
+      matched: enriched.length,
       dropped,
       matchedFromBodies: candidates.length,
       matchedFromClusters: clusterCandidates.length,
@@ -388,5 +434,6 @@ export async function scanGmail({ accessToken, options, context }) {
       tookMs: Date.now() - startedAt,
       query: q,
     },
+    merchants: finalCandidates.length,
   };
 }
