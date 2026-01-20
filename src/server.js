@@ -149,41 +149,71 @@ export async function buildServer() {
   server.post("/v1/gmail/scan/start", async (req, reply) => {
     const parsed = StartGmailSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-
+  
     const userId = req.userId;
-
-    await upsertGoogleTokens({
-      supabase: supabaseAdmin,
-      userId,
-      accessToken: parsed.data.auth.accessToken,
-      refreshToken: parsed.data.auth.refreshToken ?? null,
-      expiresAt: parsed.data.auth.expiresAt ? new Date(parsed.data.auth.expiresAt).toISOString() : null,
-    });
-
-    // ✅ Enforce SLO budgets server-side (never trust client)
-    const safeOptions = enforceBudgets(parsed.data.options || {});
-    safeOptions.cursor = parsed.data.options?.cursor ?? null;
-
-    const session = await createScanSession({
-      supabase: supabaseAdmin,
-      userId,
-      provider: "gmail",
-      cursor: safeOptions.cursor,
-      options: safeOptions,
-    });
-
-    await writeEvent({
-      supabase: supabaseAdmin,
-      sessionId: session.id,
-      userId,
-      type: "hello",
-      payload: { ok: true, sessionId: session.id, mode: safeOptions.mode || "quick" },
-      dedupeKey: `hello:${session.id}`,
-    });
-
-    await enqueueScanChunk({ sessionId: session.id });
+  
+    // Stage 1: token storage
+    try {
+      await upsertGoogleTokens({
+        supabase: supabaseAdmin,
+        userId,
+        accessToken: parsed.data.auth.accessToken,
+        refreshToken: parsed.data.auth.refreshToken ?? null,
+        expiresAt: parsed.data.auth.expiresAt ? new Date(parsed.data.auth.expiresAt).toISOString() : null,
+      });
+    } catch (e) {
+      e.statusCode = 500;
+      e.code = e.code || "TOKEN_STORE_FAILED";
+      throw e;
+    }
+  
+    // Stage 2: create session
+    let session;
+    try {
+      session = await createScanSession({
+        supabase: supabaseAdmin,
+        userId,
+        provider: "gmail",
+        cursor: parsed.data.options.cursor ?? null,
+        options: { ...parsed.data.options },
+      });
+    } catch (e) {
+      e.statusCode = 500;
+      e.code = e.code || "SESSION_CREATE_FAILED";
+      throw e;
+    }
+  
+    // Stage 3: hello event
+    try {
+      await writeEvent({
+        supabase: supabaseAdmin,
+        sessionId: session.id,
+        userId,
+        type: "hello",
+        payload: { ok: true, sessionId: session.id },
+        dedupeKey: `hello:${session.id}`,
+      });
+    } catch (e) {
+      // Not fatal, but loggable
+      req.log.warn({ err: e }, "writeEvent_failed");
+    }
+  
+    // Stage 4: enqueue first chunk (this is the #1 failure source)
+    try {
+      await enqueueScanChunk({ sessionId: session.id });
+    } catch (e) {
+      // ✅ Return a useful error instead of opaque 500
+      return reply.code(e.statusCode || 503).send({
+        error: "queue_unavailable",
+        code: e.code || "QUEUE_ENQUEUE_FAILED",
+        message: process.env.DEBUG_ERRORS === "true" ? e.message : "Queue unavailable",
+        sessionId: session.id, // still return so you can show UI state
+      });
+    }
+  
     return { ok: true, sessionId: session.id, status: session.status };
   });
+  
 
   server.get("/v1/gmail/scan/stream", async (req, reply) => {
     const userId = req.userId;
