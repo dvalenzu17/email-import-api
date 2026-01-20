@@ -3,23 +3,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * Expected table: scan_events(session_id, user_id, type, payload, dedupe_key)
- * If you used event_type before, rename column or update selects accordingly.
- */
 export async function writeEvent({ supabase, sessionId, userId, type, payload, dedupeKey = null }) {
   const row = {
     session_id: sessionId,
     user_id: userId,
-    type,
+    event_type: type, // ✅ DB expects event_type NOT NULL
     payload,
     dedupe_key: dedupeKey,
   };
 
   if (dedupeKey) {
-    const { error } = await supabase.from("scan_events").upsert(row, {
-      onConflict: "session_id,dedupe_key",
-    });
+    const { error } = await supabase
+      .from("scan_events")
+      .upsert(row, { onConflict: "session_id,dedupe_key" });
+
     if (error) throw new Error(`writeEvent(upsert): ${error.message}`);
     return;
   }
@@ -28,9 +25,6 @@ export async function writeEvent({ supabase, sessionId, userId, type, payload, d
   if (error) throw new Error(`writeEvent(insert): ${error.message}`);
 }
 
-/**
- * Poll scan_events and push them to SSE writer.
- */
 export async function streamEvents({
   supabase,
   sessionId,
@@ -51,7 +45,7 @@ export async function streamEvents({
     while (!canceled && !(signal?.aborted)) {
       const { data, error } = await supabase
         .from("scan_events")
-        .select("id,type,payload,created_at")
+        .select("id,event_type,payload,created_at") // ✅ FIX
         .eq("session_id", sessionId)
         .eq("user_id", userId)
         .gt("id", cursor)
@@ -59,7 +53,6 @@ export async function streamEvents({
         .limit(200);
 
       if (error) {
-        // Don’t emit SSE event name "error" (browsers treat it as transport failure)
         write?.({ type: "sse_error", payload: { message: error.message } });
         break;
       }
@@ -67,7 +60,7 @@ export async function streamEvents({
       if (data?.length) {
         for (const evt of data) {
           cursor = Math.max(cursor, evt.id);
-          write?.({ type: evt.type, payload: evt.payload });
+          write?.({ type: evt.event_type, payload: evt.payload }); // ✅ FIX
         }
       }
 
