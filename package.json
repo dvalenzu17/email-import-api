@@ -4,7 +4,6 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "dev": "node --watch src/index.js",
         "start": "node --env-file=.env src/start.js",
     "worker": "node --env-file=.env src/worker/entry.js"
     },

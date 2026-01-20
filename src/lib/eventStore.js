@@ -1,31 +1,35 @@
 // src/lib/eventStore.js
-// Supabase-backed scan event helpers used by SSE.
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
- * Write a scan event.
- * Tables expected:
- *   scan_events(session_id, user_id, event_type, payload)
+ * Expected table: scan_events(session_id, user_id, type, payload, dedupe_key)
+ * If you used event_type before, rename column or update selects accordingly.
  */
-export async function writeEvent({ supabase, sessionId, userId, type, payload }) {
+export async function writeEvent({ supabase, sessionId, userId, type, payload, dedupeKey = null }) {
   const row = {
     session_id: sessionId,
     user_id: userId,
-    event_type: type,
-    payload: payload ?? {},
+    type,
+    payload,
+    dedupe_key: dedupeKey,
   };
 
-  const { data, error } = await supabase.from("scan_events").insert(row).select("id").single();
-  if (error) throw new Error(`writeEvent: ${error.message}`);
-  return data;
+  if (dedupeKey) {
+    const { error } = await supabase.from("scan_events").upsert(row, {
+      onConflict: "session_id,dedupe_key",
+    });
+    if (error) throw new Error(`writeEvent(upsert): ${error.message}`);
+    return;
+  }
+
+  const { error } = await supabase.from("scan_events").insert(row);
+  if (error) throw new Error(`writeEvent(insert): ${error.message}`);
 }
 
 /**
- * Poll scan_events and push them to an SSE writer.
- * Returns a cancel() function.
+ * Poll scan_events and push them to SSE writer.
  */
 export async function streamEvents({
   supabase,
@@ -43,12 +47,11 @@ export async function streamEvents({
     canceled = true;
   };
 
-  // Run the loop async so the caller can attach cancel handlers.
   (async () => {
     while (!canceled && !(signal?.aborted)) {
       const { data, error } = await supabase
         .from("scan_events")
-        .select("id,event_type,payload,created_at")
+        .select("id,type,payload,created_at")
         .eq("session_id", sessionId)
         .eq("user_id", userId)
         .gt("id", cursor)
@@ -56,24 +59,23 @@ export async function streamEvents({
         .limit(200);
 
       if (error) {
-        write?.({ type: "error", payload: { message: error.message } });
+        // Don’t emit SSE event name "error" (browsers treat it as transport failure)
+        write?.({ type: "sse_error", payload: { message: error.message } });
         break;
       }
 
       if (data?.length) {
         for (const evt of data) {
           cursor = Math.max(cursor, evt.id);
-          write?.({ type: evt.event_type, payload: evt.payload });
+          write?.({ type: evt.type, payload: evt.payload });
         }
       }
 
-      // Heartbeat so proxies don't kill the connection
       write?.({ type: "ping", payload: { t: Date.now() } });
-
       await sleep(heartbeatMs);
     }
   })().catch((e) => {
-    write?.({ type: "error", payload: { message: e?.message || "stream_failed" } });
+    write?.({ type: "sse_error", payload: { message: e?.message || "stream_failed" } });
   });
 
   return cancel;

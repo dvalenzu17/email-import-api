@@ -1,16 +1,18 @@
-// api/src/worker/scanWorker.js
+// src/worker/scanWorker.js
 import { Worker } from "bullmq";
 import { redis } from "../queue/redis.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
+
 import { getGoogleTokens } from "../lib/tokenStore.js";
 import { scanGmail } from "../lib/gmail.js";
+
 import { writeEvent } from "../lib/eventStore.js";
 import { getScanSession, updateSessionProgress, upsertCandidates } from "../lib/scanStore.js";
 import { enqueueScanChunk } from "../queue/scanQueue.js";
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
+import { enforceBudgets } from "../lib/slo.js";
+import { upsertChunkLog } from "../lib/scanDebugStore.js";
+import { getMerchantDirectoryCached, getUserOverrides } from "../lib/merchantData.js";
 
 async function failSession(session, code, message) {
   await updateSessionProgress({
@@ -18,12 +20,14 @@ async function failSession(session, code, message) {
     sessionId: session.id,
     patch: { status: "error", error_code: code, error_message: message },
   });
+
   await writeEvent({
     supabase: supabaseAdmin,
     sessionId: session.id,
     userId: session.user_id,
     type: "scan_failed",
     payload: { code, message },
+    dedupeKey: `fail:${code}`,
   });
 }
 
@@ -34,19 +38,24 @@ export const scanWorker = new Worker(
     if (!sessionId) return;
 
     const supabase = supabaseAdmin;
-
     const session = await getScanSession({ supabase, sessionId });
     if (!session) return;
 
-    if (["done", "failed", "canceled", "error"].includes(session.status)) return;
+    if (["done", "canceled", "error"].includes(session.status)) return;
 
-    // Mark running on first chunk
+    // Start state
     if (session.status === "queued") {
       await updateSessionProgress({ supabase, sessionId, patch: { status: "running" } });
-      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "progress", payload: { phase: "starting" } });
+      await writeEvent({
+        supabase,
+        sessionId,
+        userId: session.user_id,
+        type: "progress",
+        payload: { phase: "starting" },
+        dedupeKey: `progress:starting`,
+      });
     }
 
-    // Token: prefer stored access token; refresh token is a bonus, not a requirement for the first hour.
     const tokens = await getGoogleTokens({ supabase, userId: session.user_id }).catch(() => null);
     const accessToken = tokens?.accessToken;
     if (!accessToken) {
@@ -54,43 +63,77 @@ export const scanWorker = new Worker(
       return;
     }
 
-    const opts = session.options || {};
-    const maxPages = clamp(Number(opts.maxPages ?? 120), 1, 400);
-    const maxCandidates = clamp(Number(opts.maxCandidates ?? 200), 10, 400);
+    // ✅ Enforce budgets again (worker-side)
+    const opts = enforceBudgets(session.options || {});
+    const cursorIn = session.cursor || null;
 
-    const pages = Number(session.pages || 0);
-    const scannedTotal = Number(session.scanned_total || 0);
-    const foundTotal = Number(session.found_total || 0);
+    // ✅ Load directory/overrides for better merchant mapping
+    const [directory, overrides] = await Promise.all([
+      getMerchantDirectoryCached().catch(() => null),
+      getUserOverrides(session.user_id).catch(() => null),
+    ]);
 
-    // One chunk per job (bounded by deadlineMs)
-    const result = await scanGmail({
-      accessToken,
-      options: {
-        daysBack: Number(opts.daysBack ?? 90),
-        pageSize: Number(opts.pageSize ?? 500),
-        deadlineMs: Number(opts.chunkMs ?? 9000),
-        fullFetchCap: Number(opts.fullFetchCap ?? 12),
-        concurrency: Number(opts.concurrency ?? 6),
-        queryMode: opts.queryMode ?? "transactions",
-        includePromotions: Boolean(opts.includePromotions ?? false),
-        maxListIds: Number(opts.maxListIds ?? 800),
-        clusterCap: Number(opts.clusterCap ?? 40),
-        cursor: session.cursor || undefined,
-        debug: Boolean(opts.debug ?? false),
-      },
-      context: {
-        directory: null,
-        overrides: null,
-      },
-    });
+    const chunkKey = `${session.id}:${cursorIn || "start"}`;
+    const t0 = Date.now();
+
+    let result;
+    try {
+      result = await scanGmail({
+        accessToken,
+        options: {
+          ...opts,
+          cursor: cursorIn || undefined,
+        },
+        context: {
+          directory: directory || [],
+          overrides: overrides || [],
+        },
+      });
+
+      await upsertChunkLog({
+        supabase,
+        sessionId: session.id,
+        chunkKey,
+        cursorIn,
+        cursorOut: result.nextCursor ?? null,
+        listed: result.stats?.listed ?? 0,
+        screened: result.stats?.screenedIn ?? 0,
+        fullFetched: result.stats?.fullFetched ?? 0,
+        matched: result.stats?.matched ?? 0,
+        tookMs: Date.now() - t0,
+      });
+    } catch (e) {
+      await upsertChunkLog({
+        supabase,
+        sessionId: session.id,
+        chunkKey,
+        cursorIn,
+        cursorOut: null,
+        listed: 0,
+        screened: 0,
+        fullFetched: 0,
+        matched: 0,
+        tookMs: Date.now() - t0,
+        error: String(e?.message || e),
+      });
+      await failSession(session, "CHUNK_ERROR", String(e?.message || e));
+      return;
+    }
 
     const scannedDelta = Number(result?.stats?.scanned || 0);
-    const up = await upsertCandidates({ supabase, sessionId, userId: session.user_id, candidates: result.candidates || [] });
+
+    const up = await upsertCandidates({
+      supabase,
+      sessionId,
+      userId: session.user_id,
+      candidates: result.candidates || [],
+    });
+
     const foundDelta = up.inserted;
 
-    const nextPages = pages + 1;
-    const nextScanned = scannedTotal + scannedDelta;
-    const nextFound = foundTotal + foundDelta;
+    const nextPages = Number(session.pages || 0) + 1;
+    const nextScanned = Number(session.scanned_total || 0) + scannedDelta;
+    const nextFound = Number(session.found_total || 0) + foundDelta;
     const nextCursor = result.nextCursor ?? null;
 
     const progressPayload = {
@@ -114,23 +157,45 @@ export const scanWorker = new Worker(
       },
     });
 
-    await writeEvent({ supabase, sessionId, userId: session.user_id, type: "progress", payload: progressPayload });
+    await writeEvent({
+      supabase,
+      sessionId,
+      userId: session.user_id,
+      type: "progress",
+      payload: progressPayload,
+      dedupeKey: `progress:${nextPages}:${nextCursor || "end"}`,
+    });
+
     if (foundDelta > 0) {
-      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "candidates", payload: { candidates: result.candidates || [] } });
+      await writeEvent({
+        supabase,
+        sessionId,
+        userId: session.user_id,
+        type: "candidates",
+        payload: { candidates: result.candidates || [] },
+        dedupeKey: `candidates:${nextPages}:${nextCursor || "end"}`,
+      });
     }
 
     const done =
       !nextCursor ||
-      nextPages >= maxPages ||
-      nextFound >= maxCandidates;
+      nextPages >= Number(opts.maxPages ?? 6) ||
+      nextFound >= Number(opts.maxCandidates ?? 60);
 
     if (done) {
       await updateSessionProgress({ supabase, sessionId, patch: { status: "done" } });
-      await writeEvent({ supabase, sessionId, userId: session.user_id, type: "done", payload: { ok: true, pages: nextPages, scannedTotal: nextScanned, foundTotal: nextFound } });
+      await writeEvent({
+        supabase,
+        sessionId,
+        userId: session.user_id,
+        type: "done",
+        payload: { ok: true, pages: nextPages, scannedTotal: nextScanned, foundTotal: nextFound },
+        dedupeKey: `done`,
+      });
       return;
     }
 
-    // schedule next chunk
+    // schedule next chunk (jobId is idempotent in scanQueue.js)
     await enqueueScanChunk({ sessionId });
   },
   { connection: redis }
