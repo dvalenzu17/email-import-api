@@ -4,25 +4,26 @@ import { redis } from "./redis.js";
 
 export const scanQueue = new Queue("scan", { connection: redis });
 
-export async function enqueueScanChunk({ sessionId, cursor = null }) {
-  const jobId = `${sessionId}:${cursor || "start"}`; // ✅ idempotent
+export async function enqueueScanChunk({ sessionId, cursor = null, phase = "run" }) {
+  // ✅ BullMQ custom IDs cannot contain ":"
+  const jobId = `${sessionId}__${phase}__${cursor || "start"}`;
 
   try {
-    return await scanQueue.add(
-      "gmail-scan-chunk",
+    await scanQueue.add(
+      "scan-chunk",
       { sessionId },
       {
         jobId,
-        attempts: 8,
-        backoff: { type: "exponential", delay: 2000 },
-        removeOnComplete: 500,
-        removeOnFail: 2000,
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
+        attempts: 5,
+        backoff: { type: "exponential", delay: 1000 },
       }
     );
   } catch (e) {
     const err = new Error(`QUEUE_ENQUEUE_FAILED: ${e?.message || e}`);
     err.code = "QUEUE_ENQUEUE_FAILED";
-    err.statusCode = 503; // service unavailable
+    err.statusCode = 503;
     throw err;
   }
 }
