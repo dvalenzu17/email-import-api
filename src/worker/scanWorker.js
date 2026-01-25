@@ -4,6 +4,7 @@ import { redis } from "../queue/redis.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 
 import { getGoogleTokens } from "../lib/tokenStore.js";
+import { getFreshGoogleAccessToken } from "../lib/googleAuth.js";
 import { scanGmail } from "../lib/gmail.js";
 
 import { writeEvent } from "../lib/eventStore.js";
@@ -56,8 +57,19 @@ export const scanWorker = new Worker(
       });
     }
 
+    // ✅ Token persistence on reopen:
+    // Use stored refresh token to mint a fresh access token when available.
     const tokens = await getGoogleTokens({ supabase, userId: session.user_id }).catch(() => null);
-    const accessToken = tokens?.accessToken;
+
+    let accessToken = tokens?.accessToken || null;
+    if (tokens?.refreshToken) {
+      try {
+        accessToken = await getFreshGoogleAccessToken({ supabase, userId: session.user_id });
+      } catch {
+        accessToken = tokens?.accessToken || null;
+      }
+    }
+
     if (!accessToken) {
       await failSession(session, "MISSING_TOKEN", "Missing Google token. Reconnect Gmail.");
       return;
@@ -83,6 +95,9 @@ export const scanWorker = new Worker(
         options: {
           ...opts,
           cursor: cursorIn || undefined,
+
+          // ✅ API alignment: frontend sends chunkMs; engine expects deadlineMs
+          deadlineMs: Number(opts.chunkMs ?? 9000),
         },
         context: {
           directory: directory || [],

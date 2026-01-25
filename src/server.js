@@ -27,7 +27,8 @@ import { createScanSession, getScanSession } from "./lib/scanStore.js";
 import { writeEvent, streamEvents } from "./lib/eventStore.js";
 import { enqueueScanChunk } from "./queue/scanQueue.js";
 
-import { upsertGoogleTokens } from "./lib/tokenStore.js";
+import { getGoogleTokens, upsertGoogleTokens } from "./lib/tokenStore.js";
+import { getFreshGoogleAccessToken } from "./lib/googleAuth.js";
 import { metricsHandler } from "./telemetry/metrics.js";
 
 import { verifyImapConnection, scanImap } from "./lib/imap.js";
@@ -132,11 +133,15 @@ export async function buildServer() {
    * Gmail job start + SSE stream + run + diagnostics
    * -------------------------- */
   const StartGmailSchema = z.object({
-    auth: z.object({
-      accessToken: z.string().min(10),
-      refreshToken: z.string().min(10).optional(),
-      expiresAt: z.number().int().optional(),
-    }),
+    // auth is optional: if omitted, backend will use stored tokens (refresh -> access).
+    // This fixes the common Supabase behavior where provider_token is not present after app relaunch.
+    auth: z
+      .object({
+        accessToken: z.string().min(10).optional(),
+        refreshToken: z.string().min(10).optional(),
+        expiresAt: z.number().int().optional(),
+      })
+      .optional(),
     options: z
       .object({
         mode: z.enum(["quick", "deep"]).optional(),
@@ -164,18 +169,38 @@ export async function buildServer() {
 
     const userId = req.userId;
 
-    // Stage 1: token storage
+    // Stage 1: token storage OR token hydrate.
+    // If client supplied tokens, store them.
+    // If client did not, ensure we have stored tokens and can mint an access token.
     try {
-      await upsertGoogleTokens({
-        supabase: supabaseAdmin,
-        userId,
-        accessToken: parsed.data.auth.accessToken,
-        refreshToken: parsed.data.auth.refreshToken ?? null,
-        expiresAt: parsed.data.auth.expiresAt ? new Date(parsed.data.auth.expiresAt).toISOString() : null,
-      });
+      const auth = parsed.data.auth || {};
+
+      if (auth.accessToken) {
+        await upsertGoogleTokens({
+          supabase: supabaseAdmin,
+          userId,
+          accessToken: auth.accessToken,
+          refreshToken: auth.refreshToken ?? null,
+          expiresAt: auth.expiresAt ? new Date(auth.expiresAt).toISOString() : null,
+        });
+      } else {
+        // No access token provided: rely on stored tokens.
+        const stored = await getGoogleTokens({ supabase: supabaseAdmin, userId });
+        if (!stored?.accessToken && !stored?.refreshToken) {
+          return reply.code(400).send({
+            error: "missing_google_tokens",
+            message: "Missing Google tokens. Please reconnect Gmail.",
+          });
+        }
+
+        // If we have a refresh token, rotate access token to ensure it's valid.
+        if (stored?.refreshToken) {
+          await getFreshGoogleAccessToken({ supabase: supabaseAdmin, userId });
+        }
+      }
     } catch (e) {
-      e.statusCode = 500;
-      e.code = e.code || "TOKEN_STORE_FAILED";
+      e.statusCode = e.statusCode || 500;
+      e.code = e.code || "TOKEN_BOOTSTRAP_FAILED";
       throw e;
     }
 
