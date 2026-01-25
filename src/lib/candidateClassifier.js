@@ -3,7 +3,16 @@
 // Fixes: "TOTAL:" (Udemy course brand) false positives by requiring *money-like* patterns for receipts.
 
 const EVENT_RULES = [
+    
     {
+      type: "top_up",
+      hits: ["funds successfully added", "added funds", "top up", "top-up", "balance added"],
+    },
+    {
+      type: "ad_spend",
+      hits: ["ads account", "ad spend", "advertising", "campaign spend", "google ads", "microsoft ads"],
+    },
+{
       type: "payment_failed",
       hits: [
         "payment was unsuccessful",

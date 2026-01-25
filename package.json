@@ -5,10 +5,11 @@
     "type": "module",
     "scripts": {
         "start": "node --env-file=.env src/start.js",
-    "worker": "node --env-file=.env src/worker/entry.js"
+        "worker": "node --env-file=.env src/worker/entry.js",
+        "relay:process": "node src/worker/runRelayWorker.js"
     },
     "dependencies": {
-        "@fastify/cors": "^8.4.2",
+        "@fastify/cors": "^8.5.0",
         "@fastify/rate-limit": "^9.1.0",
         "@opentelemetry/auto-instrumentations-node": "^0.68.0",
         "@opentelemetry/exporter-trace-otlp-http": "^0.210.0",
@@ -17,7 +18,7 @@
         "bullmq": "^5.66.5",
         "chrono-node": "^2.7.0",
         "dotenv": "^17.2.3",
-        "fastify": "^4.26.2",
+        "fastify": "^4.29.1",
         "fastify-sse-v2": "^4.2.1",
         "google-auth-library": "^10.5.0",
         "html-to-text": "^9.0.5",
@@ -26,9 +27,11 @@
         "jose": "^5.2.0",
         "mailparser": "^3.6.7",
         "nanoid": "^5.1.6",
+        "nodemailer": "^6.10.1",
+        "pdf-parse": "^1.1.4",
         "pino": "^9.5.0",
         "pino-std-serializers": "^7.1.0",
         "prom-client": "^15.1.3",
-        "zod": "^3.23.8"
+        "zod": "^3.25.76"
     }
 }

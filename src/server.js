@@ -7,6 +7,18 @@ import { z } from "zod";
 import observability from "./plugins/observability.js";
 import { verifySupabaseJwt } from "./lib/jwt.js";
 import { supabaseAdmin } from "./lib/supabaseAdmin.js";
+import { getPlanOptimization, getDuplicateCoverage } from "./lib/optimization.js";
+import { getRegionalOptimizations } from "./lib/optimization.js";
+import { getCancelPlaybook } from "./lib/cancelPlaybooks.js";
+import { ingestCandidateSignals } from "./lib/signalIngest.js";
+import { buildCancelTemplates } from "./lib/cancelTemplates.js";
+import { queueRelayEmail, recordCancelMessage } from "./lib/conciergeRelay.js";
+import { processRelayOutbox } from "./worker/relayWorker.js";
+import { getBrandAssets, refreshBrandAssets, resolveBrand } from "./lib/brandAssets.js";
+import { isActiveTrial, trialNudgeWindow, computeTrialNotifications } from "./lib/trials.js";
+import { weeklyTotal } from "./lib/renewals.js";
+import { confirmCandidateAsSubscription, manualAddSubscription } from "./lib/subscriptionStore.js";
+import { parseReceiptUpload } from "./lib/uploadParser.js";
 
 import { getMerchantDirectoryCached, getUserOverrides } from "./lib/merchantData.js";
 import { enforceBudgets } from "./lib/slo.js";
@@ -149,9 +161,9 @@ export async function buildServer() {
   server.post("/v1/gmail/scan/start", async (req, reply) => {
     const parsed = StartGmailSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
-  
+
     const userId = req.userId;
-  
+
     // Stage 1: token storage
     try {
       await upsertGoogleTokens({
@@ -166,7 +178,7 @@ export async function buildServer() {
       e.code = e.code || "TOKEN_STORE_FAILED";
       throw e;
     }
-  
+
     // Stage 2: create session
     let session;
     try {
@@ -182,7 +194,7 @@ export async function buildServer() {
       e.code = e.code || "SESSION_CREATE_FAILED";
       throw e;
     }
-  
+
     // Stage 3: hello event
     try {
       await writeEvent({
@@ -197,7 +209,7 @@ export async function buildServer() {
       // Not fatal, but loggable
       req.log.warn({ err: e }, "writeEvent_failed");
     }
-  
+
     // Stage 4: enqueue first chunk (this is the #1 failure source)
     try {
       await enqueueScanChunk({ sessionId: session.id });
@@ -210,10 +222,10 @@ export async function buildServer() {
         sessionId: session.id, // still return so you can show UI state
       });
     }
-  
+
     return { ok: true, sessionId: session.id, status: session.status };
   });
-  
+
 
   server.get("/v1/gmail/scan/stream", async (req, reply) => {
     const userId = req.userId;
@@ -253,11 +265,428 @@ export async function buildServer() {
     if (!session) return reply.code(404).send({ error: "not_found" });
 
     await enqueueScanChunk({ sessionId });
-    return { ok: true };
+    // Patch 3: persist extracted signals (price_change/trial/receipt) for downstream views.
+  try {
+    const list = Array.isArray(candidates) ? candidates : [];
+    for (const c of list) {
+      await ingestCandidateSignals({ supabase: supabaseAdmin, userId: req.userId, candidate: c });
+    }
+  } catch (_) {}
+
+  return { ok: true };
   });
 
+// ✅ Canonicalize: confirm candidate → real subscription (idempotent)
+const ConfirmSubscriptionSchema = z.object({
+  sessionId: z.string().uuid().optional(),
+  fingerprint: z.string().optional(),
+  candidate: z.any().optional(),
+  overrides: z.any().optional(),
+  provider: z.string().optional(),
+});
+
+server.post("/v1/subscriptions/confirm", async (req, reply) => {
+  const parsed = ConfirmSubscriptionSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const userId = req.userId;
+  const { sessionId, fingerprint, candidate: candIn, provider } = parsed.data;
+
+  let candidate = candIn || null;
+
+  // Prefer pulling from scan_candidates to avoid client spoofing + keep proofs consistent
+  if (!candidate && sessionId && fingerprint) {
+    const { data: row, error } = await supabaseAdmin
+      .from("scan_candidates")
+      .select("candidate")
+      .eq("session_id", sessionId)
+      .eq("user_id", userId)
+      .eq("fingerprint", fingerprint)
+      .maybeSingle();
+
+    if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+    candidate = row?.candidate || null;
+  }
+
+  if (!candidate) return reply.code(400).send({ error: "missing_candidate" });
+
+  // Contract: evidenceSamples always present (array)
+  if (!Array.isArray(candidate.evidenceSamples)) candidate.evidenceSamples = candidate.evidence ? [candidate.evidence] : [];
+
+  const out = await confirmCandidateAsSubscription({
+    supabase: supabaseAdmin,
+    userId,
+    candidate,
+    provider: provider || "gmail",
+  });
+
+  return out;
+});
+
+// ✅ Manual add fallback (“can’t find it”)
+const ManualSubscriptionSchema = z.object({
+  brandName: z.string().min(1),
+  plan: z.string().optional(),
+  amount: z.number().optional(),
+  currency: z.string().optional(),
+  cadence: z.string().optional(),
+  nextChargeAt: z.string().optional(),
+});
+
+server.post("/v1/subscriptions/manual", async (req, reply) => {
+  const parsed = ManualSubscriptionSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const userId = req.userId;
+  const out = await manualAddSubscription({ supabase: supabaseAdmin, userId, payload: parsed.data });
+  return out;
+});
+
+// ✅ Upload receipt screenshot/PDF (alpha contract: JSON base64; multipart can come later)
+const UploadSchema = z.object({
+  filename: z.string().optional(),
+  mimeType: z.string().optional(),
+  base64: z.string().min(10),
+});
+
+server.post("/v1/subscriptions/upload", async (req, reply) => {
+  const parsed = UploadSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const buf = Buffer.from(parsed.data.base64, "base64");
+  const result = await parseReceiptUpload({
+    filename: parsed.data.filename || "upload",
+    mimeType: parsed.data.mimeType || "application/octet-stream",
+    buffer: buf,
+  });
+
+  return result;
+});
+
+// ✅ Price changes view (pull from signals)
+server.get("/v1/price-changes", async (req, reply) => {
+  const userId = req.userId;
+  const { data, error } = await supabaseAdmin
+    .from("signals")
+    .select("id,type,confidence,extracted,created_at,email_message_id")
+    .eq("user_id", userId)
+    .eq("type", "price_change")
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+  return { items: data || [] };
+});
+
+/** Patch 2: Renewals views (product surface) */
+server.get("/v1/renewals/upcoming", async (req, reply) => {
+  const windowDays = Math.min(Math.max(Number(req.query?.windowDays ?? 30), 1), 365);
+  const now = new Date();
+  const end = new Date(now);
+  end.setUTCDate(end.getUTCDate() + windowDays);
+
+  const { data: subs, error } = await supabaseAdmin
+    .from("subscriptions")
+    .select("*")
+    .eq("user_id", req.userId)
+    .not("next_charge_at", "is", null);
+
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+
+  const upcoming = (subs || [])
+    .filter((s) => {
+      const t = new Date(s.next_charge_at).getTime();
+      return t >= now.getTime() && t <= end.getTime();
+    })
+    .sort((a, b) => new Date(a.next_charge_at) - new Date(b.next_charge_at));
+
+  return { ok: true, windowDays, count: upcoming.length, items: upcoming };
+});
+
+server.get("/v1/renewals/week-total", async (req, reply) => {
+  const weekStart = req.query?.weekStart || new Date().toISOString();
+
+  const { data: subs, error } = await supabaseAdmin
+    .from("subscriptions")
+    .select("*")
+    .eq("user_id", req.userId)
+    .not("next_charge_at", "is", null);
+
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+
+  return { ok: true, ...weeklyTotal(subs || [], weekStart) };
+});
+
+/** Patch 2: Trials views + notification preview (scheduler stub) */
+server.get("/v1/trials", async (req, reply) => {
+  const { data: trials, error } = await supabaseAdmin.from("trials").select("*").eq("user_id", req.userId);
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+
+  const now = new Date();
+  const active = (trials || []).filter((t) => isActiveTrial(t, now)).sort((a, b) => new Date(a.ends_at) - new Date(b.ends_at));
+  return { ok: true, count: active.length, items: active };
+});
+
+server.get("/v1/trials/upcoming", async (req, reply) => {
+  const windowDays = Math.min(Math.max(Number(req.query?.windowDays ?? 7), 1), 60);
+  const { data: trials, error } = await supabaseAdmin.from("trials").select("*").eq("user_id", req.userId);
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+
+  const upcoming = trialNudgeWindow(trials || [], windowDays, new Date());
+  return { ok: true, windowDays, count: upcoming.length, items: upcoming };
+});
+
+server.get("/v1/trials/notifications/preview", async (req, reply) => {
+  const { data: trials, error } = await supabaseAdmin.from("trials").select("*").eq("user_id", req.userId);
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+
+  const notifications = computeTrialNotifications(trials || [], new Date());
+  return { ok: true, count: notifications.length, items: notifications };
+});
+
+/** Patch 2: Brand resolve + assets (logo pipeline stub) */
+server.post("/v1/brand/resolve", async (req, reply) => {
+  const schema = z.object({
+    fromDomain: z.string().optional(),
+    senderName: z.string().optional(),
+    subject: z.string().optional(),
+    unsubscribeDomain: z.string().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const out = await resolveBrand({ supabase: supabaseAdmin, input: parsed.data });
+  return { ok: true, ...out };
+});
+
+server.get("/v1/brand/:brandId/assets", async (req, reply) => {
+  const out = await getBrandAssets({ supabase: supabaseAdmin, brandId: req.params.brandId });
+  return { ok: true, ...out };
+});
+
+server.post("/v1/brand/:brandId/refresh-assets", async (req, reply) => {
+  const out = await refreshBrandAssets({ supabase: supabaseAdmin, brandId: req.params.brandId });
+  return { ok: true, ...out };
+});
+
+
   // ✅ Debug endpoint: “why stuck / why 0 results”
-  server.get("/v1/gmail/scan/diagnostics/:sessionId", async (req, reply) => {
+
+
+/** Patch 3: Bill optimization (v0) */
+server.get("/v1/optimization/plan/:subscriptionId", async (req, reply) => {
+  try {
+    const out = await getPlanOptimization({ supabase: supabaseAdmin, userId: req.userId, subscriptionId: req.params.subscriptionId });
+    return { ok: true, ...out };
+  } catch (e) {
+    return reply.code(500).send({ error: "optimization_error", message: String(e?.message || e) });
+  }
+});
+
+
+server.get("/v1/optimization/regional", async (req, reply) => {
+  const country = req.query?.country || null;
+  const out = await getRegionalOptimizations({ country });
+  return { ok: true, ...out };
+});
+server.get("/v1/optimization/duplicates", async (req, reply) => {
+  const out = await getDuplicateCoverage({ supabase: supabaseAdmin, userId: req.userId });
+  return { ok: true, ...out };
+});
+
+/** Patch 3: Cancellation playbooks Tier 0 */
+
+/** Patch 4: Cancellation templates Tier 1 */
+server.post("/v1/cancel/templates", async (req, reply) => {
+  const schema = z.object({
+    brandName: z.string().optional(),
+    country: z.string().optional(),
+    accountEmail: z.string().email().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const out = buildCancelTemplates(parsed.data);
+  return { ok: true, ...out };
+});
+server.get("/v1/cancel/playbook/:brandId", async (req, reply) => {
+  const country = req.query?.country || null;
+  try {
+    const out = await getCancelPlaybook({ supabase: supabaseAdmin, userId: req.userId, brandId: req.params.brandId, country });
+    return { ok: true, ...out };
+  } catch (e) {
+    return reply.code(500).send({ error: "playbook_error", message: String(e?.message || e) });
+  }
+});
+
+/** Patch 4: Cancellation concierge Tier 2 (request tracking only) */
+server.post("/v1/cancel/requests", async (req, reply) => {
+  const schema = z.object({
+    brandId: z.string().uuid().optional(),
+    country: z.string().optional(),
+    notes: z.string().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  const { data, error } = await supabaseAdmin
+    .from("cancel_requests")
+    .insert({
+      user_id: req.userId,
+      brand_id: parsed.data.brandId ?? null,
+      country: parsed.data.country ?? null,
+      notes: parsed.data.notes ?? null,
+      status: "queued",
+    })
+    .select("*")
+    .single();
+
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+  return { ok: true, request: data };
+});
+
+server.get("/v1/cancel/requests/:id", async (req, reply) => {
+  const { data, error } = await supabaseAdmin
+    .from("cancel_requests")
+    .select("*")
+    .eq("id", req.params.id)
+    .eq("user_id", req.userId)
+    .single();
+
+  if (error) return reply.code(404).send({ error: "not_found", message: error.message });
+
+  const { data: updates } = await supabaseAdmin
+    .from("cancel_request_updates")
+    .select("*")
+    .eq("request_id", req.params.id)
+    .order("created_at", { ascending: false });
+
+  return { ok: true, request: data, updates: updates || [] };
+});
+
+// Internal/admin-style update endpoint (still auth-gated by your JWT middleware)
+
+server.post("/v1/cancel/requests/:id/send", async (req, reply) => {
+  const schema = z.object({
+    to: z.string().email(),
+    subject: z.string().min(1),
+    body: z.string().min(1),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  // Verify ownership
+  const { data: reqRow, error: rErr } = await supabaseAdmin
+    .from("cancel_requests")
+    .select("*")
+    .eq("id", req.params.id)
+    .eq("user_id", req.userId)
+    .single();
+  if (rErr) return reply.code(404).send({ error: "not_found", message: rErr.message });
+
+  const queued = await queueRelayEmail({
+    supabase: supabaseAdmin,
+    requestId: req.params.id,
+    to: parsed.data.to,
+    subject: parsed.data.subject,
+    body: parsed.data.body,
+  });
+
+  await recordCancelMessage({
+    supabase: supabaseAdmin,
+    requestId: req.params.id,
+    direction: "outbound",
+    channel: "email",
+    subject: parsed.data.subject,
+    body: parsed.data.body,
+    toAddress: parsed.data.to,
+    fromAddress: reqRow.relay_email || null,
+    externalId: queued.id,
+  });
+
+  return { ok: true, queued };
+});
+
+server.post("/v1/cancel/requests/:id/inbound", async (req, reply) => {
+  // Inbound webhook placeholder (e.g., from your relay inbox provider)
+  const schema = z.object({
+    from: z.string().email().optional(),
+    subject: z.string().optional(),
+    body: z.string().optional(),
+    externalId: z.string().optional(),
+    status: z.enum(["queued","in_progress","waiting_user","done","failed"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  // Ownership check
+  const { data: reqRow, error: rErr } = await supabaseAdmin
+    .from("cancel_requests")
+    .select("*")
+    .eq("id", req.params.id)
+    .eq("user_id", req.userId)
+    .single();
+  if (rErr) return reply.code(404).send({ error: "not_found", message: rErr.message });
+
+  await recordCancelMessage({
+    supabase: supabaseAdmin,
+    requestId: req.params.id,
+    direction: "inbound",
+    channel: "email",
+    subject: parsed.data.subject ?? null,
+    body: parsed.data.body ?? null,
+    toAddress: reqRow.relay_email || null,
+    fromAddress: parsed.data.from ?? null,
+    externalId: parsed.data.externalId ?? null,
+  });
+
+  if (parsed.data.status) {
+    await supabaseAdmin
+      .from("cancel_requests")
+      .update({ status: parsed.data.status, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id)
+      .eq("user_id", req.userId);
+  }
+
+  return { ok: true };
+});
+server.post("/v1/cancel/requests/:id/updates", async (req, reply) => {
+  const schema = z.object({
+    status: z.enum(["queued","in_progress","waiting_user","done","failed"]).optional(),
+    note: z.string().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: "bad_request", details: parsed.error.flatten() });
+
+  // Update request status if provided
+  if (parsed.data.status) {
+    await supabaseAdmin
+      .from("cancel_requests")
+      .update({ status: parsed.data.status, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id);
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("cancel_request_updates")
+    .insert({ request_id: req.params.id, status: parsed.data.status ?? null, note: parsed.data.note ?? null })
+    .select("*")
+    .single();
+
+  if (error) return reply.code(500).send({ error: "db_error", message: error.message });
+  return { ok: true, update: data };
+});
+
+/** Patch 6: Admin relay outbox processing (for alpha) */
+server.post("/v1/admin/relay/process", async (req, reply) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit ?? 10), 1), 50);
+  try {
+    const out = await processRelayOutbox({ supabase: supabaseAdmin, limit });
+    return { ok: true, ...out };
+  } catch (e) {
+    return reply.code(500).send({ error: "relay_error", message: String(e?.message || e) });
+  }
+});
+server.get("/v1/gmail/scan/diagnostics/:sessionId", async (req, reply) => {
     const userId = req.userId;
     const sessionId = req.params.sessionId;
 

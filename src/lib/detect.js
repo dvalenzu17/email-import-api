@@ -1,3 +1,4 @@
+import { extractSignals } from "./signalExtractor.js";
 // src/lib/detect.js
 // Detection engine: conservative on per-email parsing, but *never* returns 0 by default.
 // Strategy:
@@ -259,6 +260,8 @@ export function buildCandidate(email, context) {
   const html = String(email?.html || "");
   const headerMap = email?.headerMap || {};
   const dateMs = Number(email?.dateMs || 0) || null;
+  const messageId = email?.messageId || null;
+  const threadId = email?.threadId || null;
 
   const normText = normalizeTextForParsing(text);
   const normSnippet = normalizeTextForParsing(snippet);
@@ -365,6 +368,25 @@ export function buildCandidate(email, context) {
       senderEmail,
       senderDomain,
       dateMs,
+      messageId,
+      threadId,
+    },
+    evidenceSamples: [
+      {
+        from,
+        subject,
+        snippet,
+        senderEmail,
+        senderDomain,
+        dateMs,
+        messageId,
+        threadId,
+      },
+    ].filter((x) => x.messageId || x.threadId || x.from || x.subject),
+    evidenceSummary: {
+      primaryMessageId: messageId,
+      primaryThreadId: threadId,
+      sampleCount: 1,
     },
   };
 }
@@ -426,6 +448,8 @@ export function buildClusterCandidates(metaItems, context, maxCandidates = 50) {
       fromSamples: [],
       snippets: [],
       dates: [],
+      messageIds: [],
+      threadIds: [],
       bulkCount: 0,
       transactionalCount: 0,
     };
@@ -438,6 +462,8 @@ export function buildClusterCandidates(metaItems, context, maxCandidates = 50) {
     if (from) c.fromSamples.push(from);
     if (snippet) c.snippets.push(snippet);
     if (dateMs) c.dates.push(dateMs);
+    if (m?.id) c.messageIds.push(m.id);
+    if (m?.threadId) c.threadIds.push(m.threadId);
 
     // If we ever resolve a canonical merchant via overrides/directory, keep it.
     if (resolved.canonical) c.merchant = resolved.canonical;
@@ -516,6 +542,25 @@ export function buildClusterCandidates(metaItems, context, maxCandidates = 50) {
         senderEmail,
         senderDomain,
         dateMs: lastDate,
+        messageId: c.messageIds?.[c.messageIds.length - 1] || null,
+        threadId: c.threadIds?.[c.threadIds.length - 1] || null,
+      },
+      evidenceSamples: (c.messageIds || []).slice(-3).map((id, i) => {
+        const idx = Math.max(0, (c.messageIds.length - 3) + i);
+        return {
+          messageId: id,
+          threadId: (c.threadIds || [])[idx] || null,
+          from: c.fromSamples[idx] || fromSample,
+          subject: c.subjects[idx] || subjectSample,
+          snippet: c.snippets[idx] || c.snippets[0] || "",
+          senderDomain,
+          dateMs: c.dates[idx] || lastDate,
+        };
+      }).filter(Boolean),
+      evidenceSummary: {
+        primaryMessageId: (c.messageIds || []).slice(-1)[0] || null,
+        primaryThreadId: (c.threadIds || []).slice(-1)[0] || null,
+        sampleCount: Math.min(3, (c.messageIds || []).length),
       },
     });
   }

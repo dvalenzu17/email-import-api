@@ -3,6 +3,10 @@ import { buildCandidate, buildClusterCandidates, aggregateCandidates, quickScree
 import { buildImprovedCandidate } from "./candidateScoring.js";
 import { enrichTopCandidates } from "./extractBilling.js";
 import { dedupeBestPerMerchant } from "./merchantDedupe.js";
+import { strictGate } from "./negativeFilters.js";
+import { computePriceState } from "./pricingModel.js";
+import { extractSignals } from "./signalExtractor.js";
+import { extractSignalsFromCandidate } from "./signalExtractor.js";
 
 
 const ENGINE_VERSION = "gmail.v7.cluster-first";
@@ -164,7 +168,7 @@ async function extractBodiesFull({ accessToken, messageId, payload, timeoutMs, a
 
 // Used by top-25 enrichment to full-fetch bodies quickly.
 async function fetchGmailMessageText({ accessToken, messageId, fullTimeoutMs, attachTimeoutMs, shouldStop }) {
-  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full&fields=id,internalDate,payload,snippet`;
+  const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full&fields=id,threadId,internalDate,payload,snippet`;
   const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, fullTimeoutMs, shouldStop);
   if (!res.ok) return "";
 
@@ -277,7 +281,7 @@ export async function scanGmail({ accessToken, options, context }) {
     async (id) => {
       if (shouldStop()) return null;
 
-      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Reply-To&metadataHeaders=Return-Path&fields=id,internalDate,snippet,payload/headers`;
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Reply-To&metadataHeaders=Return-Path&fields=id,threadId,internalDate,snippet,payload/headers`;
       const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, metaTimeoutMs, shouldStop);
       if (!res.ok) return null;
 
@@ -288,7 +292,7 @@ export async function scanGmail({ accessToken, options, context }) {
 
       const screen = quickScreenMessage({ headers, snippet });
       const ok = screen.ok || screen.reason === "weak_signal";
-      return { id, headers, snippet, dateMs, ok, screenReason: screen.reason };
+      return { id, threadId: msg?.threadId || null, headers, snippet, dateMs, ok, screenReason: screen.reason };
     },
     concurrency,
     shouldStop
@@ -313,7 +317,7 @@ export async function scanGmail({ accessToken, options, context }) {
 
     const m = fullTargets[i];
     try {
-      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full&fields=id,internalDate,payload,snippet`;
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full&fields=id,threadId,internalDate,payload,snippet`;
       const res = await fetchRetry(url, { headers: { Authorization: `Bearer ${accessToken}` } }, fullTimeoutMs, shouldStop);
       if (!res.ok) continue;
 
@@ -340,6 +344,8 @@ export async function scanGmail({ accessToken, options, context }) {
           replyTo: m.headers.replyTo,
           returnPath: m.headers.returnPath,
           dateMs: Number(msg?.internalDate || m.dateMs || 0) || null,
+          messageId: m.id,
+          threadId: msg?.threadId || m?.threadId || null,
         },
         { ...context, stats: statsRef }
       );
@@ -394,7 +400,7 @@ export async function scanGmail({ accessToken, options, context }) {
 
   // Enrich top 25 (best-effort) for amount/cadence
   const enriched = await enrichTopCandidates({
-    
+
     candidates: improved,
     topN: 25,
     shouldStop,
@@ -407,9 +413,23 @@ export async function scanGmail({ accessToken, options, context }) {
         shouldStop,
       }),
   });
+  const gated = [];
+  let droppedByGate = 0;
 
-  const finalCandidates = dedupeBestPerMerchant(enriched, { max: options?.maxMerchants ?? 60 });
+  for (const c of enriched) {
+    const g = strictGate(c);
+    if (!g.keep) { droppedByGate++; continue; }
+    gated.push(c);
+  }
 
+
+  const finalCandidates = dedupeBestPerMerchant(gated, { max: options?.maxMerchants ?? 60 });
+
+  for (const c of finalCandidates) {
+    if (!Array.isArray(c.evidenceSamples)) c.evidenceSamples = c.evidence ? [c.evidence] : [];
+    c.priceState = computePriceState(c);
+    c.signals = extractSignalsFromCandidate(c);
+  }
 
   return {
     candidates: finalCandidates,
@@ -418,6 +438,7 @@ export async function scanGmail({ accessToken, options, context }) {
       engineVersion: ENGINE_VERSION,
       daysBack,
       pageSize,
+      droppedByGate,
       estimatedTotal,
       listed: ids.length,
       scanned,
