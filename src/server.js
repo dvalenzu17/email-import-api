@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { pool } from "./db/index.js";
 import { registerScanRoutes } from "./routes/scanRoutes.js";
 import { registerSubscriptionRoutes } from "./routes/subscriptionRoutes.js";
+import { exchangeCodeForTokens } from "./googleOAuth.js";
 
 const server = Fastify({ logger: true });
 
@@ -31,23 +32,21 @@ server.post("/gmail/connect", async (req, reply) => {
     const authHeader = req.headers.authorization;
     const token = authHeader?.split(" ")[1];
 
-    if (!token) {
-      return reply.code(401).send({ error: "missing_token" });
-    }
-
-    // 🔐 Verify Supabase JWT
     const decoded = jwt.verify(
       token,
       process.env.SUPABASE_JWT_SECRET
     );
 
-    const supabaseUserId = decoded.sub;
+    const userId = decoded.sub;
 
-    const { accessToken, refreshToken, expiresIn } = req.body;
+    const { code, redirectUri } = req.body;
 
-    if (!accessToken || !refreshToken) {
-      return reply.code(400).send({ error: "missing_tokens" });
-    }
+    const tokens = await exchangeCodeForTokens({
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      redirectUri,
+      code,
+    });
 
     await pool.query(
       `
@@ -60,17 +59,17 @@ server.post("/gmail/connect", async (req, reply) => {
         expiry_date = EXCLUDED.expiry_date
       `,
       [
-        supabaseUserId,
-        accessToken,
-        refreshToken,
-        expiresIn
+        userId,
+        tokens.accessToken,
+        tokens.refreshToken,
+        tokens.expiresIn
       ]
     );
 
     return { success: true };
 
   } catch (err) {
-    console.error("GMAIL CONNECT ERROR:", err);
+    console.error(err);
     return reply.code(500).send({ error: "connect_failed" });
   }
 });
