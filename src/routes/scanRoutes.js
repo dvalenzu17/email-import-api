@@ -1,5 +1,5 @@
 // routes/scanRoutes.js
-
+import jwt from "jsonwebtoken";
 import {
   listRecentMessages,
   fetchMessage,
@@ -18,7 +18,19 @@ import {
   export function registerScanRoutes(server) {
     server.post("/scan", async (req, reply) => {
         console.log("HEADERS:", req.headers);
-      const userId = req.user?.id || req.headers["x-user-id"];
+        const authHeader = req.headers.authorization;
+        const token = authHeader?.split(" ")[1];
+        
+        if (!token) {
+          return reply.code(401).send({ error: "unauthorized" });
+        }
+        
+        const decoded = jwt.verify(
+          token,
+          process.env.SUPABASE_JWT_SECRET
+        );
+        
+        const userId = decoded.sub;
   
       if (!userId) {
         return reply.code(401).send({ error: "unauthorized" });
