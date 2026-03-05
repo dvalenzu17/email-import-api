@@ -5,12 +5,16 @@ import { pool } from "./db/index.js";
 import { registerScanRoutes } from "./routes/scanRoutes.js";
 import { registerSubscriptionRoutes } from "./routes/subscriptionRoutes.js";
 import { exchangeCodeForTokens } from "./googleOAuth.js";
+import { registerOAuthRoutes } from "./routes/oauthRoutes.js";
+
 
 const server = Fastify({ logger: true });
 
 // Register routes
 registerScanRoutes(server);
 registerSubscriptionRoutes(server);
+registerOAuthRoutes(server);
+
 
 server.get("/", async () => {
   return { status: "ok" };
