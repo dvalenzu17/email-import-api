@@ -41,62 +41,81 @@ import { findOrCreateUser, saveOAuthTokens } from "./db/index.js";
     // Step 2: Google redirects back here
     server.get("/auth/google/callback", async (req, reply) => {
       try {
-        const { code } = req.query;
-  
+    
+        const { code, state } = req.query;
+    
         if (!code) {
           return reply.code(400).send({ error: "missing_code" });
         }
-  
+    
+        if (!state) {
+          return reply.code(400).send({ error: "missing_state" });
+        }
+    
+        /* decode state */
+        const decodedState = JSON.parse(
+          Buffer.from(state, "base64").toString()
+        );
+    
+        const userId = decodedState.supabaseUserId;
+    
+        if (!userId) {
+          return reply.code(400).send({ error: "invalid_state" });
+        }
+    
+        /* exchange code for tokens */
         const tokens = await exchangeCodeForTokens({
           clientId,
           clientSecret,
           redirectUri,
-          code,
+          code
         });
-        
-        // 🔹 Decode email from Google idToken
-        // Fetch user info directly from Google
-const userInfoRes = await fetch(
-  "https://www.googleapis.com/oauth2/v2/userinfo",
-  {
-    headers: {
-      Authorization: `Bearer ${tokens.accessToken}`
-    }
-  }
-);
-
-if (!userInfoRes.ok) {
-  throw new Error("failed_to_fetch_userinfo");
-}
-
-const userInfo = await userInfoRes.json();
-const email = userInfo.email;
-
-if (!email) {
-  return reply.code(400).send({ error: "email_not_found" });
-}
-        
+    
+        /* fetch Google account info */
+        const userInfoRes = await fetch(
+          "https://www.googleapis.com/oauth2/v2/userinfo",
+          {
+            headers: {
+              Authorization: `Bearer ${tokens.accessToken}`
+            }
+          }
+        );
+    
+        if (!userInfoRes.ok) {
+          throw new Error("failed_to_fetch_userinfo");
+        }
+    
+        const userInfo = await userInfoRes.json();
+    
+        /* define email AFTER userInfo */
+        const email = userInfo.email;
+    
         if (!email) {
           return reply.code(400).send({ error: "email_not_found" });
         }
-        
-        // 🔹 Create or fetch user
-        const user = await findOrCreateUser(email);
-        
-        // 🔹 Save tokens to DB
-        await saveOAuthTokens(user.id, tokens);
-        
-        // 🔹 Return user ID (frontend stores this)
-        return {
-          success: true,
-          userId: user.id
-        };
+    
+        /* ensure local user exists (keeps your FK intact) */
+        await findOrCreateUser(email);
+    
+        /* store Gmail OAuth tokens */
+        await saveOAuthTokens(userId, tokens);
+    
+        /* return to mobile app */
+        return reply.redirect(
+          "beforeitbills://oauth-success"
+        );
+    
       } catch (err) {
+    
         console.error("OAUTH CALLBACK ERROR:", err);
-        return reply.code(500).send({ error: err.message });
+    
+        return reply.code(500).send({
+          error: "oauth_failed",
+          details: err.message
+        });
+    
       }
     });
-
 
   }
 
