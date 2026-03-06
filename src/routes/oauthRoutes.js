@@ -68,10 +68,9 @@ export function registerOAuthRoutes(server) {
 
       await saveOAuthTokens(user.id, tokens);
 
-      return reply.send({
-        success: true,
-        userId: user.id
-      });
+      return reply.redirect(
+        `beforeitbills://oauth-success?userId=${user.id}`
+      );
 
     } catch (err) {
 
