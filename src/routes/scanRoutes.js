@@ -11,6 +11,7 @@ import {
   
   import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
   import { getOAuthToken, upsertSubscription, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
+  import pLimit from "p-limit";
 
   
   import { refreshAccessToken } from "../googleOAuth.js";
@@ -69,10 +70,13 @@ import {
         const ids = await listRecentMessages(accessToken);
   
         // 4️⃣ Fetch full messages
-        const fullMessages = await Promise.all(
-          ids.map(m => fetchMessage(accessToken, m.id))
-        );
-  
+        const limit = pLimit(10);
+
+      const fullMessages = await Promise.all(
+        ids.map(m =>
+          limit(() => fetchMessage(accessToken, m.id))
+        )
+      );
         const charges = [];
 
         

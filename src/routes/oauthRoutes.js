@@ -93,6 +93,14 @@ export function registerOAuthRoutes(server) {
       const decodedState = JSON.parse(
         Buffer.from(state, "base64").toString()
       );
+      
+      const userId = decodedState.supabaseUserId;
+      
+      /* ensure user exists locally */
+      await findOrCreateUser(email);
+      
+      /* save tokens */
+      await saveOAuthTokens(userId, tokens);
 
       const supabaseUserId = decodedState.supabaseUserId;
 
