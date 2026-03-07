@@ -38,89 +38,115 @@ export async function verifyImapCredentials({ provider, user, pass }) {
 }
 
 export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
-  const { host, port, secure } = getImapConfig(provider);
-
-  const client = new ImapFlow({
-    host, port, secure,
-    auth: { user, pass },
-    logger: false,
-    connectionTimeout: 15000,
-  });
-
-  await client.connect();
-
-  const charges = [];
-  let scannedCount = 0;
-
-  try {
-    await client.mailboxOpen("INBOX");
-
-    const since = new Date();
-    since.setDate(since.getDate() - daysBack);
-
-    const uids = await client.search({ since });
-
-    if (!uids.length) return { charges, scannedCount };
-
-    for await (const msg of client.fetch(uids, {
-      envelope: true,
-      bodyStructure: true,
-      source: true,
-    })) {
-      scannedCount++;
-
-      try {
-        const raw = msg.source?.toString("utf8") ?? "";
-        if (!raw) continue;
-
-        const text = cleanEmailHtml(raw);
-        if (!text || text.length < 30) continue;
-
-        const hasKeyword = SEARCH_KEYWORDS.some((k) => text.includes(k));
-        if (!hasKeyword) continue;
-
-        if (
-          text.includes("trip with uber") ||
-          text.includes("thanks for riding") ||
-          text.includes("order with uber eats")
-        ) continue;
-
-        const amount = extractAmount(text);
-        if (!amount) continue;
-
-        const from = msg.envelope?.from?.[0];
-        const merchant = normaliseMerchant(from);
-        const date = msg.envelope?.date
-          ? new Date(msg.envelope.date)
-          : new Date();
-
-        let intentScore = 0;
-        if (text.includes("subscription")) intentScore += 1;
-        if (text.includes("membership")) intentScore += 1;
-        if (text.includes("automatically renew")) intentScore += 2;
-        if (text.includes("renews on")) intentScore += 2;
-        if (text.includes("/month") || text.includes("per month")) intentScore += 2;
-        if (text.includes("/year") || text.includes("per year")) intentScore += 2;
-        if (text.includes("valid until")) intentScore += 2;
-        if (text.includes("plan")) intentScore += 1;
-
-        charges.push({
-          merchant,
-          amount,
-          date,
-          subscriptionIntent: intentScore >= 3,
-        });
-      } catch {
-        continue;
+    const { host, port, secure } = getImapConfig(provider);
+  
+    const client = new ImapFlow({
+      host, port, secure,
+      auth: { user, pass },
+      logger: false,
+      connectionTimeout: 15000,
+    });
+  
+    await client.connect();
+  
+    const charges = [];
+    let scannedCount = 0;
+  
+    try {
+      await client.mailboxOpen("INBOX");
+  
+      const since = new Date();
+      since.setDate(since.getDate() - daysBack);
+  
+      const allUids = await client.search({ since });
+      if (!allUids.length) return { charges, scannedCount };
+  
+      // Cap at 500 most recent
+      const uids = allUids.slice(-500);
+  
+      // Pass 1 — subject filter, envelopes only
+      const relevant = [];
+  
+      for await (const msg of client.fetch(uids, { envelope: true })) {
+        scannedCount++;
+        const subject = msg.envelope?.subject?.toLowerCase() ?? "";
+  
+        const looksRelevant =
+          subject.includes("receipt") ||
+          subject.includes("invoice") ||
+          subject.includes("subscription") ||
+          subject.includes("renewal") ||
+          subject.includes("payment") ||
+          subject.includes("billing") ||
+          subject.includes("charged") ||
+          subject.includes("membership") ||
+          subject.includes("your plan") ||
+          subject.includes("order confirmation");
+  
+        if (looksRelevant) {
+          relevant.push({ uid: msg.uid, envelope: msg.envelope });
+        }
       }
+  
+      if (!relevant.length) return { charges, scannedCount };
+  
+      // Pass 2 — fetch body only for relevant messages
+      const relevantUids = relevant.map((r) => r.uid);
+      const envelopeMap = Object.fromEntries(
+        relevant.map((r) => [r.uid, r.envelope])
+      );
+  
+      for await (const msg of client.fetch(relevantUids, {
+        source: true,
+        envelope: true,
+      })) {
+        try {
+          const raw = msg.source?.toString("utf8") ?? "";
+          if (!raw) continue;
+  
+          const text = cleanEmailHtml(raw);
+          if (!text || text.length < 30) continue;
+  
+          if (
+            text.includes("trip with uber") ||
+            text.includes("thanks for riding") ||
+            text.includes("order with uber eats")
+          ) continue;
+  
+          const amount = extractAmount(text);
+          if (!amount) continue;
+  
+          const envelope = envelopeMap[msg.uid] ?? msg.envelope;
+          const from = envelope?.from?.[0];
+          const merchant = normaliseMerchant(from);
+          const date = envelope?.date ? new Date(envelope.date) : new Date();
+  
+          let intentScore = 0;
+          if (text.includes("subscription")) intentScore += 1;
+          if (text.includes("membership")) intentScore += 1;
+          if (text.includes("automatically renew")) intentScore += 2;
+          if (text.includes("renews on")) intentScore += 2;
+          if (text.includes("/month") || text.includes("per month")) intentScore += 2;
+          if (text.includes("/year") || text.includes("per year")) intentScore += 2;
+          if (text.includes("valid until")) intentScore += 2;
+          if (text.includes("plan")) intentScore += 1;
+  
+          charges.push({
+            merchant,
+            amount,
+            date,
+            subscriptionIntent: intentScore >= 3,
+          });
+        } catch {
+          continue;
+        }
+      }
+    } finally {
+      await client.logout();
     }
-  } finally {
-    await client.logout();
+  
+    return { charges, scannedCount };
   }
-
-  return { charges, scannedCount };
-}
-
 function normaliseMerchant(from) {
   if (!from) return "unknown";
 
