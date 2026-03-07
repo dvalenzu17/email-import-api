@@ -52,16 +52,26 @@ export function registerImapScanRoutes(server) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
-    const { provider, user, pass, daysBack = 365 } = req.body;
+    let { provider, user, pass, daysBack = 365 } = req.body;
 
-    if (!provider || !user || !pass) {
-      return reply.code(400).send({ error: "missing_fields" });
+    if (!provider) {
+      return reply.code(400).send({ error: "missing_provider" });
     }
 
     try {
       getImapConfig(provider);
     } catch {
       return reply.code(400).send({ error: "unsupported_provider" });
+    }
+
+    // Fall back to stored credentials if not supplied in request
+    if (!user || !pass) {
+      const stored = await getImapCredentials(userId, provider);
+      if (!stored) {
+        return reply.code(400).send({ error: "imap_not_connected" });
+      }
+      user = stored.imap_user;
+      pass = decryptCredential(stored.imap_pass);
     }
 
     const started = Date.now();
