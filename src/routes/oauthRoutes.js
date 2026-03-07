@@ -83,11 +83,11 @@ export function registerOAuthRoutes(server) {
       if (!email) return reply.code(400).send({ error: "email_not_found" });
 
       try {
-        await findOrCreateUser(email);
+        await findOrCreateUser(supabaseUserId, email);
       } catch (err) {
         console.warn("USER SYNC WARNING:", err.message);
       }
-
+      
       await saveOAuthTokens(supabaseUserId, tokens);
 
       return reply.redirect("beforeitbills://oauth-success");

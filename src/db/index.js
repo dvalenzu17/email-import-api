@@ -13,20 +13,13 @@ export const pool = new Pool({
 // USERS
 // -------------------------
 
-export async function findOrCreateUser(email) {
-  const existing = await pool.query(
-    "SELECT * FROM users WHERE email = $1",
-    [email]
+export async function findOrCreateUser(supabaseId, email) {
+  await pool.query(
+    `INSERT INTO users (id, email)
+     VALUES ($1, $2)
+     ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email`,
+    [supabaseId, email]
   );
-
-  if (existing.rows.length) return existing.rows[0];
-
-  const created = await pool.query(
-    "INSERT INTO users (email) VALUES ($1) RETURNING *",
-    [email]
-  );
-
-  return created.rows[0];
 }
 
 // -------------------------
