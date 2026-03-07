@@ -143,3 +143,28 @@ export async function getLatestScanMetadata(userId) {
 
   return result.rows[0] || null;
 }
+
+export async function saveImapCredentials(userId, { provider, user, pass }) {
+  const { encryptCredential } = await import("../services/crypto.js");
+
+  const encryptedPass = encryptCredential(pass);
+
+  await pool.query(
+    `INSERT INTO imap_credentials (user_id, provider, imap_user, imap_pass)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, provider)
+     DO UPDATE SET
+       imap_user = EXCLUDED.imap_user,
+       imap_pass = EXCLUDED.imap_pass,
+       updated_at = NOW()`,
+    [userId, provider, user, encryptedPass]
+  );
+}
+
+export async function getImapCredentials(userId, provider) {
+  const result = await pool.query(
+    `SELECT * FROM imap_credentials WHERE user_id = $1 AND provider = $2`,
+    [userId, provider]
+  );
+  return result.rows[0] ?? null;
+}

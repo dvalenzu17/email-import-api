@@ -3,12 +3,13 @@ import "dotenv/config";
 import { registerScanRoutes } from "./routes/scanRoutes.js";
 import { registerSubscriptionRoutes } from "./routes/subscriptionRoutes.js";
 import { registerOAuthRoutes } from "./routes/oauthRoutes.js";
-
+import { registerImapScanRoutes } from "./routes/imapScanRoutes.js";
 const server = Fastify({ logger: true });
 
 registerScanRoutes(server);
 registerSubscriptionRoutes(server);
 registerOAuthRoutes(server);
+registerImapScanRoutes(server);
 
 server.get("/", async () => {
   return { status: "ok" };
