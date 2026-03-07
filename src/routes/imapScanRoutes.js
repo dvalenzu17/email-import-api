@@ -7,6 +7,8 @@ import { decryptCredential } from "../services/crypto.js";
 export function registerImapScanRoutes(server) {
 
   server.post("/scan/imap/verify", async (req, reply) => {
+    console.log("IMAP VERIFY HIT:", req.body?.provider, req.body?.user);
+
     const authHeader = req.headers.authorization;
     const token = authHeader?.split(" ")[1];
     if (!token) return reply.code(401).send({ error: "unauthorized" });
