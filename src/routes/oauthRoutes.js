@@ -77,7 +77,7 @@ export function registerOAuthRoutes(server) {
   */
 
   server.get("/auth/google/callback", async (req, reply) => {
-
+    console.log("CALLBACK HIT — code:", !!req.query.code, "state:", !!req.query.state);
     try {
 
       const { code, state } = req.query;
