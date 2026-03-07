@@ -90,7 +90,9 @@ export function registerOAuthRoutes(server) {
       
       await saveOAuthTokens(supabaseUserId, tokens);
 
-      return reply.redirect("beforeitbills://oauth-success");
+      return reply.redirect(
+        `beforeitbills://oauth-success?email=${encodeURIComponent(email)}`
+      );
     } catch (err) {
       console.error("OAUTH CALLBACK ERROR:", err);
       return reply.code(500).send({ error: "oauth_failed", details: err.message });
