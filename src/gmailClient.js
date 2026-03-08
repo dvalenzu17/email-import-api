@@ -109,22 +109,44 @@ export async function listRecentMessages(accessToken) {
   
   
   export function extractMerchant(headers) {
-    const from = headers.find(h => h.name === "From")?.value;
+    const from = headers.find((h) => h.name === "From")?.value;
     if (!from) return "unknown";
   
     const emailMatch = from.match(/<(.+?)>/);
-    if (!emailMatch) return from.toLowerCase();
+    const address = emailMatch ? emailMatch[1] : from;
+    const domain = address.split("@")[1]?.toLowerCase() ?? "";
   
-    const domain = emailMatch[1].split("@")[1].toLowerCase();
+    // Extract root domain — strip subdomains and TLD
+    const parts = domain.split(".");
+    const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
   
-    // Normalize known cases
-    if (domain.includes("uber")) {
-      if (from.toLowerCase().includes("uber one")) return "uber one";
-      return "uber";
+    // Known overrides
+    if (root.includes("uber")) {
+      return from.toLowerCase().includes("uber one") ? "uber one" : "uber";
     }
   
-    if (domain.includes("openai")) return "openai";
-    if (domain.includes("netflix")) return "netflix";
+    const knownMap = {
+      openai: "openai",
+      chatgpt: "openai",
+      netflix: "netflix",
+      spotify: "spotify",
+      apple: "apple",
+      google: "google",
+      youtube: "google",
+      microsoft: "microsoft",
+      adobe: "adobe",
+      dropbox: "dropbox",
+      slack: "slack",
+      amazon: "amazon",
+      hulu: "hulu",
+      disney: "disney+",
+      notion: "notion",
+      figma: "figma",
+      github: "github",
+      anthropic: "anthropic",
+      linkedin: "linkedin",
+      zoom: "zoom",
+    };
   
-    return domain;
+    return knownMap[root] ?? root;
   }

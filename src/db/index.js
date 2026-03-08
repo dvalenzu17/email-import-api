@@ -102,10 +102,8 @@ export async function getSubscriptions(userId) {
     "SELECT * FROM subscriptions WHERE user_id = $1",
     [userId]
   );
-
   return result.rows;
 }
-
 // -------------------------
 // SCAN METADATA
 // -------------------------

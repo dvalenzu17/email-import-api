@@ -1,176 +1,201 @@
-// routes/scanRoutes.js
 import jwt from "jsonwebtoken";
 import {
-  listRecentMessages,
   fetchMessage,
   extractText,
   extractAmount,
   extractMerchant,
-  cleanEmailHtml
+  cleanEmailHtml,
 } from "../gmailClient.js";
-  
-  import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-  import { getOAuthToken, upsertSubscription, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
-  import pLimit from "p-limit";
 
-  
-  import { refreshAccessToken } from "../googleOAuth.js";
-  
-  export function registerScanRoutes(server) {
-    server.post("/scan", async (req, reply) => {
-        console.log("HEADERS:", req.headers);
-        const authHeader = req.headers.authorization;
-        const token = authHeader?.split(" ")[1];
-        
-        if (!token) {
-          return reply.code(401).send({ error: "unauthorized" });
-        }
-        
-        const decoded = jwt.verify(
-          token,
-          process.env.SUPABASE_JWT_SECRET
-        );
-        
-        const userId = decoded.sub;
-  
-      if (!userId) {
-        return reply.code(401).send({ error: "unauthorized" });
+import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
+import { getOAuthToken, upsertSubscription, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
+import pLimit from "p-limit";
+import { refreshAccessToken } from "../googleOAuth.js";
+
+const SUBSCRIPTION_NEGATIVE_PATTERNS = [
+  "trip with uber",
+  "thanks for riding",
+  "order with uber eats",
+  "your uber eats order",
+  "you've earned",
+  "reward",
+  "you ordered",
+  "is on its way",
+  "out for delivery",
+  "has been shipped",
+  "tracking number",
+  "your order has",
+  "rate your experience",
+  "left a review",
+  "survey",
+  "unsubscribe from marketing",
+  "you've been charged a late fee",
+  "one-time",
+  "one time purchase",
+];
+
+const SUBSCRIPTION_POSITIVE_DOMAINS = [
+  "netflix.com", "spotify.com", "openai.com", "adobe.com",
+  "apple.com", "google.com", "amazon.com", "microsoft.com",
+  "dropbox.com", "slack.com", "notion.so", "figma.com",
+  "github.com", "anthropic.com", "chatgpt.com", "hulu.com",
+  "disneyplus.com", "youtube.com", "linkedin.com", "zoom.us",
+  "shopify.com", "squarespace.com", "wix.com", "webflow.io",
+];
+
+export function registerScanRoutes(server) {
+  server.post("/scan", async (req, reply) => {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(" ")[1];
+
+    if (!token) return reply.code(401).send({ error: "unauthorized" });
+
+    let userId;
+    try {
+      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+      userId = decoded.sub;
+    } catch {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    if (!userId) return reply.code(401).send({ error: "unauthorized" });
+
+    // Accept optional daysBack from request body — default 180, max 730
+    const daysBack = Math.min(Number(req.body?.daysBack) || 180, 730);
+    const started = Date.now();
+
+    try {
+      const tokenRecord = await getOAuthToken(userId);
+      if (!tokenRecord) {
+        return reply.code(400).send({ error: "gmail_not_connected" });
       }
-  
-      const started = Date.now();
-  
-      try {
-        // 1️⃣ Get stored OAuth token
-        const tokenRecord = await getOAuthToken(userId);
-        if (!tokenRecord) {
-          return reply.code(400).send({ error: "gmail_not_connected" });
-        }
-  
-        let accessToken = tokenRecord.access_token;
-  
-        // 2️⃣ Refresh if expired
-        if (new Date(tokenRecord.expiry_date) < new Date()) {
-            const refreshed = await refreshAccessToken({
-              clientId: process.env.GOOGLE_CLIENT_ID,
-              clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-              refreshToken: tokenRecord.refresh_token
-            });
-          
-            accessToken = refreshed.accessToken;
-          
-            // 🔹 Persist refreshed token
-            await saveOAuthTokens(userId, {
-              accessToken: refreshed.accessToken,
-              refreshToken: tokenRecord.refresh_token,
-              expiresIn: refreshed.expiresIn
-            });
-          }
-  
-        // 3️⃣ Fetch message IDs
-        const ids = await listRecentMessages(accessToken);
-  
-        // 4️⃣ Fetch full messages
-        const limit = pLimit(10);
 
+      let accessToken = tokenRecord.access_token;
+
+      if (new Date(tokenRecord.expiry_date) < new Date()) {
+        const refreshed = await refreshAccessToken({
+          clientId: process.env.GOOGLE_CLIENT_ID,
+          clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+          refreshToken: tokenRecord.refresh_token,
+        });
+
+        accessToken = refreshed.accessToken;
+
+        await saveOAuthTokens(userId, {
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken ?? tokenRecord.refresh_token,
+          expiresIn: refreshed.expiresIn,
+        });
+      }
+
+      const query = `newer_than:${daysBack}d (subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal OR subject:payment OR subject:billing OR subject:membership OR subject:"your plan" OR subject:"order confirmation")`;
+
+      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&q=${encodeURIComponent(query)}`;
+      const listRes = await fetch(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const listData = await listRes.json();
+      const ids = listData.messages || [];
+
+      const limit = pLimit(10);
       const fullMessages = await Promise.all(
-        ids.map(m =>
-          limit(() => fetchMessage(accessToken, m.id))
-        )
+        ids.map((m) => limit(() => fetchMessage(accessToken, m.id)))
       );
-        const charges = [];
 
-        
-  
-        for (const full of fullMessages) {
-          if (!full?.payload) continue;
-  
-          const headers = full.payload.headers;
+      const charges = [];
 
+      for (const full of fullMessages) {
+        if (!full?.payload) continue;
+
+        const headers = full.payload.headers;
         const rawHtml = extractText(full.payload);
         if (!rawHtml) continue;
 
         const text = cleanEmailHtml(rawHtml);
         if (!text || text.length < 30) continue;
 
-        /* ---------- HARD NEGATIVE FILTERS ----------  */
-        if (
-        text.includes("trip with uber") ||
-        text.includes("thanks for riding") ||
-        text.includes("order with uber eats")
-      ) {
-        continue;
-      }
+        // Hard negative filters
+        const isNegative = SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) =>
+          text.includes(p)
+        );
+        if (isNegative) continue;
 
-        /* ---------- TRANSACTIONAL CONFIRMATION ---------- */
+        // Must have transactional signal
         const transactional =
-  text.includes("payment") ||
-  text.includes("charged") ||
-  text.includes("invoice") ||
-  text.includes("successfully subscribed");
+          text.includes("payment") ||
+          text.includes("charged") ||
+          text.includes("invoice") ||
+          text.includes("successfully subscribed") ||
+          text.includes("receipt") ||
+          text.includes("billing") ||
+          text.includes("renewal");
 
-      //  if (!transactional) continue;
+        if (!transactional) continue;
 
-      const amount = extractAmount(text);
+        const amount = extractAmount(text);
         if (!amount) continue;
 
+        // Filter out suspiciously large one-off amounts
+        if (amount > 500) continue;
+
         const merchant = extractMerchant(headers);
+        if (merchant === "unknown") continue;
+
         const date = new Date(Number(full.internalDate));
 
-        /* ---------- SUBSCRIPTION INTENT ---------- */
-        
+        // Subscription intent scoring
         let intentScore = 0;
-
-        if (text.includes("subscription")) intentScore += 1;
-        if (text.includes("membership")) intentScore += 1;
-        if (text.includes("automatically renew")) intentScore += 2;
-        if (text.includes("renews on")) intentScore += 2;
+        if (text.includes("subscription")) intentScore += 2;
+        if (text.includes("membership")) intentScore += 2;
+        if (text.includes("automatically renew")) intentScore += 3;
+        if (text.includes("renews on")) intentScore += 3;
+        if (text.includes("next billing")) intentScore += 3;
         if (text.includes("/month") || text.includes("per month")) intentScore += 2;
         if (text.includes("/year") || text.includes("per year")) intentScore += 2;
         if (text.includes("valid until")) intentScore += 2;
+        if (text.includes("cancel anytime")) intentScore += 3;
+        if (text.includes("free trial")) intentScore += 2;
+        if (text.includes("your plan")) intentScore += 2;
         if (text.includes("plan")) intentScore += 1;
 
-const subscriptionIntent = intentScore >= 3;
+        // Boost intent if sender is a known subscription domain
+        const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
+        const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
+          fromHeader.toLowerCase().includes(d)
+        );
+        if (isKnownDomain) intentScore += 3;
 
-        charges.push({
-          merchant,
-          amount,
-          date,
-          subscriptionIntent
-        });
-        
+        const subscriptionIntent = intentScore >= 4;
+
+        charges.push({ merchant, amount, date, subscriptionIntent });
+      }
+
+      const subscriptions = detectRecurringSubscriptions(charges);
+
+      for (const sub of subscriptions) {
+        if (sub.confidence >= 0.7) {
+          await upsertSubscription(userId, sub);
         }
-  
-        // 5️⃣ Detect recurring subscriptions
-        const subscriptions = detectRecurringSubscriptions(charges);
-  
-        // 6️⃣ Persist subscriptions
-        for (const sub of subscriptions) {
-          if (sub.confidence >= 0.65) {
-            await upsertSubscription(userId, sub);
-          }
-        }
-  
-        // 7️⃣ Save scan metadata
-        await saveScanMetadata(userId, {
+      }
+
+      await saveScanMetadata(userId, {
+        scannedMessages: ids.length,
+        detectedCharges: charges.length,
+        executionTimeMs: Date.now() - started,
+      });
+
+      return {
+        success: true,
+        detectedSubscriptions: subscriptions.length,
+        meta: {
           scannedMessages: ids.length,
           detectedCharges: charges.length,
-          executionTimeMs: Date.now() - started
-        });
-  
-        return {
-          success: true,
-          detectedSubscriptions: subscriptions.length
-        };
-  
+          executionTimeMs: Date.now() - started,
+        },
+      };
     } catch (err) {
-        console.error("SCAN ERROR:", err);
-        return reply.code(500).send({
-          error: "scan_failed",
-          details: err.message
-        });
-      }
-    });
-
-
-    
-  }
+      console.error("SCAN ERROR:", err);
+      return reply.code(500).send({ error: "scan_failed", details: err.message });
+    }
+  });
+}
