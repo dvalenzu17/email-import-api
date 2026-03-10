@@ -43,16 +43,10 @@ export function detectRecurringSubscriptions(charges) {
   for (const merchant in grouped) {
     const list = grouped[merchant];
 
-    // Single occurrence — only pass through if very strong intent
-    // and it's a known subscription keyword, not just "plan"
     if (list.length < 2) {
       const single = list[0];
-
       if (!single.subscriptionIntent) continue;
 
-      // Require stronger signal for singles — intentScore must be high
-      // We proxy this by checking if the amount looks like a subscription
-      // (round numbers or common subscription price points)
       const amount = single.amount;
       const looksLikeSubscription =
         amount === Math.round(amount) ||
@@ -86,10 +80,7 @@ export function detectRecurringSubscriptions(charges) {
 
     const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
     const intervalVariance = Math.max(...intervals) - Math.min(...intervals);
-
-    // If interval doesn't match any known billing cycle, skip
     const billingInterval = detectBillingInterval(avgInterval);
-    if (billingInterval === "unknown") continue;
 
     const amounts = list.map((x) => x.amount);
     const avgAmount = amounts.reduce((a, b) => a + b, 0) / amounts.length;
@@ -109,7 +100,10 @@ export function detectRecurringSubscriptions(charges) {
       subscriptionIntent: anyIntent,
     });
 
-    // Raise the floor — don't persist weak signals
+    // Only drop unknown interval if confidence is also low
+    // A stable amount + recurring merchant overrides unknown interval
+    if (billingInterval === "unknown" && confidence < 0.4) continue;
+
     if (confidence < 0.5) continue;
 
     results.push({
