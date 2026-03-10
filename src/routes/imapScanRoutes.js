@@ -89,7 +89,7 @@ export function registerImapScanRoutes(server) {
       }));
 
       for (const sub of subscriptions) {
-        if (sub.confidence >= 0.65) {
+        if (sub.confidence >= 0.7) {
           await upsertSubscription(userId, sub);
         }
       }

@@ -116,14 +116,21 @@ export async function listRecentMessages(accessToken) {
     const address = emailMatch ? emailMatch[1] : from;
     const domain = address.split("@")[1]?.toLowerCase() ?? "";
   
-    // Extract root domain — strip subdomains and TLD
     const parts = domain.split(".");
     const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
   
-    // Known overrides
     if (root.includes("uber")) {
       return from.toLowerCase().includes("uber one") ? "uber one" : "uber";
     }
+  
+    // Explicitly blocked — marketing/transactional senders, not subscription services
+    const blocked = new Set([
+      "klaviyo", "mailchimp", "sendgrid", "constantcontact",
+      "interactivebrokers", "hoyoverse", "gelato", "brevo",
+      "hubspot", "salesforce", "marketo",
+    ]);
+  
+    if (blocked.has(root)) return "unknown";
   
     const knownMap = {
       openai: "openai",
