@@ -32,6 +32,14 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "you've been charged a late fee",
   "one-time",
   "one time purchase",
+  // Amazon specific
+  "your amazon.com order",
+  "order confirmation",
+  "items ordered",
+  "estimated delivery",
+  "shipping confirmation",
+  "your package",
+  "arriving",
 ];
 
 const SUBSCRIPTION_POSITIVE_DOMAINS = [

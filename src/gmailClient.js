@@ -101,12 +101,19 @@ export async function listRecentMessages(accessToken) {
     const chargedMatch = text.match(/charged\s*\$([0-9]+(?:\.[0-9]{2})?)/i);
     if (chargedMatch) return parseFloat(chargedMatch[1]);
   
+    // Plan price — catches "$8.99/month", "$99/year"
+    const planMatch = text.match(/\$([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/i);
+    if (planMatch) return parseFloat(planMatch[1]);
+  
     const allMatches = [...text.matchAll(/\$([0-9]+(?:\.[0-9]{2})?)/g)];
     if (!allMatches.length) return null;
   
-    return parseFloat(allMatches[allMatches.length - 1][1]);
-  }
+    // Filter out suspiciously large amounts before returning last match
+    const filtered = allMatches.filter(m => parseFloat(m[1]) <= 100);
+    if (!filtered.length) return null;
   
+    return parseFloat(filtered[filtered.length - 1][1]);
+  }
   
   export function extractMerchant(headers) {
     const from = headers.find((h) => h.name === "From")?.value;
@@ -119,11 +126,10 @@ export async function listRecentMessages(accessToken) {
     const parts = domain.split(".");
     const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
   
-    if (root.includes("uber")) {
+    if (root.includes("uber") || parts.some(p => p.includes("uber"))) {
       return from.toLowerCase().includes("uber one") ? "uber one" : "uber";
     }
   
-    // Explicitly blocked — marketing/transactional senders, not subscription services
     const blocked = new Set([
       "klaviyo", "mailchimp", "sendgrid", "constantcontact",
       "interactivebrokers", "hoyoverse", "gelato", "brevo",
@@ -154,6 +160,13 @@ export async function listRecentMessages(accessToken) {
       linkedin: "linkedin",
       zoom: "zoom",
     };
+  
+    // Check every part of the domain, not just root
+    // Catches tm.openai.com → openai, info.netflix.com → netflix
+    for (const part of parts) {
+      if (knownMap[part]) return knownMap[part];
+      if (blocked.has(part)) return "unknown";
+    }
   
     return knownMap[root] ?? root;
   }
