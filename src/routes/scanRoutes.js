@@ -180,7 +180,7 @@ export function registerScanRoutes(server) {
       const subscriptions = detectRecurringSubscriptions(charges);
 
       for (const sub of subscriptions) {
-        if (sub.confidence >= 0.7) {
+        if (sub.confidence >= 0.6) {
           await upsertSubscription(userId, sub);
         }
       }

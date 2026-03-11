@@ -19,8 +19,8 @@ function calculateConfidence({ occurrences, intervalVariance, amountVariance, su
 }
 
 function detectBillingInterval(avgDays) {
-  if (avgDays > 25 && avgDays < 35) return "monthly";
-  if (avgDays > 350 && avgDays < 380) return "yearly";
+  if (avgDays > 25 && avgDays < 70) return "monthly";   // wider — covers monthly + every-6-weeks
+  if (avgDays > 350 && avgDays < 400) return "yearly";  // slightly wider for yearly
   if (avgDays > 80 && avgDays < 100) return "quarterly";
   if (avgDays > 6 && avgDays < 9) return "weekly";
   return "unknown";
