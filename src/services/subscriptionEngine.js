@@ -114,6 +114,11 @@ export function detectRecurringSubscriptions(charges) {
       continue;
     }
 
+    if (avgInterval < 1) {
+      console.log(`DROP ${merchant}: avgInterval ${avgInterval.toFixed(2)} days, duplicate transaction`);
+      continue;
+    }
+
     if (confidence < 0.5) {
       console.log(`DROP ${merchant}: confidence too low ${confidence.toFixed(2)}`);
       continue;

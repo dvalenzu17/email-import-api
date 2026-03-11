@@ -96,8 +96,7 @@ export function registerScanRoutes(server) {
         });
       }
 
-      const query = `newer_than:${daysBack}d (subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal OR subject:payment OR subject:billing OR subject:membership OR subject:"your plan" OR subject:"order confirmation")`;
-
+      const query = `newer_than:${daysBack}d (subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal OR subject:payment OR subject:billing OR subject:membership OR subject:plan OR subject:welcome OR subject:"order confirmation")`;
       const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&q=${encodeURIComponent(query)}`;
       const listRes = await fetch(url, {
         headers: { Authorization: `Bearer ${accessToken}` },
