@@ -1,26 +1,13 @@
-import jwt from "jsonwebtoken";
+// routes/subscriptionRoutes.js
+
 import {
   getSubscriptions,
-  getLatestScanMetadata,
+  getLatestScanMetadata
 } from "../db/index.js";
 
 export function registerSubscriptionRoutes(server) {
-  server.get("/subscriptions", async (req, reply) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.split(" ")[1];
-
-    if (!token) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
-
-    let userId;
-
-    try {
-      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-      userId = decoded.sub;
-    } catch {
-      return reply.code(401).send({ error: "invalid_token" });
-    }
+  server.get("/subscriptions", { preHandler: [server.authenticate] }, async (req, reply) => {
+    const userId = req.user?.id;
 
     if (!userId) {
       return reply.code(401).send({ error: "unauthorized" });
@@ -31,7 +18,7 @@ export function registerSubscriptionRoutes(server) {
       const latestScan = await getLatestScanMetadata(userId);
 
       return {
-        subscriptions: subs.map((s) => ({
+        subscriptions: subs.map(s => ({
           id: s.id,
           merchant: s.merchant,
           renewalAmount: Number(s.renewal_amount),
@@ -39,6 +26,7 @@ export function registerSubscriptionRoutes(server) {
           renewalDate: s.renewal_date
             ? new Date(s.renewal_date).toISOString()
             : null,
+          billingInterval: s.billing_interval ?? null,
           confidence: Number(s.confidence),
           isActive: s.is_active,
           isSuggested: s.is_suggested,

@@ -19,8 +19,8 @@ function calculateConfidence({ occurrences, intervalVariance, amountVariance, su
 }
 
 function detectBillingInterval(avgDays) {
-  if (avgDays > 25 && avgDays < 70) return "monthly";   // wider — covers monthly + every-6-weeks
-  if (avgDays > 350 && avgDays < 400) return "yearly";  // slightly wider for yearly
+  if (avgDays > 25 && avgDays < 35) return "monthly";
+  if (avgDays > 350 && avgDays < 380) return "yearly";
   if (avgDays > 80 && avgDays < 100) return "quarterly";
   if (avgDays > 6 && avgDays < 9) return "weekly";
   return "unknown";
@@ -66,7 +66,7 @@ export function detectRecurringSubscriptions(charges) {
         merchant,
         renewalAmount: amount,
         currency: "USD",
-        renewalDate: null,
+        renewalDate: single.renewalDate ?? null,
         billingInterval: "unknown",
         confidence: 0.7,
         isActive: true,
@@ -94,7 +94,8 @@ export function detectRecurringSubscriptions(charges) {
     const amountVariance = (Math.max(...amounts) - Math.min(...amounts)) / avgAmount;
 
     const last = list[list.length - 1];
-    const nextDate = new Date(
+    const explicitRenewalDate = list.find((c) => c.renewalDate)?.renewalDate ?? null;
+    const nextDate = explicitRenewalDate ?? new Date(
       last.date.getTime() + avgInterval * 24 * 60 * 60 * 1000
     );
 
@@ -111,11 +112,6 @@ export function detectRecurringSubscriptions(charges) {
 
     if (billingInterval === "unknown" && confidence < 0.4) {
       console.log(`DROP ${merchant}: unknown interval + low confidence`);
-      continue;
-    }
-
-    if (avgInterval < 1) {
-      console.log(`DROP ${merchant}: avgInterval ${avgInterval.toFixed(2)} days, duplicate transaction`);
       continue;
     }
 

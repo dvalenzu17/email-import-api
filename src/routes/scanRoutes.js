@@ -3,6 +3,7 @@ import {
   fetchMessage,
   extractText,
   extractAmount,
+  extractRenewalDate,
   extractMerchant,
   cleanEmailHtml,
 } from "../gmailClient.js";
@@ -157,7 +158,6 @@ export function registerScanRoutes(server) {
 
         if (!transactional) continue;
 
-        // Check known domain early — needed for plan price fallback
         const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
         const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
           fromHeader.toLowerCase().includes(d)
@@ -165,19 +165,19 @@ export function registerScanRoutes(server) {
 
         let amount = extractAmount(text);
 
-        // For known subscription domains, fall back to plan price if no transaction amount
         if (!amount && isKnownDomain) {
-          const planMatch = text.match(/\$([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:mo|month|yr|year)/i);
+          const planMatch = text.match(/(?:us\$|\$)([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:mo|month|yr|year)/i);
           if (planMatch) amount = parseFloat(planMatch[1]);
         }
 
         if (!amount) continue;
         if (amount > 100) continue;
 
-        const merchant = extractMerchant(headers);
+        const merchant = extractMerchant(headers, text);
         if (merchant === "unknown") continue;
 
         const date = new Date(Number(full.internalDate));
+        const renewalDate = extractRenewalDate(text);
 
         let intentScore = 0;
         if (text.includes("subscription")) intentScore += 2;
@@ -196,7 +196,7 @@ export function registerScanRoutes(server) {
 
         const subscriptionIntent = intentScore >= 4;
 
-        charges.push({ merchant, amount, date, subscriptionIntent });
+        charges.push({ merchant, amount, date, subscriptionIntent, renewalDate });
       }
 
       const subscriptions = detectRecurringSubscriptions(charges);
