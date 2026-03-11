@@ -1,10 +1,16 @@
 import Fastify from "fastify";
+import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { registerScanRoutes } from "./routes/scanRoutes.js";
 import { registerSubscriptionRoutes } from "./routes/subscriptionRoutes.js";
 import { registerOAuthRoutes } from "./routes/oauthRoutes.js";
 import { registerImapScanRoutes } from "./routes/imapScanRoutes.js";
+
 const server = Fastify({ logger: true });
+
+await server.register(rateLimit, {
+  global: false, // only apply where explicitly set
+});
 
 registerScanRoutes(server);
 registerSubscriptionRoutes(server);

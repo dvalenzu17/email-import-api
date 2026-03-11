@@ -32,7 +32,6 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "you've been charged a late fee",
   "one-time",
   "one time purchase",
-  // Amazon specific
   "your amazon.com order",
   "order confirmation",
   "items ordered",
@@ -40,6 +39,12 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "shipping confirmation",
   "your package",
   "arriving",
+  "payment declined",
+  "update your payment",
+  "unable to process your payment",
+  "trouble authorizing",
+  "failed payment",
+  "action required",
 ];
 
 const SUBSCRIPTION_POSITIVE_DOMAINS = [
@@ -51,8 +56,26 @@ const SUBSCRIPTION_POSITIVE_DOMAINS = [
   "shopify.com", "squarespace.com", "wix.com", "webflow.io",
 ];
 
+const SCAN_RATE_LIMIT = {
+  max: 3,
+  timeWindow: "15 minutes",
+  keyGenerator: (req) => {
+    try {
+      const token = req.headers.authorization?.split(" ")[1];
+      const decoded = jwt.decode(token);
+      return decoded?.sub ?? req.ip;
+    } catch {
+      return req.ip;
+    }
+  },
+  errorResponseBuilder: () => ({
+    error: "rate_limited",
+    message: "Too many scans. Please wait 15 minutes before scanning again.",
+  }),
+};
+
 export function registerScanRoutes(server) {
-  server.post("/scan", async (req, reply) => {
+  server.post("/scan", { config: { rateLimit: SCAN_RATE_LIMIT } }, async (req, reply) => {
     const authHeader = req.headers.authorization;
     const token = authHeader?.split(" ")[1];
 
@@ -68,7 +91,6 @@ export function registerScanRoutes(server) {
 
     if (!userId) return reply.code(401).send({ error: "unauthorized" });
 
-    // Accept optional daysBack from request body — default 180, max 730
     const daysBack = Math.min(Number(req.body?.daysBack) || 180, 730);
     const started = Date.now();
 
@@ -121,13 +143,9 @@ export function registerScanRoutes(server) {
         const text = cleanEmailHtml(rawHtml);
         if (!text || text.length < 30) continue;
 
-        // Hard negative filters
-        const isNegative = SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) =>
-          text.includes(p)
-        );
+        const isNegative = SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) => text.includes(p));
         if (isNegative) continue;
 
-        // Must have transactional signal
         const transactional =
           text.includes("payment") ||
           text.includes("charged") ||
@@ -139,18 +157,28 @@ export function registerScanRoutes(server) {
 
         if (!transactional) continue;
 
-        const amount = extractAmount(text);
-        if (!amount) continue;
+        // Check known domain early — needed for plan price fallback
+        const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
+        const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
+          fromHeader.toLowerCase().includes(d)
+        );
 
-        // Filter out suspiciously large one-off amounts
-        if (amount > 500) continue;
+        let amount = extractAmount(text);
+
+        // For known subscription domains, fall back to plan price if no transaction amount
+        if (!amount && isKnownDomain) {
+          const planMatch = text.match(/\$([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:mo|month|yr|year)/i);
+          if (planMatch) amount = parseFloat(planMatch[1]);
+        }
+
+        if (!amount) continue;
+        if (amount > 100) continue;
 
         const merchant = extractMerchant(headers);
         if (merchant === "unknown") continue;
 
         const date = new Date(Number(full.internalDate));
 
-        // Subscription intent scoring
         let intentScore = 0;
         if (text.includes("subscription")) intentScore += 2;
         if (text.includes("membership")) intentScore += 2;
@@ -164,12 +192,6 @@ export function registerScanRoutes(server) {
         if (text.includes("free trial")) intentScore += 2;
         if (text.includes("your plan")) intentScore += 2;
         if (text.includes("plan")) intentScore += 1;
-
-        // Boost intent if sender is a known subscription domain
-        const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
-        const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
-          fromHeader.toLowerCase().includes(d)
-        );
         if (isKnownDomain) intentScore += 3;
 
         const subscriptionIntent = intentScore >= 4;
