@@ -1,22 +1,18 @@
 function calculateConfidence({ occurrences, intervalVariance, amountVariance, subscriptionIntent }) {
   let score = 0;
 
-  // Recurrence strength — requires at least 2 occurrences for meaningful confidence
   if (occurrences >= 4) score += 0.45;
   else if (occurrences === 3) score += 0.35;
   else if (occurrences === 2) score += 0.2;
 
-  // Interval stability
   if (intervalVariance < 3) score += 0.3;
   else if (intervalVariance < 7) score += 0.2;
   else if (intervalVariance < 14) score += 0.1;
 
-  // Amount stability
   if (amountVariance < 0.02) score += 0.25;
   else if (amountVariance < 0.08) score += 0.15;
   else if (amountVariance < 0.15) score += 0.05;
 
-  // Subscription intent boost
   if (subscriptionIntent) score += 0.1;
 
   return Math.min(score, 0.99);
@@ -31,6 +27,8 @@ function detectBillingInterval(avgDays) {
 }
 
 export function detectRecurringSubscriptions(charges) {
+  console.log("ENGINE charges:", charges.map(c => `${c.merchant} $${c.amount} intent:${c.subscriptionIntent}`));
+
   const grouped = {};
 
   for (const c of charges) {
@@ -45,7 +43,11 @@ export function detectRecurringSubscriptions(charges) {
 
     if (list.length < 2) {
       const single = list[0];
-      if (!single.subscriptionIntent) continue;
+
+      if (!single.subscriptionIntent) {
+        console.log(`DROP single ${merchant}: no intent`);
+        continue;
+      }
 
       const amount = single.amount;
       const looksLikeSubscription =
@@ -53,7 +55,12 @@ export function detectRecurringSubscriptions(charges) {
         [4.99, 5.99, 6.99, 7.99, 9.99, 10.99, 12.99, 14.99, 15.99,
          19.99, 24.99, 29.99, 39.99, 49.99, 59.99, 79.99, 99.99].includes(amount);
 
-      if (!looksLikeSubscription) continue;
+      if (!looksLikeSubscription) {
+        console.log(`DROP single ${merchant}: amount ${amount} not subscription-like`);
+        continue;
+      }
+
+      console.log(`PASS single ${merchant}: $${amount} intent:true`);
 
       results.push({
         merchant,
@@ -100,11 +107,17 @@ export function detectRecurringSubscriptions(charges) {
       subscriptionIntent: anyIntent,
     });
 
-    // Only drop unknown interval if confidence is also low
-    // A stable amount + recurring merchant overrides unknown interval
-    if (billingInterval === "unknown" && confidence < 0.4) continue;
+    console.log(`MULTI ${merchant}: occurrences=${list.length} avgInterval=${avgInterval.toFixed(1)} billingInterval=${billingInterval} confidence=${confidence.toFixed(2)}`);
 
-    if (confidence < 0.5) continue;
+    if (billingInterval === "unknown" && confidence < 0.4) {
+      console.log(`DROP ${merchant}: unknown interval + low confidence`);
+      continue;
+    }
+
+    if (confidence < 0.5) {
+      console.log(`DROP ${merchant}: confidence too low ${confidence.toFixed(2)}`);
+      continue;
+    }
 
     results.push({
       merchant,
