@@ -1,17 +1,27 @@
 // routes/subscriptionRoutes.js
 
+import jwt from "jsonwebtoken";
 import {
   getSubscriptions,
   getLatestScanMetadata
 } from "../db/index.js";
 
 export function registerSubscriptionRoutes(server) {
-  server.get("/subscriptions", { preHandler: [server.authenticate] }, async (req, reply) => {
-    const userId = req.user?.id;
+  server.get("/subscriptions", async (req, reply) => {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(" ")[1];
 
-    if (!userId) {
+    if (!token) return reply.code(401).send({ error: "unauthorized" });
+
+    let userId;
+    try {
+      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+      userId = decoded.sub;
+    } catch {
       return reply.code(401).send({ error: "unauthorized" });
     }
+
+    if (!userId) return reply.code(401).send({ error: "unauthorized" });
 
     try {
       const subs = await getSubscriptions(userId);
