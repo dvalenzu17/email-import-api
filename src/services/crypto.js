@@ -1,7 +1,24 @@
 import crypto from "crypto";
 
 const ALGORITHM = "aes-256-gcm";
-const KEY = Buffer.from(process.env.APP_SECRET, "hex");
+
+// Use the same env var as the main backend (TOKEN_ENCRYPTION_KEY)
+// Accept hex or base64, matching parseEncryptionKey in backend/index.js
+function loadKey() {
+  const raw = process.env.TOKEN_ENCRYPTION_KEY || process.env.APP_SECRET || "";
+  if (!raw) throw new Error("TOKEN_ENCRYPTION_KEY is not set");
+  try {
+    const b64 = Buffer.from(raw, "base64");
+    if (b64.length === 32) return b64;
+  } catch {}
+  try {
+    const hex = Buffer.from(raw, "hex");
+    if (hex.length === 32) return hex;
+  } catch {}
+  throw new Error("TOKEN_ENCRYPTION_KEY must be 32 bytes (base64 or hex)");
+}
+
+const KEY = loadKey();
 
 export function encryptCredential(plaintext) {
   const iv = crypto.randomBytes(12);

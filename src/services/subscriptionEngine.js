@@ -27,7 +27,6 @@ function detectBillingInterval(avgDays) {
 }
 
 export function detectRecurringSubscriptions(charges) {
-  console.log("ENGINE charges:", charges.map(c => `${c.merchant} $${c.amount} intent:${c.subscriptionIntent}`));
 
   const grouped = {};
 
@@ -45,7 +44,6 @@ export function detectRecurringSubscriptions(charges) {
       const single = list[0];
 
       if (!single.subscriptionIntent) {
-        console.log(`DROP single ${merchant}: no intent`);
         continue;
       }
 
@@ -56,11 +54,9 @@ export function detectRecurringSubscriptions(charges) {
          19.99, 24.99, 29.99, 39.99, 49.99, 59.99, 79.99, 99.99].includes(amount);
 
       if (!looksLikeSubscription) {
-        console.log(`DROP single ${merchant}: amount ${amount} not subscription-like`);
         continue;
       }
 
-      console.log(`PASS single ${merchant}: $${amount} intent:true`);
 
       results.push({
         merchant,
@@ -108,15 +104,12 @@ export function detectRecurringSubscriptions(charges) {
       subscriptionIntent: anyIntent,
     });
 
-    console.log(`MULTI ${merchant}: occurrences=${list.length} avgInterval=${avgInterval.toFixed(1)} billingInterval=${billingInterval} confidence=${confidence.toFixed(2)}`);
 
     if (billingInterval === "unknown" && confidence < 0.4) {
-      console.log(`DROP ${merchant}: unknown interval + low confidence`);
       continue;
     }
 
     if (confidence < 0.5) {
-      console.log(`DROP ${merchant}: confidence too low ${confidence.toFixed(2)}`);
       continue;
     }
 

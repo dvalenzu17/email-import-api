@@ -1,5 +1,34 @@
 import { ImapFlow } from "imapflow";
-import { cleanEmailHtml, extractAmount } from "../gmailClient.js";
+
+// Inline helpers — avoids dependency on gmailClient.js which may not exist
+function cleanEmailHtml(raw = '') {
+  return raw
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function extractAmount(text = '') {
+  const s = String(text);
+  const patterns = [
+    /(USD|US\$|\$|GBP|£|EUR|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/i,
+    /([0-9]+(?:\.[0-9]{1,2})?)\s?(USD|GBP|EUR)/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) {
+      const num = Number(m[1]) || Number(m[2]);
+      if (Number.isFinite(num) && num > 0) return num;
+    }
+  }
+  return null;
+}
 
 const IMAP_CONFIGS = {
   yahoo:   { host: "imap.mail.yahoo.com",      port: 993, secure: true },
@@ -80,12 +109,13 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         subject.includes("invoice") ||
         subject.includes("subscription") ||
         subject.includes("renewal") ||
-        subject.includes("payment") ||
-        subject.includes("billing") ||
-        subject.includes("charged") ||
         subject.includes("membership") ||
+        subject.includes("billing") ||
+        subject.includes("auto-renew") ||
         subject.includes("your plan") ||
-        subject.includes("order confirmation");
+        subject.includes("charged");
+        // NOTE: "payment", "order confirmation" deliberately excluded —
+        // they fire on one-time purchases (Amazon etc.) and dominate results
 
       if (looksRelevant) {
         relevant.push({ uid: msg.uid, envelope: msg.envelope });
