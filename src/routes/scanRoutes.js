@@ -10,6 +10,7 @@ import {
 
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
 import { getOAuthToken, upsertSubscription, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
+import { decryptCredential } from "../services/crypto.js";
 import pLimit from "p-limit";
 import { refreshAccessToken } from "../googleOAuth.js";
 
@@ -103,18 +104,32 @@ export function registerScanRoutes(server) {
 
       let accessToken = tokenRecord.access_token;
 
+      // Tokens stored by the main Express backend are AES-256-GCM encrypted.
+      // Tokens stored by this backend are plain text.
+      // Detect by checking for the iv:tag:ciphertext format.
+      function maybeDecrypt(val) {
+        if (!val) return val;
+        const parts = String(val).split(":");
+        if (parts.length === 3 && parts[0].length === 24) {
+          try { return decryptCredential(val); } catch { return val; }
+        }
+        return val;
+      }
+
+      const rawRefreshToken = maybeDecrypt(tokenRecord.refresh_token);
+
       if (new Date(tokenRecord.expiry_date) < new Date()) {
         const refreshed = await refreshAccessToken({
           clientId: process.env.GOOGLE_CLIENT_ID,
           clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-          refreshToken: tokenRecord.refresh_token,
+          refreshToken: rawRefreshToken,
         });
 
         accessToken = refreshed.accessToken;
 
         await saveOAuthTokens(userId, {
           accessToken: refreshed.accessToken,
-          refreshToken: refreshed.refreshToken ?? tokenRecord.refresh_token,
+          refreshToken: refreshed.refreshToken ?? rawRefreshToken,
           expiresIn: refreshed.expiresIn,
         });
       }
