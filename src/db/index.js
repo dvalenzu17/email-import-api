@@ -6,18 +6,9 @@ export const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// -------------------------
-// USERS
-// -------------------------
-
-export async function findOrCreateUser(supabaseId, email) {
-  await pool.query(
-    `INSERT INTO users (id, email)
-     VALUES ($1, $2)
-     ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email`,
-    [supabaseId, email]
-  );
-}
+// NOTE: findOrCreateUser() has been removed.
+// public.users was dropped — auth users live in auth.users only.
+// The Supabase user ID from the verified JWT is used directly in all queries.
 
 // -------------------------
 // OAUTH TOKENS
@@ -31,7 +22,8 @@ export async function saveOAuthTokens(userId, tokens) {
      DO UPDATE SET
        access_token = EXCLUDED.access_token,
        refresh_token = EXCLUDED.refresh_token,
-       expiry_date = EXCLUDED.expiry_date`,
+       expiry_date = EXCLUDED.expiry_date,
+       updated_at = NOW()`,
     [userId, tokens.accessToken, tokens.refreshToken, tokens.expiresIn]
   );
 }
@@ -65,13 +57,13 @@ export async function upsertSubscription(userId, sub) {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     ON CONFLICT (user_id, merchant)
     DO UPDATE SET
-      renewal_amount = EXCLUDED.renewal_amount,
-      renewal_date = EXCLUDED.renewal_date,
-      confidence = EXCLUDED.confidence,
-      is_active = EXCLUDED.is_active,
-      is_suggested = EXCLUDED.is_suggested,
+      renewal_amount   = EXCLUDED.renewal_amount,
+      renewal_date     = EXCLUDED.renewal_date,
+      confidence       = EXCLUDED.confidence,
+      is_active        = EXCLUDED.is_active,
+      is_suggested     = EXCLUDED.is_suggested,
       billing_interval = EXCLUDED.billing_interval,
-      updated_at = NOW()`,
+      updated_at       = NOW()`,
     [
       userId,
       sub.merchant,
@@ -89,7 +81,7 @@ export async function upsertSubscription(userId, sub) {
 
 export async function getSubscriptions(userId) {
   const result = await pool.query(
-    "SELECT * FROM subscriptions WHERE user_id = $1",
+    "SELECT * FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC",
     [userId]
   );
   return result.rows;
@@ -136,8 +128,8 @@ export async function saveImapCredentials(userId, { provider, user, pass }) {
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (user_id, provider)
      DO UPDATE SET
-       imap_user = EXCLUDED.imap_user,
-       imap_pass = EXCLUDED.imap_pass,
+       imap_user  = EXCLUDED.imap_user,
+       imap_pass  = EXCLUDED.imap_pass,
        updated_at = NOW()`,
     [userId, provider, user, encryptedPass]
   );

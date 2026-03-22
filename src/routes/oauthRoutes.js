@@ -7,7 +7,6 @@ import {
 } from "../googleOAuth.js";
 
 import {
-  findOrCreateUser,
   saveOAuthTokens,
 } from "../db/index.js";
 
@@ -81,13 +80,6 @@ export function registerOAuthRoutes(server) {
       const email = userInfo.email;
 
       if (!email) return reply.code(400).send({ error: "email_not_found" });
-
-      try {
-        await findOrCreateUser(supabaseUserId, email);
-      } catch (err) {
-        console.warn("USER SYNC WARNING:", err.message);
-      }
-      
       await saveOAuthTokens(supabaseUserId, tokens);
 
       return reply.redirect(
@@ -161,14 +153,6 @@ export function registerOAuthRoutes(server) {
       const email = userInfo.email || null;
 
       // Sync user record
-      if (email) {
-        try {
-          await findOrCreateUser(userId, email);
-        } catch (e) {
-          console.warn("User sync warning:", e.message);
-        }
-      }
-
       // Persist tokens
       await saveOAuthTokens(userId, {
         accessToken: tokenData.access_token,
