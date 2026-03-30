@@ -27,34 +27,19 @@ export function decodeBody(data) {
 
 export function extractText(payload) {
   if (!payload) return "";
+  if (payload.body?.data) return decodeBody(payload.body.data);
+  if (!payload.parts) return "";
 
-  if (payload.body?.data) {
-    return decodeBody(payload.body.data);
-  }
-
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      if (
-        (part.mimeType === "text/plain" || part.mimeType === "text/html") &&
-        part.body?.data
-      ) {
-        return decodeBody(part.body.data);
-      }
-
-      if (part.parts) {
-        for (const nested of part.parts) {
-          if (
-            (nested.mimeType === "text/plain" || nested.mimeType === "text/html") &&
-            nested.body?.data
-          ) {
-            return decodeBody(nested.body.data);
-          }
-        }
-      }
+  let plain = "";
+  for (const part of payload.parts) {
+    if (part.mimeType === "text/html" && part.body?.data) return decodeBody(part.body.data);
+    if (part.mimeType === "text/plain" && part.body?.data && !plain) plain = decodeBody(part.body.data);
+    if (part.parts) {
+      const nested = extractText(part);
+      if (nested) return nested;
     }
   }
-
-  return "";
+  return plain;
 }
 
 export function cleanEmailHtml(html) {
@@ -95,10 +80,8 @@ export function extractAmount(text) {
   const allMatches = [...text.matchAll(/\$([0-9]+(?:\.[0-9]{2})?)/g)];
   if (!allMatches.length) return null;
 
-  const filtered = allMatches.filter((m) => parseFloat(m[1]) <= 100);
-  if (!filtered.length) return null;
-
-  return parseFloat(filtered[filtered.length - 1][1]);
+  const first = allMatches.find(m => { const v = parseFloat(m[1]); return v > 0 && v <= 500; });
+  return first ? parseFloat(first[1]) : null;
 }
 
 export function extractRenewalDate(text) {
@@ -133,22 +116,18 @@ function extractAppleAppName(text) {
     /([a-z0-9][a-z0-9\s\-\+\:]+?)\s+\([0-9]+\s+(?:year|month|yr|mo)s?\)/i
   );
   if (planDescriptor) {
-    const raw = planDescriptor[1].trim();
-    // Strip trailing plan/subscription keywords
-    const cleaned = raw
-      .replace(/\s+(premium|plus|pro|basic|standard|annual|monthly|plan|subscription)$/i, "")
+    const cleaned = planDescriptor[1].trim()
+      .replace(/\s+(annual|monthly|plan|subscription)$/i, "")
       .trim();
     if (cleaned.length > 2) return cleaned;
   }
 
-  // Fallback: text immediately before "us$X.XX/year" or "us$X.XX/month"
   const priceAnchor = text.match(
     /([a-z0-9][a-z0-9\s\-\+]{2,40}?)\s+us\$[0-9]+(?:\.[0-9]{2})?\/(?:year|month|yr|mo)/i
   );
   if (priceAnchor) {
-    const raw = priceAnchor[1].trim();
-    const cleaned = raw
-      .replace(/\s+(premium|plus|pro|basic|standard|annual|monthly|plan|subscription)$/i, "")
+    const cleaned = priceAnchor[1].trim()
+      .replace(/\s+(annual|monthly|plan|subscription)$/i, "")
       .trim();
     if (cleaned.length > 2) return cleaned;
   }

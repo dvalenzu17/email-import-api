@@ -15,17 +15,21 @@ function cleanEmailHtml(raw = '') {
 }
 
 function extractAmount(text = '') {
-  const s = String(text);
-  const patterns = [
-    /(USD|US\$|\$|GBP|£|EUR|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/i,
-    /([0-9]+(?:\.[0-9]{1,2})?)\s?(USD|GBP|EUR)/i,
-  ];
-  for (const re of patterns) {
-    const m = s.match(re);
-    if (m) {
-      const num = Number(m[1]) || Number(m[2]);
-      if (Number.isFinite(num) && num > 0) return num;
-    }
+  const s = String(text).toLowerCase();
+
+  const totalMatch = s.match(/total\s*[:\-]?\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
+  if (totalMatch) return parseFloat(totalMatch[1]);
+
+  const chargedMatch = s.match(/charged\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
+  if (chargedMatch) return parseFloat(chargedMatch[1]);
+
+  const planMatch = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/);
+  if (planMatch) return parseFloat(planMatch[1]);
+
+  const fallback = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
+  if (fallback) {
+    const v = parseFloat(fallback[1]);
+    if (v > 0 && v <= 500) return v;
   }
   return null;
 }

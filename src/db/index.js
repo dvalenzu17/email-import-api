@@ -1,4 +1,5 @@
 import pkg from "pg";
+import { encryptCredential } from "../services/crypto.js";
 const { Pool } = pkg;
 
 export const pool = new Pool({
@@ -93,14 +94,14 @@ export async function getSubscriptions(userId) {
 
 export async function saveScanMetadata(userId, meta) {
   await pool.query(
-    `INSERT INTO scan_metadata (
-      user_id,
-      scanned_messages,
-      detected_charges,
-      execution_time_ms
-    )
-    VALUES ($1,$2,$3,$4)`,
+    `INSERT INTO scan_metadata (user_id, scanned_messages, detected_charges, execution_time_ms)
+     VALUES ($1,$2,$3,$4)`,
     [userId, meta.scannedMessages, meta.detectedCharges, meta.executionTimeMs]
+  );
+  await pool.query(
+    `DELETE FROM scan_metadata WHERE user_id = $1
+     AND id NOT IN (SELECT id FROM scan_metadata WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10)`,
+    [userId]
   );
 }
 
@@ -120,7 +121,6 @@ export async function getLatestScanMetadata(userId) {
 // -------------------------
 
 export async function saveImapCredentials(userId, { provider, user, pass }) {
-  const { encryptCredential } = await import("../services/crypto.js");
   const encryptedPass = encryptCredential(pass);
 
   await pool.query(

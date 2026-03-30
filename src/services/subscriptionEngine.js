@@ -19,11 +19,18 @@ function calculateConfidence({ occurrences, intervalVariance, amountVariance, su
 }
 
 function detectBillingInterval(avgDays) {
-  if (avgDays > 25 && avgDays < 35) return "monthly";
-  if (avgDays > 350 && avgDays < 380) return "yearly";
-  if (avgDays > 80 && avgDays < 100) return "quarterly";
   if (avgDays > 6 && avgDays < 9) return "weekly";
+  if (avgDays > 25 && avgDays < 35) return "monthly";
+  if (avgDays > 80 && avgDays < 100) return "quarterly";
+  if (avgDays > 170 && avgDays < 195) return "semi-annual";
+  if (avgDays > 350 && avgDays < 380) return "yearly";
   return "unknown";
+}
+
+function calcIntervalVariance(intervals) {
+  if (intervals.length < 3) return Math.max(...intervals) - Math.min(...intervals);
+  const sorted = [...intervals].sort((a, b) => a - b);
+  return sorted[sorted.length - 2] - sorted[0]; // trim single worst outlier
 }
 
 export function detectRecurringSubscriptions(charges) {
@@ -82,7 +89,7 @@ export function detectRecurringSubscriptions(charges) {
     }
 
     const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    const intervalVariance = Math.max(...intervals) - Math.min(...intervals);
+    const intervalVariance = calcIntervalVariance(intervals);
     const billingInterval = detectBillingInterval(avgInterval);
 
     const amounts = list.map((x) => x.amount);
@@ -104,10 +111,6 @@ export function detectRecurringSubscriptions(charges) {
       subscriptionIntent: anyIntent,
     });
 
-
-    if (billingInterval === "unknown" && confidence < 0.4) {
-      continue;
-    }
 
     if (confidence < 0.5) {
       continue;

@@ -4,6 +4,18 @@ import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js"
 import { upsertSubscription, saveScanMetadata, saveImapCredentials, getImapCredentials } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
 
+const IMAP_RATE_LIMIT = {
+  max: 3,
+  timeWindow: "15 minutes",
+  keyGenerator: (req) => {
+    try {
+      const token = req.headers.authorization?.split(" ")[1];
+      return jwt.decode(token)?.sub ?? req.ip;
+    } catch { return req.ip; }
+  },
+  errorResponseBuilder: () => ({ error: "rate_limited", message: "Too many scans. Please wait 15 minutes." }),
+};
+
 export function registerImapScanRoutes(server) {
 
   server.post("/scan/imap/verify", async (req, reply) => {
@@ -39,7 +51,7 @@ export function registerImapScanRoutes(server) {
     }
   });
 
-  server.post("/scan/imap", async (req, reply) => {
+  server.post("/scan/imap", { config: { rateLimit: IMAP_RATE_LIMIT } }, async (req, reply) => {
     const authHeader = req.headers.authorization;
     const token = authHeader?.split(" ")[1];
     if (!token) return reply.code(401).send({ error: "unauthorized" });
@@ -77,11 +89,11 @@ export function registerImapScanRoutes(server) {
     const started = Date.now();
 
     try {
-      await saveImapCredentials(userId, { provider, user, pass });
-
       const { charges, scannedCount } = await scanImapInbox({
         provider, user, pass, daysBack,
       });
+
+      await saveImapCredentials(userId, { provider, user, pass });
 
       const subscriptions = detectRecurringSubscriptions(charges).map((s) => ({
         ...s,

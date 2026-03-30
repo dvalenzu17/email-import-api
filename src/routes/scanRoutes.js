@@ -46,7 +46,6 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "unable to process your payment",
   "trouble authorizing",
   "failed payment",
-  "action required",
 ];
 
 const SUBSCRIPTION_POSITIVE_DOMAINS = [
@@ -186,7 +185,7 @@ export function registerScanRoutes(server) {
         }
 
         if (!amount) continue;
-        if (amount > 100) continue;
+        if (amount > 500) continue;
 
         const merchant = extractMerchant(headers, text);
         if (merchant === "unknown") continue;
@@ -217,9 +216,7 @@ export function registerScanRoutes(server) {
       const subscriptions = detectRecurringSubscriptions(charges);
 
       for (const sub of subscriptions) {
-        if (sub.confidence >= 0.6) {
-          await upsertSubscription(userId, sub);
-        }
+        await upsertSubscription(userId, sub);
       }
 
       await saveScanMetadata(userId, {
