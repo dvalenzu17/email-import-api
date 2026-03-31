@@ -1,8 +1,24 @@
 import jwt from "jsonwebtoken";
+import { z } from "zod";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { upsertSubscription, saveScanMetadata, saveImapCredentials, getImapCredentials } from "../db/index.js";
+import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
+
+const PROVIDERS = ["yahoo", "outlook", "icloud"];
+
+const verifyBodySchema = z.object({
+  provider: z.enum(PROVIDERS),
+  user: z.string().email(),
+  pass: z.string().min(1),
+});
+
+const scanBodySchema = z.object({
+  provider: z.enum(PROVIDERS),
+  user: z.string().email().optional(),
+  pass: z.string().min(1).optional(),
+  daysBack: z.number().int().min(1).max(730).optional(),
+});
 
 const IMAP_RATE_LIMIT = {
   max: 3,
@@ -10,7 +26,8 @@ const IMAP_RATE_LIMIT = {
   keyGenerator: (req) => {
     try {
       const token = req.headers.authorization?.split(" ")[1];
-      return jwt.decode(token)?.sub ?? req.ip;
+      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+      return decoded?.sub ?? req.ip;
     } catch { return req.ip; }
   },
   errorResponseBuilder: () => ({ error: "rate_limited", message: "Too many scans. Please wait 15 minutes." }),
@@ -19,8 +36,6 @@ const IMAP_RATE_LIMIT = {
 export function registerImapScanRoutes(server) {
 
   server.post("/scan/imap/verify", async (req, reply) => {
-    console.log("IMAP VERIFY HIT:", req.body?.provider, req.body?.user);
-
     const authHeader = req.headers.authorization;
     const token = authHeader?.split(" ")[1];
     if (!token) return reply.code(401).send({ error: "unauthorized" });
@@ -31,17 +46,12 @@ export function registerImapScanRoutes(server) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
-    const { provider, user, pass } = req.body;
-
-    if (!provider || !user || !pass) {
-      return reply.code(400).send({ error: "missing_fields" });
+    const parsed = verifyBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: "invalid_request" });
     }
 
-    try {
-      getImapConfig(provider);
-    } catch {
-      return reply.code(400).send({ error: "unsupported_provider" });
-    }
+    const { provider, user, pass } = parsed.data;
 
     try {
       await verifyImapCredentials({ provider, user, pass });
@@ -64,17 +74,12 @@ export function registerImapScanRoutes(server) {
       return reply.code(401).send({ error: "unauthorized" });
     }
 
-    let { provider, user, pass, daysBack = 365 } = req.body;
-
-    if (!provider) {
-      return reply.code(400).send({ error: "missing_provider" });
+    const scanParsed = scanBodySchema.safeParse(req.body);
+    if (!scanParsed.success) {
+      return reply.code(400).send({ error: "invalid_request" });
     }
 
-    try {
-      getImapConfig(provider);
-    } catch {
-      return reply.code(400).send({ error: "unsupported_provider" });
-    }
+    let { provider, user, pass, daysBack = 365 } = scanParsed.data;
 
     // Fall back to stored credentials if not supplied in request
     if (!user || !pass) {
@@ -100,11 +105,7 @@ export function registerImapScanRoutes(server) {
         source: provider,
       }));
 
-      for (const sub of subscriptions) {
-        if (sub.confidence >= 0.7) {
-          await upsertSubscription(userId, sub);
-        }
-      }
+      await batchUpsertSubscriptions(userId, subscriptions.filter((s) => s.confidence >= 0.7));
 
       await saveScanMetadata(userId, {
         scannedMessages: scannedCount,
@@ -122,8 +123,8 @@ export function registerImapScanRoutes(server) {
         },
       };
     } catch (err) {
-      console.error("IMAP SCAN ERROR:", err);
-      return reply.code(500).send({ error: "scan_failed", details: err.message });
+      req.log.error({ err }, "imap_scan_error");
+      return reply.code(500).send({ error: "scan_failed" });
     }
   });
 }

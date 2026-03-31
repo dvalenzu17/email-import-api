@@ -39,7 +39,11 @@ export function encryptCredential(plaintext) {
 }
 
 export function decryptCredential(stored) {
-  const [ivHex, tagHex, encryptedHex] = stored.split(":");
+  const parts = String(stored).split(":");
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+    throw new Error("invalid_encrypted_format");
+  }
+  const [ivHex, tagHex, encryptedHex] = parts;
 
   const iv = Buffer.from(ivHex, "hex");
   const tag = Buffer.from(tagHex, "hex");

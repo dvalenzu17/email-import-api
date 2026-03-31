@@ -1,61 +1,8 @@
 import jwt from "jsonwebtoken";
-import {
-  fetchMessage,
-  extractText,
-  extractAmount,
-  extractRenewalDate,
-  extractMerchant,
-  cleanEmailHtml,
-} from "../gmailClient.js";
+import { runGmailScan } from "../services/gmailScanService.js";
+import { getQueue, getJobStatus, getQueueEvents } from "../services/scanQueue.js";
 
-import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { getOAuthToken, upsertSubscription, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
-import { decryptCredential } from "../services/crypto.js";
-import pLimit from "p-limit";
-import { refreshAccessToken } from "../googleOAuth.js";
-
-const SUBSCRIPTION_NEGATIVE_PATTERNS = [
-  "trip with uber",
-  "thanks for riding",
-  "order with uber eats",
-  "your uber eats order",
-  "you've earned",
-  "reward",
-  "you ordered",
-  "is on its way",
-  "out for delivery",
-  "has been shipped",
-  "tracking number",
-  "your order has",
-  "rate your experience",
-  "left a review",
-  "survey",
-  "unsubscribe from marketing",
-  "you've been charged a late fee",
-  "one-time",
-  "one time purchase",
-  "your amazon.com order",
-  "order confirmation",
-  "items ordered",
-  "estimated delivery",
-  "shipping confirmation",
-  "your package",
-  "arriving",
-  "payment declined",
-  "update your payment",
-  "unable to process your payment",
-  "trouble authorizing",
-  "failed payment",
-];
-
-const SUBSCRIPTION_POSITIVE_DOMAINS = [
-  "netflix.com", "spotify.com", "openai.com", "adobe.com",
-  "apple.com", "google.com", "amazon.com", "microsoft.com",
-  "dropbox.com", "slack.com", "notion.so", "figma.com",
-  "github.com", "anthropic.com", "chatgpt.com", "hulu.com",
-  "disneyplus.com", "youtube.com", "linkedin.com", "zoom.us",
-  "shopify.com", "squarespace.com", "wix.com", "webflow.io",
-];
+const QUEUE_ENABLED = process.env.QUEUE_ENABLED === "true";
 
 const SCAN_RATE_LIMIT = {
   max: 3,
@@ -63,7 +10,7 @@ const SCAN_RATE_LIMIT = {
   keyGenerator: (req) => {
     try {
       const token = req.headers.authorization?.split(" ")[1];
-      const decoded = jwt.decode(token);
+      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
       return decoded?.sub ?? req.ip;
     } catch {
       return req.ip;
@@ -75,168 +22,149 @@ const SCAN_RATE_LIMIT = {
   }),
 };
 
+function verifyUserId(req, reply) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) { reply.code(401).send({ error: "unauthorized" }); return null; }
+  try {
+    const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+    const userId = decoded.sub;
+    if (!userId) { reply.code(401).send({ error: "unauthorized" }); return null; }
+    return userId;
+  } catch {
+    reply.code(401).send({ error: "unauthorized" });
+    return null;
+  }
+}
+
 export function registerScanRoutes(server) {
+  // ── POST /scan ────────────────────────────────────────────────────────────
+  // QUEUE_ENABLED=true  → enqueues job, returns { jobId } immediately
+  // QUEUE_ENABLED=false → runs synchronously, returns result directly
   server.post("/scan", { config: { rateLimit: SCAN_RATE_LIMIT } }, async (req, reply) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.split(" ")[1];
+    const userId = verifyUserId(req, reply);
+    if (!userId) return;
 
-    if (!token) return reply.code(401).send({ error: "unauthorized" });
+    const rawDaysBack = req.body?.daysBack;
+    if (rawDaysBack !== undefined) {
+      const n = Number(rawDaysBack);
+      if (!Number.isInteger(n) || n < 1 || n > 730) {
+        return reply.code(400).send({
+          error: "invalid_days_back",
+          message: "daysBack must be an integer between 1 and 730",
+        });
+      }
+    }
+    const daysBack = rawDaysBack !== undefined ? Number(rawDaysBack) : 180;
 
-    let userId;
-    try {
-      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-      userId = decoded.sub;
-    } catch {
-      return reply.code(401).send({ error: "unauthorized" });
+    if (QUEUE_ENABLED) {
+      try {
+        const job = await getQueue().add("scan", { userId, daysBack });
+        return reply.code(202).send({ jobId: job.id, status: "queued" });
+      } catch (err) {
+        req.log.error({ err }, "scan_enqueue_error");
+        return reply.code(500).send({ error: "scan_failed" });
+      }
     }
 
-    if (!userId) return reply.code(401).send({ error: "unauthorized" });
-
-    const daysBack = Math.min(Number(req.body?.daysBack) || 180, 730);
-    const started = Date.now();
-
+    // Synchronous path (default, no Redis required)
     try {
-      const tokenRecord = await getOAuthToken(userId);
-      if (!tokenRecord) {
+      const result = await runGmailScan({ userId, daysBack });
+      return { success: true, ...result };
+    } catch (err) {
+      if (err.message === "gmail_not_connected") {
         return reply.code(400).send({ error: "gmail_not_connected" });
       }
-
-      let accessToken = tokenRecord.access_token;
-
-      // Tokens stored by the main Express backend are AES-256-GCM encrypted.
-      // Tokens stored by this backend are plain text.
-      // Detect by checking for the iv:tag:ciphertext format.
-      function maybeDecrypt(val) {
-        if (!val) return val;
-        const parts = String(val).split(":");
-        if (parts.length === 3 && parts[0].length === 24) {
-          try { return decryptCredential(val); } catch { return val; }
-        }
-        return val;
+      if (err.message === "circuit_open") {
+        return reply.code(503).send({ error: "scan_paused", message: "Gmail API is rate limited. Try again shortly." });
       }
-
-      const rawRefreshToken = maybeDecrypt(tokenRecord.refresh_token);
-
-      if (new Date(tokenRecord.expiry_date) < new Date()) {
-        const refreshed = await refreshAccessToken({
-          clientId: process.env.GOOGLE_CLIENT_ID,
-          clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-          refreshToken: rawRefreshToken,
-        });
-
-        accessToken = refreshed.accessToken;
-
-        await saveOAuthTokens(userId, {
-          accessToken: refreshed.accessToken,
-          refreshToken: refreshed.refreshToken ?? rawRefreshToken,
-          expiresIn: refreshed.expiresIn,
-        });
-      }
-
-      const query = `newer_than:${daysBack}d (subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal OR subject:payment OR subject:billing OR subject:membership OR subject:plan OR subject:welcome OR subject:"order confirmation")`;
-      const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&q=${encodeURIComponent(query)}`;
-      const listRes = await fetch(url, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      const listData = await listRes.json();
-      const ids = listData.messages || [];
-
-      const limit = pLimit(10);
-      const fullMessages = await Promise.all(
-        ids.map((m) => limit(() => fetchMessage(accessToken, m.id)))
-      );
-
-      const charges = [];
-
-      for (const full of fullMessages) {
-        if (!full?.payload) continue;
-
-        const headers = full.payload.headers;
-        const rawHtml = extractText(full.payload);
-        if (!rawHtml) continue;
-
-        const text = cleanEmailHtml(rawHtml);
-        if (!text || text.length < 30) continue;
-
-        const isNegative = SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) => text.includes(p));
-        if (isNegative) continue;
-
-        const transactional =
-          text.includes("payment") ||
-          text.includes("charged") ||
-          text.includes("invoice") ||
-          text.includes("successfully subscribed") ||
-          text.includes("receipt") ||
-          text.includes("billing") ||
-          text.includes("renewal");
-
-        if (!transactional) continue;
-
-        const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
-        const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
-          fromHeader.toLowerCase().includes(d)
-        );
-
-        let amount = extractAmount(text);
-
-        if (!amount && isKnownDomain) {
-          const planMatch = text.match(/(?:us\$|\$)([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:mo|month|yr|year)/i);
-          if (planMatch) amount = parseFloat(planMatch[1]);
-        }
-
-        if (!amount) continue;
-        if (amount > 500) continue;
-
-        const merchant = extractMerchant(headers, text);
-        if (merchant === "unknown") continue;
-
-        const date = new Date(Number(full.internalDate));
-        const renewalDate = extractRenewalDate(text);
-
-        let intentScore = 0;
-        if (text.includes("subscription")) intentScore += 2;
-        if (text.includes("membership")) intentScore += 2;
-        if (text.includes("automatically renew")) intentScore += 3;
-        if (text.includes("renews on")) intentScore += 3;
-        if (text.includes("next billing")) intentScore += 3;
-        if (text.includes("/month") || text.includes("per month")) intentScore += 2;
-        if (text.includes("/year") || text.includes("per year")) intentScore += 2;
-        if (text.includes("valid until")) intentScore += 2;
-        if (text.includes("cancel anytime")) intentScore += 3;
-        if (text.includes("free trial")) intentScore += 2;
-        if (text.includes("your plan")) intentScore += 2;
-        if (text.includes("plan")) intentScore += 1;
-        if (isKnownDomain) intentScore += 3;
-
-        const subscriptionIntent = intentScore >= 4;
-
-        charges.push({ merchant, amount, date, subscriptionIntent, renewalDate });
-      }
-
-      const subscriptions = detectRecurringSubscriptions(charges);
-
-      for (const sub of subscriptions) {
-        await upsertSubscription(userId, sub);
-      }
-
-      await saveScanMetadata(userId, {
-        scannedMessages: ids.length,
-        detectedCharges: charges.length,
-        executionTimeMs: Date.now() - started,
-      });
-
-      return {
-        success: true,
-        detectedSubscriptions: subscriptions.length,
-        meta: {
-          scannedMessages: ids.length,
-          detectedCharges: charges.length,
-          executionTimeMs: Date.now() - started,
-        },
-      };
-    } catch (err) {
-      console.error("SCAN ERROR:", err);
-      return reply.code(500).send({ error: "scan_failed", details: err.message });
+      req.log.error({ err }, "scan_error");
+      return reply.code(500).send({ error: "scan_failed" });
     }
+  });
+
+  // ── GET /scan/:jobId/status ───────────────────────────────────────────────
+  // Polls a queued scan job. Returns status + result when complete.
+  server.get("/scan/:jobId/status", async (req, reply) => {
+    const userId = verifyUserId(req, reply);
+    if (!userId) return;
+
+    if (!QUEUE_ENABLED) {
+      return reply.code(400).send({ error: "queue_not_enabled" });
+    }
+
+    try {
+      const status = await getJobStatus(req.params.jobId);
+      if (!status) return reply.code(404).send({ error: "job_not_found" });
+      return status;
+    } catch (err) {
+      req.log.error({ err }, "scan_status_error");
+      return reply.code(500).send({ error: "status_failed" });
+    }
+  });
+
+  // ── GET /scan/:jobId/events ───────────────────────────────────────────────
+  // SSE stream of real-time scan progress for a queued job.
+  // Client receives { pct, message } progress updates and a final { done } event.
+  server.get("/scan/:jobId/events", async (req, reply) => {
+    const userId = verifyUserId(req, reply);
+    if (!userId) return;
+
+    if (!QUEUE_ENABLED) {
+      return reply.code(400).send({ error: "queue_not_enabled" });
+    }
+
+    const { jobId } = req.params;
+
+    reply.sse(
+      (async function* () {
+        // First, check if the job is already done.
+        const initial = await getJobStatus(jobId);
+        if (!initial) {
+          yield { event: "error", data: JSON.stringify({ error: "job_not_found" }) };
+          return;
+        }
+
+        if (initial.status === "completed") {
+          yield { event: "progress", data: JSON.stringify({ pct: 100, message: "Done" }) };
+          yield { event: "done", data: JSON.stringify(initial.result) };
+          return;
+        }
+
+        if (initial.status === "failed") {
+          yield { event: "error", data: JSON.stringify({ error: initial.error }) };
+          return;
+        }
+
+        // Job is still running — subscribe to QueueEvents for live updates.
+        const queueEvents = getQueueEvents();
+
+        const MAX_WAIT_MS = 5 * 60 * 1000; // 5 minutes
+        const startedAt = Date.now();
+
+        while (Date.now() - startedAt < MAX_WAIT_MS) {
+          const current = await getJobStatus(jobId);
+          if (!current) break;
+
+          if (current.progress) {
+            yield { event: "progress", data: JSON.stringify(current.progress) };
+          }
+
+          if (current.status === "completed") {
+            yield { event: "progress", data: JSON.stringify({ pct: 100, message: "Done" }) };
+            yield { event: "done", data: JSON.stringify(current.result) };
+            return;
+          }
+
+          if (current.status === "failed") {
+            yield { event: "error", data: JSON.stringify({ error: current.error }) };
+            return;
+          }
+
+          await new Promise((res) => setTimeout(res, 2000)); // poll every 2s
+        }
+
+        yield { event: "error", data: JSON.stringify({ error: "timeout" }) };
+      })()
+    );
   });
 }

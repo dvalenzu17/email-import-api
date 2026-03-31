@@ -2,6 +2,24 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Interaction Style — Gamified Mode
+
+All interactions in this project are **gamified**. Follow these rules in every response:
+
+- **Show current level progress** at the start of any coding response: e.g., `[LVL 10 ⚔️ — Critical Bug Fixes | 2/5 tasks done]`
+- **Award XP** when a task from `todo.md` is completed — announce it: e.g., `+20 XP — Guard added to decryptCredential()`
+- **Level up** when all tasks in a level are checked off — celebrate it clearly before moving on
+- **Reference `todo.md`** as the source of truth for what's in scope — don't work on a higher level until the current one is complete
+- Keep the tone direct and efficient — the gamification is in the framing, not the filler words
+- After completing any task, **check the box in `todo.md`** and update the Completion Log when a full level is done
+
+## Improvement Roadmap
+
+The full audit and level-by-level improvement plan lives in [`todo.md`](./todo.md).
+Current focus: **Level 10 — Critical Bug Fixes**.
+Do not skip levels. Each level is a precondition for the next.
+
+
 ## Commands
 
 ```bash

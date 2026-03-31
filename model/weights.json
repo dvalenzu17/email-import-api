@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "description": "Bootstrapped logistic regression weights for subscription confidence scoring. Features: [occ_norm, interval_score, amount_score, intent_score, known_brand]. Recency decay is applied as a post-sigmoid multiplier. Retrain with: node scripts/trainModel.js",
+  "weights": [1.5, 1.2, 1.0, 0.4, 0.8],
+  "bias": -2.5
+}

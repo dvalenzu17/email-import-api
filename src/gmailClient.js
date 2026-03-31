@@ -1,5 +1,4 @@
-import * as cheerio from "cheerio";
-import he from "he";
+export { cleanEmailHtml, extractAmount, extractMerchant } from "./services/emailParser.js";
 
 export async function listRecentMessages(accessToken) {
   const url =
@@ -7,6 +6,7 @@ export async function listRecentMessages(accessToken) {
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  if (!res.ok) throw new Error(`gmail_list_failed: ${res.status}`);
   const data = await res.json();
   return data.messages || [];
 }
@@ -16,6 +16,7 @@ export async function fetchMessage(accessToken, messageId) {
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+  if (!res.ok) throw new Error(`gmail_fetch_failed: ${res.status}`);
   return res.json();
 }
 
@@ -30,59 +31,21 @@ export function extractText(payload) {
   if (payload.body?.data) return decodeBody(payload.body.data);
   if (!payload.parts) return "";
 
+  let html = "";
   let plain = "";
   for (const part of payload.parts) {
-    if (part.mimeType === "text/html" && part.body?.data) return decodeBody(part.body.data);
-    if (part.mimeType === "text/plain" && part.body?.data && !plain) plain = decodeBody(part.body.data);
-    if (part.parts) {
+    if (part.mimeType === "text/html" && part.body?.data) {
+      html += decodeBody(part.body.data);
+    } else if (part.mimeType === "text/plain" && part.body?.data && !plain) {
+      plain = decodeBody(part.body.data);
+    } else if (part.parts) {
       const nested = extractText(part);
-      if (nested) return nested;
+      if (nested) html += nested;
     }
   }
-  return plain;
+  return html || plain;
 }
 
-export function cleanEmailHtml(html) {
-  if (!html) return "";
-
-  const $ = cheerio.load(html);
-
-  $("style").remove();
-  $("script").remove();
-  $("head").remove();
-  $("meta").remove();
-  $("link").remove();
-
-  let text = $("body").text();
-
-  text = he.decode(text);
-
-  text = text
-    .replace(/\u00a0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-
-  return text;
-}
-
-export function extractAmount(text) {
-  const totalMatch = text.match(/total\s*[:\-]?\s*\$([0-9]+(?:\.[0-9]{2})?)/i);
-  if (totalMatch) return parseFloat(totalMatch[1]);
-
-  const chargedMatch = text.match(/charged\s*\$([0-9]+(?:\.[0-9]{2})?)/i);
-  if (chargedMatch) return parseFloat(chargedMatch[1]);
-
-  // Plan price — catches "$8.99/month", "US$14.99/year"
-  const planMatch = text.match(/(?:us\$|\$)([0-9]+(?:\.[0-9]{2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/i);
-  if (planMatch) return parseFloat(planMatch[1]);
-
-  const allMatches = [...text.matchAll(/\$([0-9]+(?:\.[0-9]{2})?)/g)];
-  if (!allMatches.length) return null;
-
-  const first = allMatches.find(m => { const v = parseFloat(m[1]); return v > 0 && v <= 500; });
-  return first ? parseFloat(first[1]) : null;
-}
 
 export function extractRenewalDate(text) {
   const patterns = [
@@ -106,93 +69,3 @@ export function extractRenewalDate(text) {
   return null;
 }
 
-function extractAppleAppName(text) {
-  // Apple renewal emails follow the pattern (lowercased after cleanEmailHtml):
-  // "... app name app name plan name (duration) us$x.xx/year ..."
-  // We extract the text that appears just before the price line.
-
-  // Try to find "X (1 year)" or "X premium (1 year)" style plan descriptor
-  const planDescriptor = text.match(
-    /([a-z0-9][a-z0-9\s\-\+\:]+?)\s+\([0-9]+\s+(?:year|month|yr|mo)s?\)/i
-  );
-  if (planDescriptor) {
-    const cleaned = planDescriptor[1].trim()
-      .replace(/\s+(annual|monthly|plan|subscription)$/i, "")
-      .trim();
-    if (cleaned.length > 2) return cleaned;
-  }
-
-  const priceAnchor = text.match(
-    /([a-z0-9][a-z0-9\s\-\+]{2,40}?)\s+us\$[0-9]+(?:\.[0-9]{2})?\/(?:year|month|yr|mo)/i
-  );
-  if (priceAnchor) {
-    const cleaned = priceAnchor[1].trim()
-      .replace(/\s+(annual|monthly|plan|subscription)$/i, "")
-      .trim();
-    if (cleaned.length > 2) return cleaned;
-  }
-
-  return null;
-}
-
-export function extractMerchant(headers, text = "") {
-  const from = headers.find((h) => h.name === "From")?.value;
-  if (!from) return "unknown";
-
-  const emailMatch = from.match(/<(.+?)>/);
-  const address = emailMatch ? emailMatch[1] : from;
-  const domain = address.split("@")[1]?.toLowerCase() ?? "";
-
-  const parts = domain.split(".");
-  const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
-
-  if (root.includes("uber") || parts.some((p) => p.includes("uber"))) {
-    return from.toLowerCase().includes("uber one") ? "uber one" : "uber";
-  }
-
-  const blocked = new Set([
-    "klaviyo", "mailchimp", "sendgrid", "constantcontact",
-    "interactivebrokers", "hoyoverse", "gelato", "brevo",
-    "hubspot", "salesforce", "marketo",
-  ]);
-
-  if (blocked.has(root)) return "unknown";
-
-  // Apple — extract actual app name from body
-  const isApple = parts.some((p) => p === "apple");
-  if (isApple && text) {
-    const appName = extractAppleAppName(text);
-    if (appName) return appName;
-    return "apple";
-  }
-
-  const knownMap = {
-    openai: "openai",
-    chatgpt: "openai",
-    netflix: "netflix",
-    spotify: "spotify",
-    apple: "apple",
-    google: "google",
-    youtube: "google",
-    microsoft: "microsoft",
-    adobe: "adobe",
-    dropbox: "dropbox",
-    slack: "slack",
-    amazon: "amazon",
-    hulu: "hulu",
-    disney: "disney+",
-    notion: "notion",
-    figma: "figma",
-    github: "github",
-    anthropic: "anthropic",
-    linkedin: "linkedin",
-    zoom: "zoom",
-  };
-
-  for (const part of parts) {
-    if (knownMap[part]) return knownMap[part];
-    if (blocked.has(part)) return "unknown";
-  }
-
-  return knownMap[root] ?? root;
-}

@@ -10,6 +10,33 @@ import {
   saveOAuthTokens,
 } from "../db/index.js";
 
+function signState(payload) {
+  const data = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", process.env.SUPABASE_JWT_SECRET)
+    .update(data)
+    .digest("hex");
+  return `${data}.${sig}`;
+}
+
+function verifyState(state) {
+  const dot = state.lastIndexOf(".");
+  if (dot === -1) throw new Error("invalid_state");
+  const data = state.slice(0, dot);
+  const sig = state.slice(dot + 1);
+  const expected = crypto
+    .createHmac("sha256", process.env.SUPABASE_JWT_SECRET)
+    .update(data)
+    .digest("hex");
+  if (
+    sig.length !== expected.length ||
+    !crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"))
+  ) {
+    throw new Error("invalid_state");
+  }
+  return JSON.parse(Buffer.from(data, "base64url").toString());
+}
+
 export function registerOAuthRoutes(server) {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -30,15 +57,13 @@ export function registerOAuthRoutes(server) {
         return reply.code(401).send({ error: "invalid_supabase_token" });
       }
 
-      const state = Buffer.from(
-        JSON.stringify({ supabaseUserId, nonce: crypto.randomUUID() })
-      ).toString("base64");
+      const state = signState({ supabaseUserId, nonce: crypto.randomUUID() });
 
       const url = buildGoogleAuthUrl({ clientId, redirectUri, state });
 
       return reply.redirect(url);
     } catch (err) {
-      console.error("OAUTH INIT ERROR:", err);
+      req.log.error({ err }, "oauth_init_error");
       return reply.code(401).send({ error: "invalid_supabase_token" });
     }
   });
@@ -52,7 +77,7 @@ export function registerOAuthRoutes(server) {
 
       let supabaseUserId;
       try {
-        const decodedState = JSON.parse(Buffer.from(state, "base64").toString());
+        const decodedState = verifyState(state);
         supabaseUserId = decodedState.supabaseUserId;
       } catch {
         return reply.code(400).send({ error: "invalid_state" });
@@ -86,8 +111,8 @@ export function registerOAuthRoutes(server) {
         `beforeitbills://oauth-success?email=${encodeURIComponent(email)}`
       );
     } catch (err) {
-      console.error("OAUTH CALLBACK ERROR:", err);
-      return reply.code(500).send({ error: "oauth_failed", details: err.message });
+      req.log.error({ err }, "oauth_callback_error");
+      return reply.code(500).send({ error: "oauth_failed" });
     }
   });
   // ── Native app PKCE exchange ──────────────────────────────────────────────
@@ -138,8 +163,8 @@ export function registerOAuthRoutes(server) {
 
       if (!tokenRes.ok) {
         const text = await tokenRes.text();
-        console.error("Google token exchange failed:", text);
-        return reply.code(400).send({ error: "token_exchange_failed", detail: text });
+        req.log.warn({ status: tokenRes.status }, "google_token_exchange_failed");
+        return reply.code(400).send({ error: "token_exchange_failed" });
       }
 
       const tokenData = await tokenRes.json();
@@ -162,8 +187,8 @@ export function registerOAuthRoutes(server) {
 
       return reply.send({ ok: true, connected: true, provider: "google", email });
     } catch (err) {
-      console.error("OAUTH EXCHANGE ERROR:", err);
-      return reply.code(500).send({ error: "exchange_failed", detail: err.message });
+      req.log.error({ err }, "oauth_exchange_error");
+      return reply.code(500).send({ error: "exchange_failed" });
     }
   });
 

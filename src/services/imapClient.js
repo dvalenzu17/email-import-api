@@ -1,38 +1,5 @@
 import { ImapFlow } from "imapflow";
-
-// Inline helpers — avoids dependency on gmailClient.js which may not exist
-function cleanEmailHtml(raw = '') {
-  return raw
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-function extractAmount(text = '') {
-  const s = String(text).toLowerCase();
-
-  const totalMatch = s.match(/total\s*[:\-]?\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
-  if (totalMatch) return parseFloat(totalMatch[1]);
-
-  const chargedMatch = s.match(/charged\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
-  if (chargedMatch) return parseFloat(chargedMatch[1]);
-
-  const planMatch = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/);
-  if (planMatch) return parseFloat(planMatch[1]);
-
-  const fallback = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
-  if (fallback) {
-    const v = parseFloat(fallback[1]);
-    if (v > 0 && v <= 500) return v;
-  }
-  return null;
-}
+import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode } from "./emailParser.js";
 
 const IMAP_CONFIGS = {
   yahoo:   { host: "imap.mail.yahoo.com",      port: 993, secure: true },
@@ -59,6 +26,7 @@ export async function verifyImapCredentials({ provider, user, pass }) {
     auth: { user, pass },
     logger: false,
     connectionTimeout: 10000,
+    authTimeout: 10000,
   });
 
   try {
@@ -78,6 +46,7 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     auth: { user, pass },
     logger: false,
     connectionTimeout: 15000,
+    authTimeout: 15000,
   });
 
   await client.connect();
@@ -157,8 +126,12 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 
         const envelope = envelopeMap[msg.uid] ?? msg.envelope;
         const from = envelope?.from?.[0];
-        const merchant = normaliseMerchant(from);
-        const date = envelope?.date ? new Date(envelope.date) : new Date();
+        const fromHeader = from?.name
+          ? `${from.name} <${from.address ?? ""}>`
+          : (from?.address ?? "");
+        const merchant = extractMerchant(fromHeader, text);
+        const parsedDate = envelope?.date ? new Date(envelope.date) : null;
+        const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
         let intentScore = 0;
         if (text.includes("subscription")) intentScore += 1;
@@ -173,6 +146,7 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         charges.push({
           merchant,
           amount,
+          currency: extractCurrencyCode(text),
           date,
           subscriptionIntent: intentScore >= 3,
         });
@@ -185,34 +159,6 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
   }
 
   return { charges, scannedCount };
-}
-function normaliseMerchant(from) {
-  if (!from) return "unknown";
-
-  const address = from.address ?? "";
-  const name = from.name ?? "";
-
-  const domain = address.split("@")[1]?.toLowerCase() ?? "";
-  const root = domain.split(".").slice(-2, -1)[0] ?? domain;
-
-  if (root.includes("uber")) {
-    return name.toLowerCase().includes("uber one") ? "uber one" : "uber";
-  }
-
-  const knownMap = {
-    netflix: "netflix",
-    openai: "openai",
-    spotify: "spotify",
-    apple: "apple",
-    amazon: "amazon",
-    google: "google",
-    microsoft: "microsoft",
-    adobe: "adobe",
-    dropbox: "dropbox",
-    slack: "slack",
-  };
-
-  return knownMap[root] ?? root;
 }
 
 function normaliseImapError(err) {
