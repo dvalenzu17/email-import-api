@@ -70,7 +70,9 @@ export function extractMerchant(fromHeader, bodyText = "") {
   const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
 
   if (root.includes("uber") || parts.some((p) => p.includes("uber"))) {
-    return fromHeader.toLowerCase().includes("uber one") ? "uber one" : "uber";
+    // "Uber One" appears in the email body, not the From header (which just says "Uber")
+    return (fromHeader.toLowerCase().includes("uber one") || bodyText.toLowerCase().includes("uber one"))
+      ? "uber one" : "uber";
   }
 
   // Email service providers and marketing platforms whose From domain is

@@ -28,17 +28,26 @@ import { withRetry, CircuitBreaker } from "./retryUtil.js";
 import { filterUnprocessedIds, markProcessedIds } from "./messageCache.js";
 import pLimit from "p-limit";
 
+// Hard negatives — always filter regardless of domain.
+// These are unambiguous non-subscription signals.
 const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "trip with uber", "thanks for riding", "order with uber eats",
-  "your uber eats order", "you've earned", "reward", "you ordered",
+  "your uber eats order", "you've earned", "you ordered",
   "is on its way", "out for delivery", "has been shipped",
   "tracking number", "your order has", "rate your experience",
   "left a review", "survey", "unsubscribe from marketing",
   "you've been charged a late fee", "one-time", "one time purchase",
-  "your amazon.com order", "order confirmation", "items ordered",
+  "your amazon.com order", "items ordered",
   "estimated delivery", "shipping confirmation", "your package",
-  "arriving", "payment declined", "update your payment",
-  "unable to process your payment", "trouble authorizing", "failed payment",
+  "arriving", "unable to process your payment", "failed payment",
+];
+
+// Soft negatives — only applied to emails NOT from a known positive domain.
+// These phrases sometimes appear in footers of valid billing emails
+// (e.g. "Update your payment method if needed" at the bottom of a receipt).
+const SUBSCRIPTION_SOFT_NEGATIVES = [
+  "order confirmation", "payment declined", "update your payment",
+  "trouble authorizing", "reward",
 ];
 
 const SUBSCRIPTION_POSITIVE_DOMAINS = [
@@ -48,6 +57,7 @@ const SUBSCRIPTION_POSITIVE_DOMAINS = [
   "github.com", "anthropic.com", "chatgpt.com", "hulu.com",
   "disneyplus.com", "youtube.com", "linkedin.com", "zoom.us",
   "shopify.com", "squarespace.com", "wix.com", "webflow.io",
+  "uber.com",
 ];
 
 function maybeDecrypt(val) {
@@ -152,30 +162,46 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
   const charges = [];
   const processedIds = [];
 
+  // Diagnostic counters — returned alongside scan results for visibility.
+  let filtered_no_payload = 0, filtered_no_text = 0, filtered_negative = 0,
+      filtered_not_transactional = 0, filtered_no_amount = 0, filtered_no_merchant = 0;
+
   for (const full of fullMessages) {
-    if (!full?.payload) continue;
+    if (!full?.payload) { filtered_no_payload++; continue; }
 
     const headers = full.payload.headers;
     const rawHtml = extractText(full.payload);
-    if (!rawHtml) continue;
+    if (!rawHtml) { filtered_no_text++; continue; }
 
     const text = cleanEmailHtml(rawHtml);
-    if (!text || text.length < 30) continue;
-
-    const isNegative = SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) => text.includes(p));
-    if (isNegative) continue;
-
-    const transactional =
-      text.includes("payment") || text.includes("charged") ||
-      text.includes("invoice") || text.includes("successfully subscribed") ||
-      text.includes("receipt") || text.includes("billing") || text.includes("renewal");
-
-    if (!transactional) continue;
+    if (!text || text.length < 30) { filtered_no_text++; continue; }
 
     const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
     const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
       fromHeader.toLowerCase().includes(d)
     );
+
+    // Hard negatives apply to all emails. Soft negatives only apply to emails
+    // not from a known billing domain (to avoid filtering valid receipts that
+    // mention "update your payment" in their footer).
+    const isNegative =
+      SUBSCRIPTION_NEGATIVE_PATTERNS.some((p) => text.includes(p)) ||
+      (!isKnownDomain && SUBSCRIPTION_SOFT_NEGATIVES.some((p) => text.includes(p)));
+    if (isNegative) { filtered_negative++; continue; }
+
+    // Broadened transactional check — subscription billing emails may use
+    // "member", "subscript", "charge", "paid", "auto-renew" without the older
+    // keywords. Known-domain emails bypass this check entirely since any charge
+    // from netflix.com / anthropic.com etc. is by definition transactional.
+    const transactional =
+      isKnownDomain ||
+      text.includes("payment") || text.includes("charged") ||
+      text.includes("invoice") || text.includes("successfully subscribed") ||
+      text.includes("receipt") || text.includes("billing") || text.includes("renewal") ||
+      text.includes("subscript") || text.includes("member") ||
+      text.includes("paid") || text.includes("charge") || text.includes("auto-renew");
+
+    if (!transactional) { filtered_not_transactional++; continue; }
 
     let amount = extractAmount(text);
     if (!amount && isKnownDomain) {
@@ -183,10 +209,10 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
       if (m) amount = parseFloat(m[1]);
     }
 
-    if (!amount || amount > 500) continue;
+    if (!amount || amount > 500) { filtered_no_amount++; continue; }
 
     const merchant = extractMerchant(fromHeader, text);
-    if (merchant === "unknown") continue;
+    if (merchant === "unknown") { filtered_no_merchant++; continue; }
 
     const date = new Date(Number(full.internalDate));
     const renewalDate = extractRenewalDate(text);
@@ -206,7 +232,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
     if (text.includes("plan"))                       intentScore += 1;
     if (isKnownDomain)                               intentScore += 3;
 
-    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 4, renewalDate });
+    // Threshold lowered from 4 → 2: a single mention of "subscription" or
+    // "membership" is enough intent signal when paired with a valid amount.
+    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate });
     if (full.id) processedIds.push(full.id);
   }
 
@@ -230,7 +258,16 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
   return {
     detectedSubscriptions: subscriptions.length,
     scannedMessages: allIds.length,
+    newMessages: newIds.length,
     detectedCharges: charges.length,
     executionTimeMs: Date.now() - started,
+    filterBreakdown: {
+      noPayload: filtered_no_payload,
+      noText: filtered_no_text,
+      negativePattern: filtered_negative,
+      notTransactional: filtered_not_transactional,
+      noAmount: filtered_no_amount,
+      noMerchant: filtered_no_merchant,
+    },
   };
 }
