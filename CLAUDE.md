@@ -1,77 +1,176 @@
-# CLAUDE.md
+# email-import-api — CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## What this is
 
-## Interaction Style — Gamified Mode
+The email-import-api is the backend for BeforeItBills (BIB) — a consumer subscription tracker. It scans users' email inboxes (Gmail via OAuth, or Yahoo/Outlook/iCloud via IMAP), extracts recurring billing charges, scores them with a logistic regression ML model, and persists detected subscriptions to Supabase PostgreSQL.
 
-All interactions in this project are **gamified**. Follow these rules in every response:
+It is the source repo for the detection engine later spun out into `subscan-api`.
 
-- **Show current level progress** at the start of any coding response: e.g., `[LVL 10 ⚔️ — Critical Bug Fixes | 2/5 tasks done]`
-- **Award XP** when a task from `todo.md` is completed — announce it: e.g., `+20 XP — Guard added to decryptCredential()`
-- **Level up** when all tasks in a level are checked off — celebrate it clearly before moving on
-- **Reference `todo.md`** as the source of truth for what's in scope — don't work on a higher level until the current one is complete
-- Keep the tone direct and efficient — the gamification is in the framing, not the filler words
-- After completing any task, **check the box in `todo.md`** and update the Completion Log when a full level is done
+---
 
-## Improvement Roadmap
+## Stack
 
-The full audit and level-by-level improvement plan lives in [`todo.md`](./todo.md).
-Current focus: **Level 10 — Critical Bug Fixes**.
-Do not skip levels. Each level is a precondition for the next.
+- **Runtime**: Node.js (ESM, `"type": "module"`)
+- **Framework**: Fastify 4
+- **Database**: PostgreSQL via Supabase (`pg` pool + Supabase admin client)
+- **Auth**: Supabase JWT (`SUPABASE_JWT_SECRET`) — every route calls `verifyUserId()`
+- **Queue**: BullMQ + Redis (optional, `QUEUE_ENABLED=true`)
+- **Deploy target**: Render
 
+---
+
+## Repo structure
+
+```
+email-import-api/
+├── src/
+│   ├── server.js                    — Fastify instance, plugin registration, route registration
+│   ├── gmailClient.js               — Gmail API message fetch + text extraction
+│   ├── googleOAuth.js               — OAuth token exchange & refresh helpers
+│   ├── db/
+│   │   └── index.js                 — All DB queries (pg pool); scoped by user_id
+│   ├── routes/
+│   │   ├── scanRoutes.js            — POST /scan, GET /scan/:jobId/status, GET /scan/:jobId/events
+│   │   ├── subscriptionRoutes.js    — GET /subscriptions, PATCH /subscriptions/:id, POST /subscriptions/:id/feedback
+│   │   ├── oauthRoutes.js           — GET /auth/google, GET /auth/google/callback, POST /oauth/google/exchange
+│   │   └── imapScanRoutes.js        — POST /scan/imap/verify, POST /scan/imap
+│   └── services/
+│       ├── subscriptionEngine.js    — Core: groups charges by merchant, scores confidence, detects interval
+│       ├── subscriptionModel.js     — ML: logistic regression (loads model/weights.json)
+│       ├── modelFeatures.js         — Feature vector extraction (occ_norm, interval_score, amount_score, intent_score, known_brand)
+│       ├── emailParser.js           — Amount/merchant/currency extraction from email text
+│       ├── gmailScanService.js      — Gmail scan orchestration: fetch → parse → dedupe → score → upsert
+│       ├── imapClient.js            — IMAP two-pass scan (envelopes first, full source second)
+│       ├── anomalyDetector.js       — Z-score anomaly detection on charge amounts
+│       ├── scanQueue.js             — BullMQ queue + worker setup
+│       ├── messageCache.js          — In-memory dedup of processed Gmail message IDs
+│       ├── crypto.js                — AES-256-GCM credential encryption (key: TOKEN_ENCRYPTION_KEY)
+│       ├── retryUtil.js             — Exponential backoff + circuit breaker
+│       ├── merchantNormalizer.js    — Merchant name normalisation (Netflix → netflix)
+│       └── knownBrands.js           — Known brand list with confirmSingle flags
+├── migrations/
+│   ├── 001_add_performance_indexes.sql
+│   ├── 002_subscription_lifecycle.sql  — last_seen_at, user_status, subscription_events
+│   ├── 003_ml_feedback.sql             — subscription_feedback table
+│   └── 004_currency_and_anomaly.sql    — currency column, is_anomalous flag
+├── model/
+│   ├── weights.json                 — Logistic regression weights (retrained via scripts/trainModel.js)
+├── scripts/
+│   ├── localScan.js                 — CLI: scan a user's inbox locally
+│   └── trainModel.js                — Retrain ML model from feedback data
+└── package.json
+```
+
+---
+
+## Auth flow
+
+Every route extracts the Supabase JWT from `Authorization: Bearer <token>`, verifies it against `SUPABASE_JWT_SECRET`, and calls `verifyUserId(req, reply)` which returns `userId = decoded.sub`.
+
+All DB queries are scoped `WHERE user_id = $1`. There is no session, no cookie, no API key.
+
+---
+
+## Data model
+
+**`oauth_tokens`** — Google OAuth credentials per user
+- `user_id` UUID, `provider` TEXT, `access_token`, `refresh_token`, `expiry_date`
+- UNIQUE `(user_id, provider)`
+
+**`subscriptions`** — Detected recurring charges
+- `id` UUID PK, `user_id` UUID
+- `merchant` TEXT, `renewal_amount` NUMERIC, `currency` TEXT (default `USD`)
+- `renewal_date` TIMESTAMPTZ, `billing_interval` TEXT (`weekly` | `monthly` | `quarterly` | `semi-annual` | `yearly` | `unknown`)
+- `confidence` NUMERIC (0–1), `is_active` BOOLEAN, `is_suggested` BOOLEAN
+- `source` TEXT (`gmail` | `imap:{provider}`)
+- `user_status` TEXT (`confirmed` | `cancelled` | `ignored` | NULL) — manual override
+- `last_seen_at` TIMESTAMPTZ — drives staleness logic
+- UNIQUE `(user_id, merchant)`
+
+**`subscription_events`** — Full audit trail of detections
+- `event_type` TEXT (`detected` | `resumed` | `cancelled` | `confirmed` | `ignored`)
+- `is_anomalous` BOOLEAN — set by anomalyDetector
+
+**`scan_metadata`** — Per-scan stats (messages, charges, execution time)
+
+**`imap_credentials`** — Encrypted IMAP credentials per user+provider
+
+**`subscription_feedback`** — ML training data: `label` (`confirmed` | `rejected`) + JSONB feature vector
+
+---
+
+## Confidence score thresholds
+
+| Source | Confirmed | Suggested (isSuggested=true) |
+|--------|-----------|------------------------------|
+| Gmail  | ≥ 0.50    | 0.50–0.84                    |
+| IMAP   | ≥ 0.70    | 0.70–0.84                    |
+
+Staleness decay: subscriptions not seen in 2× their billing period are marked inactive (unless `user_status = 'confirmed'`).
+
+---
+
+## API routes
+
+```
+POST /scan                      — Trigger Gmail scan (sync or queued)
+GET  /scan/:jobId/status        — Poll queued job status
+GET  /scan/:jobId/events        — SSE stream of scan progress
+GET  /subscriptions             — List subscriptions (paginated: ?limit=&offset=)
+PATCH /subscriptions/:id        — Set user_status (confirmed/cancelled/ignored)
+POST /subscriptions/:id/feedback — Submit ML feedback label
+GET  /auth/google               — Initiate Google OAuth (redirects to consent screen)
+GET  /auth/google/callback      — OAuth callback, saves tokens
+POST /oauth/google/exchange     — PKCE token exchange for iOS native app
+POST /scan/imap/verify          — Test IMAP credentials (no scan)
+POST /scan/imap                 — Scan IMAP inbox
+```
+
+---
+
+## Environment variables
+
+```
+PORT=8787
+DATABASE_URL=postgresql://...
+SUPABASE_URL=https://...
+SUPABASE_JWT_SECRET=...
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REDIRECT_URI=
+TOKEN_ENCRYPTION_KEY=   # 32-byte hex or base64 — AES key for crypto.js
+QUEUE_ENABLED=false     # set true to enable BullMQ
+REDIS_URL=              # only needed if QUEUE_ENABLED=true
+```
+
+---
 
 ## Commands
 
 ```bash
-npm start          # Run production server (node src/server.js)
-npm run dev        # Run with hot reload (node --watch src/server.js)
-npm run local:scan # Run local scan script
+npm run dev        # node --watch src/server.js
+npm start          # node src/server.js
+npm run local:scan # scripts/localScan.js
 ```
 
-No test or lint commands are configured.
+---
 
-## Architecture
+## Rules for Claude working in this repo
 
-**Fastify API** (`src/server.js`) with four route groups:
-- `registerScanRoutes()` — Gmail scanning via OAuth tokens
-- `registerOAuthRoutes()` — Google OAuth flow (web + PKCE/iOS native)
-- `registerImapScanRoutes()` — IMAP scanning (Yahoo, Outlook, iCloud)
-- `registerSubscriptionRoutes()` — Retrieve stored subscriptions
+- All DB queries must be scoped by `user_id` — never query without a user filter.
+- Auth is Supabase JWT only — `verifyUserId()` in every route, no exceptions.
+- The `user_id` in all tables is the Supabase `auth.users.id` (the JWT `sub` claim).
+- When adding a new route, register it in `server.js`. No route logic in `server.js`.
+- When adding a new DB function, it goes in `src/db/index.js`.
+- Migrations go in `migrations/` numbered sequentially. Never modify existing migrations.
 
-All authenticated routes verify Supabase JWTs from the `Authorization: Bearer` header.
+> Shared rules (ESM, no credential logging, no modifying detection engine) are in `C:/dev/CLAUDE.md`.
 
-### Core Detection Pipeline
+---
 
-1. **Email fetch**: Gmail API (`src/gmailClient.js`) or IMAP (`src/services/imapClient.js`) retrieves emails matching billing-related subject keywords
-2. **Parsing**: `src/services/subscriptionEngine.js` extracts merchant, amount, renewal date, and subscription intent signals from email text/HTML
-3. **Deduplication & scoring**: Groups charges by merchant, calculates confidence score based on occurrence count, interval consistency, and amount consistency
-4. **Persistence**: Upserts into `subscriptions` table via `src/db/index.js`
+## What is NOT in this repo
 
-### Confidence Score Thresholds
-- Gmail: ≥ 0.5 confirmed, < 0.85 suggested
-- IMAP: ≥ 0.7 confirmed, < 0.85 suggested
-
-### Credential Storage
-IMAP passwords and OAuth tokens are AES-256-GCM encrypted using `src/services/crypto.js` before storage. The encryption key is `TOKEN_ENC_KEY_BASE64` in `.env`.
-
-### Key Files
-- `src/server.js` — Entry point, route registration, Fastify plugins
-- `src/services/subscriptionEngine.js` — Core subscription detection logic (amount regex, merchant extraction, confidence scoring)
-- `src/db/index.js` — All PostgreSQL queries (Supabase)
-- `src/services/imapClient.js` — IMAP two-pass scan (envelopes first, then full source)
-- `src/googleOAuth.js` — OAuth token exchange and refresh
-
-## Environment
-
-Requires a `.env` file with:
-- `PORT`, `SUPABASE_JWT_SECRET`, `SUPABASE_URL`, `DATABASE_URL`
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`
-- `TOKEN_ENC_KEY_BASE64` (AES key for encrypting stored credentials)
-- `REDIS_URL`, `QUEUE_ENABLED` (optional BullMQ queue support)
-
-## Database Tables
-
-- `oauth_tokens` — Google OAuth tokens per user
-- `subscriptions` — Detected subscriptions with confidence, billing interval, amounts
-- `scan_metadata` — Per-scan stats (messages scanned, charges detected, execution time)
-- `imap_credentials` — Encrypted IMAP credentials per provider per user
+- Frontend (lives in `sublytics/`)
+- Stripe / payment handling
+- Admin provisioning (those are in `subscan-api`)
+- Model retraining automation (manual via `scripts/trainModel.js`)

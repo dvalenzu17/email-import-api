@@ -57,7 +57,8 @@ export function registerOAuthRoutes(server) {
         return reply.code(401).send({ error: "invalid_supabase_token" });
       }
 
-      const state = signState({ supabaseUserId, nonce: crypto.randomUUID() });
+      const redirectAfter = req.query.redirect || null;
+      const state = signState({ supabaseUserId, nonce: crypto.randomUUID(), redirectAfter });
 
       const url = buildGoogleAuthUrl({ clientId, redirectUri, state });
 
@@ -76,9 +77,11 @@ export function registerOAuthRoutes(server) {
       if (!state) return reply.code(400).send({ error: "missing_state" });
 
       let supabaseUserId;
+      let redirectAfter;
       try {
         const decodedState = verifyState(state);
         supabaseUserId = decodedState.supabaseUserId;
+        redirectAfter = decodedState.redirectAfter || null;
       } catch {
         return reply.code(400).send({ error: "invalid_state" });
       }
@@ -107,9 +110,10 @@ export function registerOAuthRoutes(server) {
       if (!email) return reply.code(400).send({ error: "email_not_found" });
       await saveOAuthTokens(supabaseUserId, tokens);
 
-      return reply.redirect(
-        `beforeitbills://oauth-success?email=${encodeURIComponent(email)}`
-      );
+      const deepLink = process.env.GOOGLE_APP_DEEP_LINK || "beforeitbills://oauth-success";
+      const baseUrl = redirectAfter || deepLink;
+      const sep = baseUrl.includes("?") ? "&" : "?";
+      return reply.redirect(`${baseUrl}${sep}email=${encodeURIComponent(email)}`);
     } catch (err) {
       req.log.error({ err }, "oauth_callback_error");
       return reply.code(500).send({ error: "oauth_failed" });
