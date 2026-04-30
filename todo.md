@@ -84,7 +84,6 @@ Current XP: **100 / 100**
 - [x] Expand marketing email blocklist — add missing senders (Klaviyo, Mailchimp, Braze, etc.)
 - [x] Rebuild Apple App Store parser as resilient pattern matcher (not fragile single regex)
 
----
 
 ## Level 80 — Subscription Lifecycle Tracking `[✓]`
 > Makes subscriptions actionable, not just detected.
