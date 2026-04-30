@@ -68,7 +68,8 @@ export function registerScanRoutes(server) {
 
     // Synchronous path (default, no Redis required)
     try {
-      const result = await runGmailScan({ userId, daysBack });
+      const force = req.body?.force === true;
+      const result = await runGmailScan({ userId, daysBack, force });
       return { success: true, ...result };
     } catch (err) {
       if (err.message === "gmail_not_connected") {

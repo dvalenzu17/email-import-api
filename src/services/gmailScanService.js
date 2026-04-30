@@ -69,7 +69,7 @@ function maybeDecrypt(val) {
   return val;
 }
 
-export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
+export async function runGmailScan({ userId, daysBack = 180, onProgress, force = false }) {
   const progress = onProgress ?? (() => {});
   const started = Date.now();
 
@@ -115,10 +115,12 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
   );
 
   const allIds = (listRes.messages ?? []).map((m) => m.id);
+  console.log(`[scan] gmail_query_results: ${allIds.length} messages found for userId=${userId} force=${force}`);
 
   // ── Step 3: Deduplicate (skip already-processed messages) ─────────────────
   progress(15, "Deduplicating message list");
-  const newIds = await filterUnprocessedIds(userId, allIds);
+  const newIds = force ? allIds : await filterUnprocessedIds(userId, allIds);
+  console.log(`[scan] after_dedup: ${newIds.length} new messages (${allIds.length - newIds.length} already cached)`);
 
   progress(20, `Fetching ${newIds.length} new messages`);
 
@@ -234,14 +236,21 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
 
     // Threshold lowered from 4 → 2: a single mention of "subscription" or
     // "membership" is enough intent signal when paired with a valid amount.
-    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate });
-    if (full.id) processedIds.push(full.id);
+    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, _msgId: full.id });
+  }
+
+  console.log(`[scan] charges_extracted: ${charges.length} | filters: noPayload=${filtered_no_payload} noText=${filtered_no_text} negative=${filtered_negative} notTransactional=${filtered_not_transactional} noAmount=${filtered_no_amount} noMerchant=${filtered_no_merchant}`);
+  if (charges.length > 0) {
+    const byMerchant = {};
+    for (const c of charges) byMerchant[c.merchant] = (byMerchant[c.merchant] ?? 0) + 1;
+    console.log(`[scan] charges_by_merchant:`, JSON.stringify(byMerchant));
   }
 
   progress(80, "Detecting subscriptions");
 
   // ── Step 6: Detect + persist ──────────────────────────────────────────────
   const subscriptions = detectRecurringSubscriptions(charges);
+  console.log(`[scan] subscriptions_detected: ${subscriptions.length}`, subscriptions.map(s => `${s.merchant}(${s.confidence})`));
   await batchUpsertSubscriptions(userId, subscriptions);
 
   await saveScanMetadata(userId, {
@@ -250,7 +259,14 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress }) {
     executionTimeMs: Date.now() - started,
   });
 
-  // Mark processed IDs so they're skipped on the next scan.
+  // Only mark messages as processed if their merchant produced a detected subscription.
+  // This ensures that emails filtered by tight thresholds can be re-evaluated on the
+  // next scan (e.g. after filters are loosened or more charges accumulate).
+  const detectedMerchants = new Set(subscriptions.map((s) => s.merchant));
+  const processedIds = charges
+    .filter((c) => detectedMerchants.has(c.merchant) && c._msgId)
+    .map((c) => c._msgId);
+
   await markProcessedIds(userId, processedIds);
 
   progress(100, "Done");
