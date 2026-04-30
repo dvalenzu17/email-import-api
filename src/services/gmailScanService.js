@@ -162,7 +162,6 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
   // ── Step 5: Extract charges ───────────────────────────────────────────────
   const charges = [];
-  const processedIds = [];
 
   // Diagnostic counters — returned alongside scan results for visibility.
   let filtered_no_payload = 0, filtered_no_text = 0, filtered_negative = 0,
