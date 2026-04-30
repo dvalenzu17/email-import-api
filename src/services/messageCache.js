@@ -50,6 +50,20 @@ export async function filterUnprocessedIds(userId, messageIds) {
 }
 
 /**
+ * Clears the entire processed-message cache for a user.
+ * Called before a force scan so all messages are re-evaluated.
+ */
+export async function clearUserCache(userId) {
+  const r = getRedis();
+  if (!r) return;
+  try {
+    await r.del(`processed_msgs:${userId}`);
+  } catch {
+    // Non-fatal.
+  }
+}
+
+/**
  * Marks message IDs as processed for this user.
  * Refreshes the TTL on every write.
  */

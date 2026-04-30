@@ -60,11 +60,12 @@ export function startWorker(logger) {
   _worker = new Worker(
     QUEUE_NAME,
     async (job) => {
-      const { userId, daysBack } = job.data;
+      const { userId, daysBack, force } = job.data;
 
       return runGmailScan({
         userId,
         daysBack,
+        force: force === true,
         onProgress: async (pct, message) => {
           await job.updateProgress({ pct, message });
         },

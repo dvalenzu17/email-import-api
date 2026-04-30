@@ -58,7 +58,8 @@ export function registerScanRoutes(server) {
 
     if (QUEUE_ENABLED) {
       try {
-        const job = await getQueue().add("scan", { userId, daysBack });
+        const force = req.body?.force === true;
+        const job = await getQueue().add("scan", { userId, daysBack, force });
         return reply.code(202).send({ jobId: job.id, status: "queued" });
       } catch (err) {
         req.log.error({ err }, "scan_enqueue_error");

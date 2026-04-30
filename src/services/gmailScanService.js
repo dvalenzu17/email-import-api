@@ -25,7 +25,7 @@ import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTok
 import { decryptCredential } from "./crypto.js";
 import { refreshAccessToken } from "../googleOAuth.js";
 import { withRetry, CircuitBreaker } from "./retryUtil.js";
-import { filterUnprocessedIds, markProcessedIds } from "./messageCache.js";
+import { filterUnprocessedIds, markProcessedIds, clearUserCache } from "./messageCache.js";
 import pLimit from "p-limit";
 
 // Hard negatives — always filter regardless of domain.
@@ -119,6 +119,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
   // ── Step 3: Deduplicate (skip already-processed messages) ─────────────────
   progress(15, "Deduplicating message list");
+  if (force) await clearUserCache(userId);
   const newIds = force ? allIds : await filterUnprocessedIds(userId, allIds);
   console.log(`[scan] after_dedup: ${newIds.length} new messages (${allIds.length - newIds.length} already cached)`);
 
