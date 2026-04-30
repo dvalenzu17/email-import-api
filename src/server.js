@@ -6,6 +6,7 @@ import { registerScanRoutes } from "./routes/scanRoutes.js";
 import { registerSubscriptionRoutes } from "./routes/subscriptionRoutes.js";
 import { registerOAuthRoutes } from "./routes/oauthRoutes.js";
 import { registerImapScanRoutes } from "./routes/imapScanRoutes.js";
+import { registerAdminRoutes } from "./routes/adminRoutes.js";
 
 const QUEUE_ENABLED = process.env.QUEUE_ENABLED === "true";
 
@@ -29,6 +30,7 @@ registerScanRoutes(server);
 registerSubscriptionRoutes(server);
 registerOAuthRoutes(server);
 registerImapScanRoutes(server);
+registerAdminRoutes(server);
 
 server.get("/", async () => {
   return { status: "ok" };

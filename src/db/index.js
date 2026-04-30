@@ -327,6 +327,50 @@ export async function getImapCredentials(userId, provider) {
 }
 
 // -------------------------
+// ADMIN — ALL USERS
+// -------------------------
+
+/**
+ * Returns every subscription across all users, grouped with per-user scan stats.
+ * Used exclusively by the internal admin dashboard (protected by ADMIN_SECRET).
+ */
+export async function getAdminUsersData() {
+  try {
+    const [subRes, scanRes] = await Promise.all([
+      pool.query(`
+        SELECT id, user_id, merchant, renewal_amount, currency, billing_interval,
+               confidence, is_active, is_suggested, user_status, source, last_seen_at, created_at
+        FROM subscriptions
+        ORDER BY user_id, created_at DESC
+      `),
+      pool.query(`
+        SELECT DISTINCT ON (user_id)
+          user_id, scanned_messages, detected_charges, created_at AS last_scan_at
+        FROM scan_metadata
+        ORDER BY user_id, created_at DESC
+      `),
+    ]);
+
+    // Group subscriptions by user_id
+    const byUser = {};
+    for (const row of subRes.rows) {
+      if (!byUser[row.user_id]) byUser[row.user_id] = [];
+      byUser[row.user_id].push(row);
+    }
+
+    const scanMap = Object.fromEntries(scanRes.rows.map((r) => [r.user_id, r]));
+
+    return Object.entries(byUser).map(([userId, subs]) => ({
+      userId,
+      subscriptions: subs,
+      lastScan: scanMap[userId] ?? null,
+    }));
+  } catch (err) {
+    throw new Error(`db_get_admin_users_failed: ${err.message}`);
+  }
+}
+
+// -------------------------
 // ML FEEDBACK
 // -------------------------
 
