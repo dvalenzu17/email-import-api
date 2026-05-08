@@ -1,5 +1,6 @@
 import { ImapFlow } from "imapflow";
 import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode } from "./emailParser.js";
+import { getBrandInfo } from "./knownBrands.js";
 
 const IMAP_CONFIGS = {
   yahoo:   { host: "imap.mail.yahoo.com",      port: 993, secure: true },
@@ -10,7 +11,22 @@ const IMAP_CONFIGS = {
 const SEARCH_KEYWORDS = [
   "subscription", "renewal", "receipt", "invoice",
   "billing", "payment", "charged", "membership",
+  "billed", "your plan", "auto-renew", "next billing",
 ];
+
+// Domains where any charge email is a subscription by definition.
+// Used to boost intent score so single receipts aren't filtered out.
+const IMAP_KNOWN_DOMAINS = new Set([
+  "netflix.com", "spotify.com", "openai.com", "adobe.com",
+  "apple.com", "microsoft.com", "dropbox.com", "slack.com",
+  "notion.so", "figma.com", "github.com", "anthropic.com",
+  "hulu.com", "disneyplus.com", "youtube.com", "linkedin.com",
+  "zoom.us", "shopify.com", "squarespace.com", "webflow.io",
+  "canva.com", "grammarly.com", "duolingo.com", "headspace.com",
+  "calm.com", "peloton.com", "substack.com", "patreon.com",
+  "medium.com", "crunchyroll.com", "twitch.tv", "audible.com",
+  "vercel.com", "netlify.com", "airtable.com", "hubspot.com",
+]);
 
 export function getImapConfig(provider) {
   const config = IMAP_CONFIGS[provider];
@@ -133,22 +149,37 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const parsedDate = envelope?.date ? new Date(envelope.date) : null;
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
-        let intentScore = 0;
-        if (text.includes("subscription")) intentScore += 1;
-        if (text.includes("membership")) intentScore += 1;
-        if (text.includes("automatically renew")) intentScore += 2;
-        if (text.includes("renews on")) intentScore += 2;
-        if (text.includes("/month") || text.includes("per month")) intentScore += 2;
-        if (text.includes("/year") || text.includes("per year")) intentScore += 2;
-        if (text.includes("valid until")) intentScore += 2;
-        if (text.includes("plan")) intentScore += 1;
+        // Check if this sender is a known subscription domain — same logic as
+        // the Gmail scan so that single receipts from Spotify, Netflix etc.
+        // are not dropped by the intent threshold.
+        const fromLow = fromHeader.toLowerCase();
+        const isKnownDomain = [...IMAP_KNOWN_DOMAINS].some(d => fromLow.includes(d));
+        const brandInfo = merchant !== "unknown" ? getBrandInfo(merchant) : null;
 
+        let intentScore = 0;
+        if (isKnownDomain || brandInfo?.confirmSingle) intentScore += 3;
+        if (text.includes("subscription"))              intentScore += 2;
+        if (text.includes("membership"))                intentScore += 2;
+        if (text.includes("automatically renew"))        intentScore += 2;
+        if (text.includes("renews on"))                  intentScore += 2;
+        if (text.includes("next billing"))               intentScore += 2;
+        if (text.includes("/month") || text.includes("per month")) intentScore += 2;
+        if (text.includes("/year")  || text.includes("per year"))  intentScore += 2;
+        if (text.includes("cancel anytime"))             intentScore += 2;
+        if (text.includes("valid until"))                intentScore += 1;
+        if (text.includes("plan"))                       intentScore += 1;
+        if (text.includes("charged"))                    intentScore += 1;
+        if (text.includes("receipt"))                    intentScore += 1;
+        if (text.includes("billing"))                    intentScore += 1;
+
+        // Threshold lowered from 3 → 2: a single billing keyword + known domain,
+        // or any two subscription signals, is enough intent evidence for IMAP.
         charges.push({
           merchant,
           amount,
           currency: extractCurrencyCode(text),
           date,
-          subscriptionIntent: intentScore >= 3,
+          subscriptionIntent: intentScore >= 2,
         });
       } catch {
         continue;

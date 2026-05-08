@@ -24,30 +24,42 @@ export function cleanEmailHtml(html) {
 
 /**
  * Extracts a charge amount from email text.
- * Supports USD, GBP, EUR. Priority: "total" > "charged" > plan price > first in-range match.
+ * Supports USD, GBP, EUR, CAD, AUD.
+ * Priority: "total" > "charged" > plan price > first in-range match.
+ * Handles comma-formatted thousands ($1,299.00) and European decimal (€9,99).
  */
 export function extractAmount(text) {
   const s = String(text).toLowerCase();
 
-  const totalMatch = s.match(
-    /total\s*[:\-]?\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/
-  );
-  if (totalMatch) return parseFloat(totalMatch[1]);
+  // Normalised number parser — strips thousands commas before converting.
+  function toNum(raw) {
+    return parseFloat(raw.replace(/,/g, ''));
+  }
 
-  const chargedMatch = s.match(
-    /charged\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/
-  );
-  if (chargedMatch) return parseFloat(chargedMatch[1]);
+  // European decimal format: €9,99 — comma is the decimal separator.
+  const euroDecimal = s.match(/(?:€|eur)\s?([0-9]{1,4}),([0-9]{1,2})(?!\d)/);
+  if (euroDecimal) {
+    const v = parseFloat(`${euroDecimal[1]}.${euroDecimal[2]}`);
+    if (v > 0 && v < 10_000) return v;
+  }
 
-  const planMatch = s.match(
-    /(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/
-  );
-  if (planMatch) return parseFloat(planMatch[1]);
+  // Amount pattern: currency symbol/code + number (with optional comma thousands).
+  const AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
+  const CUR = '(?:usd|us\\$|\\$|gbp|£|eur|€|cad|aud)';
 
-  const fallback = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
+  const totalMatch = s.match(new RegExp(`total\\s*[:\\-]?\\s*${CUR}\\s?${AMT}`));
+  if (totalMatch) return toNum(totalMatch[1]);
+
+  const chargedMatch = s.match(new RegExp(`charged\\s*${CUR}\\s?${AMT}`));
+  if (chargedMatch) return toNum(chargedMatch[1]);
+
+  const planMatch = s.match(new RegExp(`${CUR}\\s?${AMT}\\s*(?:\\/|\\s*per\\s*)(?:month|year|mo|yr)`));
+  if (planMatch) return toNum(planMatch[1]);
+
+  const fallback = s.match(new RegExp(`${CUR}\\s?${AMT}`));
   if (fallback) {
-    const v = parseFloat(fallback[1]);
-    if (v > 0 && v <= 500) return v;
+    const v = toNum(fallback[1]);
+    if (v > 0 && v < 2_000) return v; // raised cap: enterprise plans can exceed $500
   }
 
   return null;
@@ -100,26 +112,33 @@ export function extractMerchant(fromHeader, bodyText = "") {
   }
 
   const knownMap = {
-    openai: "openai",
-    chatgpt: "openai",
-    netflix: "netflix",
-    spotify: "spotify",
-    apple: "apple",
-    google: "google",
-    youtube: "google",
-    microsoft: "microsoft",
-    adobe: "adobe",
-    dropbox: "dropbox",
-    slack: "slack",
-    amazon: "amazon",
-    hulu: "hulu",
-    disney: "disney+",
-    notion: "notion",
-    figma: "figma",
-    github: "github",
-    anthropic: "anthropic",
-    linkedin: "linkedin",
-    zoom: "zoom",
+    // AI / Dev
+    openai: "openai", chatgpt: "openai", anthropic: "anthropic",
+    // Streaming
+    netflix: "netflix", hulu: "hulu", disney: "disney+",
+    hbo: "hbo", max: "max", peacock: "peacock", paramount: "paramount",
+    crunchyroll: "crunchyroll", twitch: "twitch",
+    // Music / Audio
+    spotify: "spotify", audible: "audible",
+    // Cloud / Productivity
+    apple: "apple", google: "google", youtube: "google",
+    microsoft: "microsoft", adobe: "adobe", dropbox: "dropbox",
+    slack: "slack", notion: "notion", figma: "figma",
+    github: "github", linkedin: "linkedin", zoom: "zoom",
+    canva: "canva", grammarly: "grammarly",
+    // Commerce / Hosting
+    amazon: "amazon", shopify: "shopify",
+    squarespace: "squarespace", wix: "wix", webflow: "webflow",
+    uber: "uber one",
+    // Wellness / Learning
+    duolingo: "duolingo", headspace: "headspace", calm: "calm",
+    peloton: "peloton",
+    // Creator
+    substack: "substack", patreon: "patreon", medium: "medium",
+    // Dev infra
+    vercel: "vercel", netlify: "netlify", airtable: "airtable",
+    hubspot: "hubspot", intercom: "intercom", zendesk: "zendesk",
+    datadog: "datadog", sentry: "sentry",
   };
 
   for (const part of parts) {

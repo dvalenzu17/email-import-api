@@ -57,7 +57,11 @@ const SUBSCRIPTION_POSITIVE_DOMAINS = [
   "github.com", "anthropic.com", "chatgpt.com", "hulu.com",
   "disneyplus.com", "youtube.com", "linkedin.com", "zoom.us",
   "shopify.com", "squarespace.com", "wix.com", "webflow.io",
-  "uber.com",
+  "uber.com", "canva.com", "grammarly.com", "duolingo.com",
+  "headspace.com", "calm.com", "peloton.com", "substack.com",
+  "patreon.com", "medium.com", "crunchyroll.com", "twitch.tv",
+  "audible.com", "vercel.com", "netlify.com", "airtable.com",
+  "hubspot.com", "intercom.com", "zendesk.com",
 ];
 
 function maybeDecrypt(val) {
@@ -102,7 +106,19 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // ── Step 2: List messages ─────────────────────────────────────────────────
   progress(10, "Fetching message list");
 
-  const query = `newer_than:${daysBack}d (subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal OR subject:payment OR subject:billing OR subject:membership OR subject:plan OR subject:welcome OR subject:"order confirmation")`;
+  const query = [
+    `newer_than:${daysBack}d`,
+    '(subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal',
+    'OR subject:payment OR subject:billing OR subject:membership OR subject:plan',
+    'OR subject:charged OR subject:billed OR subject:"your subscription"',
+    'OR subject:"payment confirmation" OR subject:"payment received"',
+    'OR subject:"thanks for subscribing" OR subject:"thank you for subscribing"',
+    'OR subject:"auto-renew" OR subject:"next billing")',
+    '-subject:shipped -subject:delivered -subject:delivery -subject:tracking',
+    '-subject:"order confirmation" -subject:"your order" -subject:"order has"',
+    '-subject:"security code" -subject:"verify your" -subject:"confirm your email"',
+    '-subject:"sign in" -subject:password -subject:refund -subject:"gift card"',
+  ].join(' ');
   const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=500&q=${encodeURIComponent(query)}`;
 
   const listRes = await withRetry(
@@ -211,7 +227,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
       if (m) amount = parseFloat(m[1]);
     }
 
-    if (!amount || amount > 500) { filtered_no_amount++; continue; }
+    if (!amount) { filtered_no_amount++; continue; }
 
     const merchant = extractMerchant(fromHeader, text);
     if (merchant === "unknown") { filtered_no_merchant++; continue; }

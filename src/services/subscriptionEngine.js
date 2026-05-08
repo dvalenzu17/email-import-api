@@ -71,7 +71,7 @@ function calcRecencyDecay(daysSinceLastCharge) {
   return 0.35;
 }
 
-import { getBrandInfo } from "./knownBrands.js";
+import { getBrandInfo, getBrandDisplayName } from "./knownBrands.js";
 import { normalizeMerchant } from "./merchantNormalizer.js";
 
 export function detectRecurringSubscriptions(charges) {
@@ -107,15 +107,15 @@ export function detectRecurringSubscriptions(charges) {
         const confidence = Math.round(0.8 * calcRecencyDecay(daysSince) * 1000) / 1000;
 
         results.push({
-          merchant,
+          merchant:      getBrandDisplayName(merchant),
           renewalAmount: single.amount,
-          currency: single.currency ?? "USD",
-          renewalDate: single.renewalDate ?? null,
+          currency:      single.currency ?? "USD",
+          renewalDate:   single.renewalDate ?? null,
           billingInterval: brand.interval,
           confidence,
-          isActive: true,
+          isActive:    true,
           isSuggested: confidence < 0.85,
-          source: "gmail",
+          source:      "gmail",
         });
         continue;
       }
@@ -134,15 +134,15 @@ export function detectRecurringSubscriptions(charges) {
       const confidence = Math.round(0.7 * calcRecencyDecay(daysSince) * 1000) / 1000;
 
       results.push({
-        merchant,
+        merchant:      getBrandDisplayName(merchant),
         renewalAmount: amount,
-        currency: single.currency ?? "USD",
-        renewalDate: single.renewalDate ?? null,
+        currency:      single.currency ?? "USD",
+        renewalDate:   single.renewalDate ?? null,
         billingInterval: brand?.interval ?? "unknown",
         confidence,
-        isActive: true,
+        isActive:    true,
         isSuggested: true,
-        source: "gmail",
+        source:      "gmail",
       });
 
       continue;
@@ -196,15 +196,15 @@ export function detectRecurringSubscriptions(charges) {
     if (confidence < 0.5) continue;
 
     results.push({
-      merchant,
+      merchant:      getBrandDisplayName(merchant),
       renewalAmount: last.amount,
-      currency: last.currency ?? "USD",
-      renewalDate: nextDate,
+      currency:      last.currency ?? "USD",
+      renewalDate:   nextDate,
       billingInterval,
-      confidence: Math.round(confidence * 1000) / 1000,
-      isActive: true,
+      confidence:  Math.round(confidence * 1000) / 1000,
+      isActive:    true,
       isSuggested: confidence < 0.85,
-      source: "gmail",
+      source:      "gmail",
     });
   }
 
