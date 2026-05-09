@@ -195,18 +195,36 @@ export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 function normaliseImapError(err) {
   const msg = err.message?.toLowerCase() ?? "";
 
-  if (msg.includes("invalid credentials") || msg.includes("authentication failed")) {
+  // Auth failures — Apple returns [AUTHENTICATIONFAILED], others vary
+  if (
+    msg.includes("invalid credentials") ||
+    msg.includes("authentication failed") ||
+    msg.includes("authenticationfailed") ||
+    msg.includes("login failed") ||
+    msg.includes("access denied") ||
+    msg.includes("no [auth") ||
+    msg.includes("incorrect password") ||
+    msg.includes("username or password")
+  ) {
     return "invalid_credentials";
   }
-  if (msg.includes("application-specific password")) {
+  // Apple-specific: account requires app-specific password
+  if (msg.includes("application-specific") || msg.includes("app-specific") || msg.includes("app password")) {
     return "app_password_required";
   }
-  if (msg.includes("too many")) {
+  if (msg.includes("too many") || msg.includes("rate limit") || msg.includes("flood")) {
     return "rate_limited";
   }
-  if (msg.includes("connect") || msg.includes("timeout")) {
+  // Network / TLS / connection errors
+  if (
+    msg.includes("connect") || msg.includes("timeout") ||
+    msg.includes("network") || msg.includes("tls") ||
+    msg.includes("ssl") || msg.includes("econnrefused") ||
+    msg.includes("enotfound") || msg.includes("socket") ||
+    msg.includes("cert") || msg.includes("eproto")
+  ) {
     return "connection_failed";
   }
-
-  return err.message ?? "imap_error";
+  // Unknown — return a known code so the frontend shows a human-readable message
+  return "imap_error";
 }
