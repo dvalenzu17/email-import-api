@@ -1,6 +1,7 @@
 import { ImapFlow } from "imapflow";
 import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode } from "./emailParser.js";
 import { getBrandInfo } from "./knownBrands.js";
+import { withRetry } from "./retryUtil.js";
 
 const IMAP_CONFIGS = {
   yahoo:   { host: "imap.mail.yahoo.com",      port: 993, secure: true },
@@ -54,7 +55,26 @@ export async function verifyImapCredentials({ provider, user, pass }) {
   }
 }
 
-export async function scanImapInbox({ provider, user, pass, daysBack = 365 }) {
+function isUnavailableError(err) {
+  if (err?.responseText?.toLowerCase().includes("unavailable")) return true;
+  const attrs = err?.response?.attributes;
+  if (Array.isArray(attrs)) {
+    return attrs.some(
+      (a) => Array.isArray(a.section) && a.section.some((s) => s.value === "UNAVAILABLE")
+    );
+  }
+  return false;
+}
+
+export async function scanImapInbox(params) {
+  return withRetry(() => _scanImapInbox(params), {
+    maxAttempts: 2,
+    baseDelayMs: 4000,
+    retryOn: isUnavailableError,
+  });
+}
+
+async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
   const { host, port, secure } = getImapConfig(provider);
 
   const client = new ImapFlow({
@@ -214,6 +234,9 @@ function normaliseImapError(err) {
   }
   if (msg.includes("too many") || msg.includes("rate limit") || msg.includes("flood")) {
     return "rate_limited";
+  }
+  if (msg.includes("unavailable") || msg.includes("temporarily")) {
+    return "service_unavailable";
   }
   // Network / TLS / connection errors
   if (
