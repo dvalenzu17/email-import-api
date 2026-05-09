@@ -126,7 +126,8 @@ export function extractMerchant(fromHeader, bodyText = "", subject = "") {
     // AI / Dev
     openai: "openai", chatgpt: "openai", anthropic: "anthropic",
     // Streaming
-    netflix: "netflix", hulu: "hulu", disney: "disney+",
+    netflix: "netflix", netflixcommunication: "netflix",
+    hulu: "hulu", disney: "disney+", disneyplus: "disney+",
     hbo: "hbo", max: "max", peacock: "peacock", paramount: "paramount",
     crunchyroll: "crunchyroll", twitch: "twitch",
     // Music / Audio
@@ -216,6 +217,35 @@ function extractAppleAppName(text) {
   );
   if (yourSub) {
     const name = cleanAppleName(yourSub[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  // Strategy 5: "App Name  1 Month Subscription" — Apple receipt table layout (no parens).
+  // Matches the format Apple uses after HTML stripping: "disney+ 1 month subscription us$7.99"
+  const beforeDuration = text.match(
+    /([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)\s+(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
+  );
+  if (beforeDuration) {
+    const name = cleanAppleName(beforeDuration[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  // Strategy 6: "subscriptions  App Name  US$X.XX" — section header in Apple receipt.
+  // Apple receipts have a "SUBSCRIPTIONS" label before the line item.
+  const subSection = text.match(
+    /subscriptions?\s+([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)(?=\s+(?:us\$|\$[0-9]|\d))/i
+  );
+  if (subSection) {
+    const name = cleanAppleName(subSection[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  // Strategy 7: "App Name  US$X.XX" — bare price anchor without /month (Apple receipt).
+  const barePrice = text.match(
+    /([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)\s+us\$[0-9]+\.[0-9]{2}/i
+  );
+  if (barePrice) {
+    const name = cleanAppleName(barePrice[1]);
     if (isValidAppleName(name)) return name;
   }
 

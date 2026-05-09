@@ -33,10 +33,10 @@ import pLimit from "p-limit";
 // These are unambiguous non-subscription signals.
 const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "trip with uber", "thanks for riding",
-  "your uber eats order", "you've earned", "you ordered",
+  "your uber eats order",
   "is on its way", "out for delivery", "has been shipped",
-  "tracking number", "your order has", "rate your experience",
-  "left a review", "survey", "unsubscribe from marketing",
+  "tracking number", "your order has",
+  "unsubscribe from marketing",
   "you've been charged a late fee", "one-time", "one time purchase",
   "your amazon.com order", "items ordered",
   "money sent", "you sent a payment", "you paid",
@@ -45,15 +45,18 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
 ];
 
 // Soft negatives — only applied to emails NOT from a known positive domain.
-// These phrases sometimes appear in footers of valid billing emails
-// (e.g. "Update your payment method if needed" at the bottom of a receipt).
+// These phrases sometimes appear in footers of valid billing emails from known
+// services (e.g. Netflix includes "survey" links, Uber One says "you've earned
+// Uber Cash", billing confirmations say "rate your experience").
 const SUBSCRIPTION_SOFT_NEGATIVES = [
   "order confirmation", "payment declined", "update your payment",
   "trouble authorizing", "reward",
+  "you've earned", "you ordered",
+  "rate your experience", "left a review", "survey",
 ];
 
 const SUBSCRIPTION_POSITIVE_DOMAINS = [
-  "netflix.com", "spotify.com", "openai.com", "adobe.com",
+  "netflix.com", "netflixcommunication.com", "spotify.com", "openai.com", "adobe.com",
   "apple.com", "google.com", "amazon.com", "microsoft.com",
   "dropbox.com", "slack.com", "notion.so", "figma.com",
   "github.com", "anthropic.com", "chatgpt.com", "hulu.com",
