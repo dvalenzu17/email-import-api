@@ -56,7 +56,11 @@ export async function verifyImapCredentials({ provider, user, pass }) {
   }
 }
 
-function isUnavailableError(err) {
+function isRetriableImapError(err) {
+  // imapflow NoConnection — connection dropped mid-scan (common on Render after
+  // hibernation wakeup or Apple IMAP dropping idle connections)
+  if (err?.code === "NoConnection") return true;
+  // Apple [UNAVAILABLE] response
   if (err?.responseText?.toLowerCase().includes("unavailable")) return true;
   const attrs = err?.response?.attributes;
   if (Array.isArray(attrs)) {
@@ -64,14 +68,16 @@ function isUnavailableError(err) {
       (a) => Array.isArray(a.section) && a.section.some((s) => s.value === "UNAVAILABLE")
     );
   }
-  return false;
+  // Generic transient network errors
+  const msg = err?.message?.toLowerCase() ?? "";
+  return msg.includes("timeout") || msg.includes("econnreset") || msg.includes("enotfound");
 }
 
 export async function scanImapInbox(params) {
   return withRetry(() => _scanImapInbox(params), {
-    maxAttempts: 2,
-    baseDelayMs: 4000,
-    retryOn: isUnavailableError,
+    maxAttempts: 3,
+    baseDelayMs: 5000,
+    retryOn: isRetriableImapError,
   });
 }
 
