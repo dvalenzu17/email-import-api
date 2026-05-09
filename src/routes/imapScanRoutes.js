@@ -40,8 +40,10 @@ export function registerImapScanRoutes(server) {
     const token = authHeader?.split(" ")[1];
     if (!token) return reply.code(401).send({ error: "unauthorized" });
 
+    let userId;
     try {
-      jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+      userId = decoded.sub;
     } catch {
       return reply.code(401).send({ error: "unauthorized" });
     }
@@ -55,6 +57,9 @@ export function registerImapScanRoutes(server) {
 
     try {
       await verifyImapCredentials({ provider, user, pass });
+      // Save credentials now so subsequent scans can use stored creds
+      // even if the first scan fails transiently (e.g. Apple UNAVAILABLE).
+      await saveImapCredentials(userId, { provider, user, pass });
       return { ok: true };
     } catch (err) {
       return reply.code(400).send({ error: err.message });
