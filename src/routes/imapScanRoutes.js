@@ -107,12 +107,13 @@ export function registerImapScanRoutes(server) {
 
       const feedbackMap = await getFeedbackMerchantMap(userId);
 
-      const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => ({
+      const allSubscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => ({
         ...s,
         source: provider,
       }));
+      const confident = allSubscriptions.filter((s) => s.confidence >= 0.7);
 
-      await batchUpsertSubscriptions(userId, subscriptions.filter((s) => s.confidence >= 0.7));
+      await batchUpsertSubscriptions(userId, confident);
 
       // Apply lifecycle cancellations detected in scan (mirrors Gmail scan behaviour).
       if (cancellations.length) {
@@ -129,7 +130,11 @@ export function registerImapScanRoutes(server) {
 
       return {
         success: true,
-        detectedSubscriptions: subscriptions.length,
+        // Return the subscriptions this scan found so the frontend can display
+        // them directly without falling back to GET /subscriptions (which would
+        // return all subscriptions across all providers for this user).
+        subscriptions: confident,
+        detectedSubscriptions: confident.length,
         meta: {
           scannedMessages: scannedCount,
           detectedCharges: charges.length,

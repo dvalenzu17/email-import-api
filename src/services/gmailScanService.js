@@ -331,6 +331,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   progress(100, "Done");
 
   return {
+    // Return subscriptions so the frontend can display them directly without
+    // falling back to GET /subscriptions (which returns all providers).
+    subscriptions: confident,
     detectedSubscriptions: subscriptions.length,
     scannedMessages: allIds.length,
     newMessages: newIds.length,
