@@ -31,7 +31,7 @@ import pLimit from "p-limit";
 // Hard negatives — always filter regardless of domain.
 // These are unambiguous non-subscription signals.
 const SUBSCRIPTION_NEGATIVE_PATTERNS = [
-  "trip with uber", "thanks for riding", "order with uber eats",
+  "trip with uber", "thanks for riding",
   "your uber eats order", "you've earned", "you ordered",
   "is on its way", "out for delivery", "has been shipped",
   "tracking number", "your order has", "rate your experience",
@@ -267,7 +267,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // ── Step 6: Detect + persist ──────────────────────────────────────────────
   const subscriptions = detectRecurringSubscriptions(charges);
   console.log(`[scan] subscriptions_detected: ${subscriptions.length}`, subscriptions.map(s => `${s.merchant}(${s.confidence})`));
-  await batchUpsertSubscriptions(userId, subscriptions);
+  const confident = subscriptions.filter((s) => s.confidence >= 0.7);
+  console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
+  await batchUpsertSubscriptions(userId, confident);
 
   await saveScanMetadata(userId, {
     scannedMessages: allIds.length,

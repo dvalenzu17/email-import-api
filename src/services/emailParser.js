@@ -82,9 +82,10 @@ export function extractMerchant(fromHeader, bodyText = "") {
   const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
 
   if (root.includes("uber") || parts.some((p) => p.includes("uber"))) {
-    // "Uber One" appears in the email body, not the From header (which just says "Uber")
-    return (fromHeader.toLowerCase().includes("uber one") || bodyText.toLowerCase().includes("uber one"))
-      ? "uber one" : "uber";
+    // Any Uber billing email that reaches this point has already passed the hard-negative
+    // filters ("trip with uber", "thanks for riding", "order with uber eats"), so it is
+    // a membership/subscription email. Always map to "uber one".
+    return "uber one";
   }
 
   // Email service providers and marketing platforms whose From domain is

@@ -154,7 +154,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         if (
           text.includes("trip with uber") ||
           text.includes("thanks for riding") ||
-          text.includes("order with uber eats")
+          text.includes("your uber eats order")
         ) continue;
 
         const amount = extractAmount(text);
