@@ -1,4 +1,5 @@
 import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
 import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate } from "./emailParser.js";
 import { getBrandInfo } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
@@ -154,16 +155,24 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     );
 
     // Pass 2 — full source, UID mode
+    // mailparser decodes MIME structure and base64 parts correctly — cheerio
+    // on the raw RFC 2822 source cannot see base64-encoded HTML bodies at all.
     for await (const msg of client.fetch(
       relevantUids,
       { source: true, uid: true },
       { uid: true }
     )) {
       try {
-        const raw = msg.source?.toString("utf8") ?? "";
-        if (!raw) continue;
+        const rawBuffer = msg.source;
+        if (!rawBuffer) continue;
 
-        const text = cleanEmailHtml(raw);
+        const parsed = await simpleParser(rawBuffer);
+
+        // Prefer HTML body (richer content); fall back to plain text.
+        const bodySource = parsed.html || parsed.textAsHtml || parsed.text || "";
+        if (!bodySource) continue;
+
+        const text = cleanEmailHtml(bodySource);
         if (!text || text.length < 30) continue;
 
         if (
@@ -172,12 +181,16 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           text.includes("your uber eats order")
         ) continue;
 
-        const envelope = envelopeMap[msg.uid] ?? msg.envelope;
-        const from = envelope?.from?.[0];
-        const fromHeader = from?.name
-          ? `${from.name} <${from.address ?? ""}>`
-          : (from?.address ?? "");
-        const subject = envelope?.subject ?? "";
+        // mailparser already parsed From + Subject from the MIME headers —
+        // prefer these over the envelope (which comes from IMAP FETCH ENVELOPE
+        // and can be lossy with non-ASCII names).
+        const fromParsed = parsed.from?.value?.[0];
+        const fromHeader = fromParsed?.name
+          ? `${fromParsed.name} <${fromParsed.address ?? ""}>`
+          : (fromParsed?.address ?? (envelopeMap[msg.uid]?.from?.[0]?.address ?? ""));
+        const subject = parsed.subject ?? envelopeMap[msg.uid]?.subject ?? "";
+
+        const parsedDate = parsed.date ?? (envelopeMap[msg.uid]?.date ? new Date(envelopeMap[msg.uid].date) : null);
 
         // ── Lifecycle classification ──────────────────────────────────────────
         // Detect cancellation/expiry emails so we can mark the subscription as
@@ -198,7 +211,6 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const merchant = extractMerchant(fromHeader, text, subject);
         if (merchant === "unknown") continue;
 
-        const parsedDate = envelope?.date ? new Date(envelope.date) : null;
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
         // Check if this sender is a known subscription domain — same logic as
@@ -239,6 +251,12 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
       } catch {
         continue;
       }
+    }
+    console.log(`[imap] scan_complete: provider=${provider} scanned=${scannedCount} charges=${charges.length} cancellations=${cancellations.length}`);
+    if (charges.length > 0) {
+      const byMerchant = {};
+      for (const c of charges) byMerchant[c.merchant] = (byMerchant[c.merchant] ?? 0) + 1;
+      console.log(`[imap] charges_by_merchant:`, JSON.stringify(byMerchant));
     }
   } finally {
     try { await client.logout(); } catch { /* connection may already be closed */ }
