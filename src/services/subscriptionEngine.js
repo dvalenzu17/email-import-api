@@ -74,7 +74,31 @@ function calcRecencyDecay(daysSinceLastCharge) {
 import { getBrandInfo, getBrandDisplayName } from "./knownBrands.js";
 import { normalizeMerchant } from "./merchantNormalizer.js";
 
-export function detectRecurringSubscriptions(charges) {
+/**
+ * Adjusts a raw confidence score based on the user's explicit feedback.
+ *
+ * confirmed → boost by +0.15 (capped at 1.0) — user said "yes this is real"
+ * rejected  → suppress to 0  — user said "this is wrong"; exclude entirely
+ *
+ * This is the core of the free intelligence graph: user feedback is the
+ * training signal that personalises detection over time without retraining.
+ */
+function applyFeedback(confidence, merchantKey, feedbackMap) {
+  const label = feedbackMap[merchantKey.toLowerCase()];
+  if (label === "confirmed") return Math.min(confidence + 0.15, 1.0);
+  if (label === "rejected")  return 0; // exclude entirely
+  return confidence;
+}
+
+/**
+ * @param {Array}  charges     — extracted charge objects from scan
+ * @param {object} opts
+ * @param {object} opts.feedbackMap — { [merchantKey: string]: 'confirmed'|'rejected' }
+ *   Per-user feedback labels from prior scans. Confirmed merchants get a confidence
+ *   boost; rejected merchants are suppressed. This is the free-tier "intelligence
+ *   graph" — it personalises detection to each user's actual spending history.
+ */
+export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {}) {
   const grouped = {};
 
   for (const c of charges) {
@@ -104,7 +128,9 @@ export function detectRecurringSubscriptions(charges) {
         // (likely a parsing error from a non-billing email).
         if (single.amount < brand.minAmount * 0.5 || single.amount > brand.maxAmount * 2) continue;
 
-        const confidence = Math.round(0.8 * calcRecencyDecay(daysSince) * 1000) / 1000;
+        let confidence = Math.round(0.8 * calcRecencyDecay(daysSince) * 1000) / 1000;
+        confidence = applyFeedback(confidence, merchant, feedbackMap);
+        if (confidence <= 0) continue;
 
         results.push({
           merchant:      getBrandDisplayName(merchant),
@@ -112,7 +138,7 @@ export function detectRecurringSubscriptions(charges) {
           currency:      single.currency ?? "USD",
           renewalDate:   single.renewalDate ?? null,
           billingInterval: brand.interval,
-          confidence,
+          confidence:    Math.round(confidence * 1000) / 1000,
           isActive:    true,
           isSuggested: confidence < 0.85,
           source:      "gmail",
@@ -131,7 +157,9 @@ export function detectRecurringSubscriptions(charges) {
 
       if (!looksLikeSubscription) continue;
 
-      const confidence = Math.round(0.7 * calcRecencyDecay(daysSince) * 1000) / 1000;
+      let confidence = Math.round(0.7 * calcRecencyDecay(daysSince) * 1000) / 1000;
+      confidence = applyFeedback(confidence, merchant, feedbackMap);
+      if (confidence <= 0) continue;
 
       results.push({
         merchant:      getBrandDisplayName(merchant),
@@ -139,7 +167,7 @@ export function detectRecurringSubscriptions(charges) {
         currency:      single.currency ?? "USD",
         renewalDate:   single.renewalDate ?? null,
         billingInterval: brand?.interval ?? "unknown",
-        confidence,
+        confidence:    Math.round(confidence * 1000) / 1000,
         isActive:    true,
         isSuggested: true,
         source:      "gmail",
@@ -194,6 +222,9 @@ export function detectRecurringSubscriptions(charges) {
     });
 
     if (confidence < 0.5) continue;
+
+    confidence = applyFeedback(confidence, merchant, feedbackMap);
+    if (confidence <= 0) continue;
 
     results.push({
       merchant:      getBrandDisplayName(merchant),

@@ -165,7 +165,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const fromHeader = from?.name
           ? `${from.name} <${from.address ?? ""}>`
           : (from?.address ?? "");
-        const merchant = extractMerchant(fromHeader, text);
+        const subject = envelope?.subject ?? "";
+        const merchant = extractMerchant(fromHeader, text, subject);
         const parsedDate = envelope?.date ? new Date(envelope.date) : null;
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 

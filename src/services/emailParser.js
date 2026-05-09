@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import he from "he";
+import { isProcessor, extractProcessorMerchant } from "./billingProcessor.js";
 
 /**
  * Strips HTML from an email body and returns clean, lowercased plain text.
@@ -70,8 +71,9 @@ export function extractAmount(text) {
  *
  * @param {string} fromHeader - Raw "From" value: "Name <email@domain.com>" or "email@domain.com"
  * @param {string} bodyText   - Cleaned email body (used for Apple App Store extraction)
+ * @param {string} subject    - Email subject (used for billing processor extraction)
  */
-export function extractMerchant(fromHeader, bodyText = "") {
+export function extractMerchant(fromHeader, bodyText = "", subject = "") {
   if (!fromHeader) return "unknown";
 
   const emailMatch = fromHeader.match(/<(.+?)>/);
@@ -81,9 +83,17 @@ export function extractMerchant(fromHeader, bodyText = "") {
   const parts = domain.split(".");
   const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
 
+  // ── Billing processor passthrough ─────────────────────────────────────────
+  // Stripe, Paddle, PayPal, Lemon Squeezy etc. send receipts on behalf of the
+  // actual merchant. Extract the real merchant from subject/body, not the sender.
+  if (isProcessor(domain)) {
+    const merchant = extractProcessorMerchant(domain, subject, bodyText);
+    return merchant || "unknown"; // unknown if we can't parse the real merchant
+  }
+
   if (root.includes("uber") || parts.some((p) => p.includes("uber"))) {
     // Any Uber billing email that reaches this point has already passed the hard-negative
-    // filters ("trip with uber", "thanks for riding", "order with uber eats"), so it is
+    // filters ("trip with uber", "thanks for riding", "your uber eats order"), so it is
     // a membership/subscription email. Always map to "uber one".
     return "uber one";
   }

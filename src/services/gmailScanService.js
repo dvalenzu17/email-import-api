@@ -21,7 +21,8 @@ import {
 } from "../gmailClient.js";
 import { extractCurrencyCode } from "./emailParser.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
-import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens } from "../db/index.js";
+import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens, cancelSubscriptionByMerchant, getFeedbackMerchantMap } from "../db/index.js";
+import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { decryptCredential } from "./crypto.js";
 import { refreshAccessToken } from "../googleOAuth.js";
 import { withRetry, CircuitBreaker } from "./retryUtil.js";
@@ -179,10 +180,12 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
   // ── Step 5: Extract charges ───────────────────────────────────────────────
   const charges = [];
+  const cancellations = []; // merchants whose cancellation emails were detected
 
   // Diagnostic counters — returned alongside scan results for visibility.
   let filtered_no_payload = 0, filtered_no_text = 0, filtered_negative = 0,
-      filtered_not_transactional = 0, filtered_no_amount = 0, filtered_no_merchant = 0;
+      filtered_not_transactional = 0, filtered_no_amount = 0, filtered_no_merchant = 0,
+      filtered_lifecycle = 0;
 
   for (const full of fullMessages) {
     if (!full?.payload) { filtered_no_payload++; continue; }
@@ -195,6 +198,27 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     if (!text || text.length < 30) { filtered_no_text++; continue; }
 
     const fromHeader = headers.find((h) => h.name === "From")?.value ?? "";
+    const subject    = headers.find((h) => h.name === "Subject")?.value ?? "";
+
+    // ── Email type classification ───────────────────────────────────────────
+    const emailType = classifyEmail(subject, text);
+
+    if (emailType === EMAIL_TYPES.CANCELLATION) {
+      // Extract which merchant was cancelled and queue for lifecycle update.
+      const merchant = extractMerchant(fromHeader, text, subject);
+      if (merchant && merchant !== "unknown") cancellations.push(merchant);
+      filtered_lifecycle++;
+      continue; // not a charge
+    }
+
+    if (emailType === EMAIL_TYPES.FAILED_PAYMENT) {
+      filtered_lifecycle++;
+      continue; // payment failed — not a successful charge
+    }
+
+    // trial_start, trial_ending, upgrade, renewal_notice, receipt → continue
+    // to charge extraction (they may carry an amount we want to track).
+
     const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
       fromHeader.toLowerCase().includes(d)
     );
@@ -229,7 +253,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
     if (!amount) { filtered_no_amount++; continue; }
 
-    const merchant = extractMerchant(fromHeader, text);
+    const merchant = extractMerchant(fromHeader, text, subject);
     if (merchant === "unknown") { filtered_no_merchant++; continue; }
 
     const date = new Date(Number(full.internalDate));
@@ -255,7 +279,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, _msgId: full.id });
   }
 
-  console.log(`[scan] charges_extracted: ${charges.length} | filters: noPayload=${filtered_no_payload} noText=${filtered_no_text} negative=${filtered_negative} notTransactional=${filtered_not_transactional} noAmount=${filtered_no_amount} noMerchant=${filtered_no_merchant}`);
+  console.log(`[scan] charges_extracted: ${charges.length} | filters: noPayload=${filtered_no_payload} noText=${filtered_no_text} negative=${filtered_negative} notTransactional=${filtered_not_transactional} noAmount=${filtered_no_amount} noMerchant=${filtered_no_merchant} lifecycle=${filtered_lifecycle} cancellations=${cancellations.length}`);
   if (charges.length > 0) {
     const byMerchant = {};
     for (const c of charges) byMerchant[c.merchant] = (byMerchant[c.merchant] ?? 0) + 1;
@@ -265,11 +289,24 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   progress(80, "Detecting subscriptions");
 
   // ── Step 6: Detect + persist ──────────────────────────────────────────────
-  const subscriptions = detectRecurringSubscriptions(charges);
+  // Fetch per-user feedback labels to personalise confidence scores.
+  const feedbackMap = await getFeedbackMerchantMap(userId);
+
+  const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap });
   console.log(`[scan] subscriptions_detected: ${subscriptions.length}`, subscriptions.map(s => `${s.merchant}(${s.confidence})`));
   const confident = subscriptions.filter((s) => s.confidence >= 0.7);
   console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
   await batchUpsertSubscriptions(userId, confident);
+
+  // ── Step 7: Lifecycle events ──────────────────────────────────────────────
+  // Apply cancellations detected during scan (cancellation emails auto-mark
+  // the matching subscription inactive without the user needing to do it manually).
+  if (cancellations.length) {
+    console.log(`[scan] lifecycle_cancellations: ${cancellations.join(", ")}`);
+    await Promise.allSettled(
+      cancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
+    );
+  }
 
   await saveScanMetadata(userId, {
     scannedMessages: allIds.length,

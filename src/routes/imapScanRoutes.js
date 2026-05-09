@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials } from "../db/index.js";
+import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
 
 const PROVIDERS = ["yahoo", "outlook", "icloud"];
@@ -105,7 +105,9 @@ export function registerImapScanRoutes(server) {
 
       await saveImapCredentials(userId, { provider, user, pass });
 
-      const subscriptions = detectRecurringSubscriptions(charges).map((s) => ({
+      const feedbackMap = await getFeedbackMerchantMap(userId);
+
+      const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => ({
         ...s,
         source: provider,
       }));

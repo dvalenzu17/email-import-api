@@ -371,8 +371,55 @@ export async function getAdminUsersData() {
 }
 
 // -------------------------
+// LIFECYCLE EVENTS
+// -------------------------
+
+/**
+ * Marks a subscription as cancelled by merchant name.
+ * Only updates rows that haven't been manually set to 'confirmed' by the user.
+ * Used when the scan detects a cancellation email for a known merchant.
+ */
+export async function cancelSubscriptionByMerchant(userId, merchant) {
+  try {
+    await pool.query(
+      `UPDATE subscriptions
+       SET user_status = 'cancelled',
+           is_active   = false,
+           updated_at  = NOW()
+       WHERE user_id = $1
+         AND LOWER(merchant) = LOWER($2)
+         AND (user_status IS NULL OR user_status NOT IN ('confirmed'))`,
+      [userId, merchant]
+    );
+  } catch (err) {
+    throw new Error(`db_cancel_subscription_failed: ${err.message}`);
+  }
+}
+
+// -------------------------
 // ML FEEDBACK
 // -------------------------
+
+/**
+ * Returns a map of { [merchantKey: string]: 'confirmed'|'rejected' } for a user.
+ * Used by the detection engine to personalise confidence scores at inference time
+ * without retraining — the free-tier intelligence graph.
+ */
+export async function getFeedbackMerchantMap(userId) {
+  try {
+    const result = await pool.query(
+      `SELECT LOWER(s.merchant) AS merchant, sf.label
+       FROM subscription_feedback sf
+       JOIN subscriptions s ON sf.subscription_id = s.id
+       WHERE sf.user_id = $1`,
+      [userId]
+    );
+    return Object.fromEntries(result.rows.map((r) => [r.merchant, r.label]));
+  } catch {
+    // Non-fatal: if feedback lookup fails, detection proceeds without personalisation.
+    return {};
+  }
+}
 
 /**
  * Upserts a user feedback label for a detected subscription.
