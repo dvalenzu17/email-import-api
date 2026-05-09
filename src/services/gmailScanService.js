@@ -39,6 +39,7 @@ const SUBSCRIPTION_NEGATIVE_PATTERNS = [
   "left a review", "survey", "unsubscribe from marketing",
   "you've been charged a late fee", "one-time", "one time purchase",
   "your amazon.com order", "items ordered",
+  "money sent", "you sent a payment", "you paid",
   "estimated delivery", "shipping confirmation", "your package",
   "arriving", "unable to process your payment", "failed payment",
 ];

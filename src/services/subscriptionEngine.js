@@ -212,7 +212,7 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
 
     const intentCount = list.filter((c) => c.subscriptionIntent).length;
 
-    const confidence = calculateConfidence({
+    let confidence = calculateConfidence({
       occurrences: list.length,
       intervalVariance,
       amountCV,

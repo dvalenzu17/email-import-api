@@ -207,7 +207,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
       }
     }
   } finally {
-    await client.logout();
+    try { await client.logout(); } catch { /* connection may already be closed */ }
   }
 
   return { charges, scannedCount };

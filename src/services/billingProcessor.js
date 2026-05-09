@@ -67,13 +67,20 @@ function extractFastSpring(subject, body) {
 }
 
 function extractPayPal(subject, body) {
+  // Only extract from PayPal SUBSCRIPTION/RECURRING emails, not P2P money-sent emails.
+  // "You sent $X to Person" emails are person-to-person transfers, not subscriptions.
   // "You sent a recurring payment to Netflix"
   // "Your subscription payment to Spotify has been processed"
-  // "Automatic payment to Hulu"
+  if (
+    subject.toLowerCase().includes("money sent") ||
+    subject.toLowerCase().includes("you sent") ||
+    subject.toLowerCase().includes("you paid") ||
+    body.toLowerCase().includes("money sent")
+  ) return null; // P2P transfer — not a subscription
+
   let m =
     subject.match(/(?:recurring|subscription|automatic) payment to ([^.$]+)/i) ||
-    body.match(/(?:recurring|subscription) payment (?:to|for) ([A-Z][^\n.]+)/i) ||
-    body.match(/you (?:sent|paid) .{1,20} to ([A-Z][^\n.]+)/i);
+    body.match(/(?:recurring|subscription) payment (?:to|for) ([A-Z][^\n.,]+)/i);
   if (m) return m[1].trim();
   return null;
 }
