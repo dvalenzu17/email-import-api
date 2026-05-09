@@ -221,16 +221,17 @@ function extractAppleAppName(text) {
   }
 
   // Strategy 5: "App Name  1 Month Subscription" — Apple receipt table layout (no parens).
-  // Matches the format Apple uses after HTML stripping: "disney+ 1 month subscription us$7.99"
+  // Word-by-word matching (max 4 words) with negative lookahead to skip common header words
+  // (subscriptions, apple, receipt, from, your) that precede the actual app name.
   const beforeDuration = text.match(
-    /([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)\s+(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
   );
   if (beforeDuration) {
     const name = cleanAppleName(beforeDuration[1]);
     if (isValidAppleName(name)) return name;
   }
 
-  // Strategy 6: "subscriptions  App Name  US$X.XX" — section header in Apple receipt.
+  // Strategy 6: "subscriptions  App Name  US$X.XX / digit" — section header in Apple receipt.
   // Apple receipts have a "SUBSCRIPTIONS" label before the line item.
   const subSection = text.match(
     /subscriptions?\s+([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)(?=\s+(?:us\$|\$[0-9]|\d))/i
@@ -241,8 +242,9 @@ function extractAppleAppName(text) {
   }
 
   // Strategy 7: "App Name  US$X.XX" — bare price anchor without /month (Apple receipt).
+  // Skips same common header words as strategy 5.
   const barePrice = text.match(
-    /([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)\s+us\$[0-9]+\.[0-9]{2}/i
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+us\$[0-9]+\.[0-9]{2}/i
   );
   if (barePrice) {
     const name = cleanAppleName(barePrice[1]);
@@ -282,4 +284,49 @@ export function extractCurrencyCode(text) {
   if (/c\$|ca\$/.test(s)) return "CAD";
 
   return "USD";
+}
+
+/**
+ * Extracts a renewal/next-billing date from email body text.
+ * Shared by both Gmail and IMAP scan paths.
+ *
+ * @param {string} text — cleaned plain text
+ * @returns {Date|null}
+ */
+// Parse a date string that may or may not have a comma: "June 15 2026" or "June 15, 2026".
+function parseFlexDate(raw) {
+  if (!raw) return null;
+  // Normalise: ensure a comma between day and year for JS Date parsing
+  const normalised = raw.trim().replace(/(\w+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
+  const d = new Date(normalised);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+export function extractRenewalDate(text) {
+  // DATE_PAT: "Month D, YYYY" or "Month D YYYY" or "D Month YYYY"
+  const DATE_PAT = String.raw`(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w+\s+\d{4})`;
+  const patterns = [
+    new RegExp(String.raw`starting from\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`renews on\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`renews\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`next billing date[:\s]+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`renewal date[:\s]+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`will renew on\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`automatically renews\s+(?:on\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`subscription renews\s+(?:on\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`your next\s+(?:billing|payment|charge)[^.]{0,30}(?:on|date)\s+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`next (?:renewal|billing)[^.]{0,20}(?:is|on|:)\s+` + DATE_PAT, "i"),
+    // ISO date format: "2026-06-15"
+    /(?:renew|next billing|renewal)[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i,
+  ];
+
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) {
+      const d = parseFlexDate(m[1]);
+      if (d) return d;
+    }
+  }
+
+  return null;
 }

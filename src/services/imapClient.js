@@ -1,6 +1,7 @@
 import { ImapFlow } from "imapflow";
-import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode } from "./emailParser.js";
+import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate } from "./emailParser.js";
 import { getBrandInfo } from "./knownBrands.js";
+import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
 
 const IMAP_CONFIGS = {
@@ -88,6 +89,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
   await client.connect();
 
   const charges = [];
+  const cancellations = [];
   let scannedCount = 0;
 
   try {
@@ -112,8 +114,14 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     )) {
       scannedCount++;
       const subject = msg.envelope?.subject?.toLowerCase() ?? "";
+      const senderAddress = msg.envelope?.from?.[0]?.address?.toLowerCase() ?? "";
+      const isKnownSender = [...IMAP_KNOWN_DOMAINS].some(d => senderAddress.includes(d));
 
+      // Always include emails from known subscription domains regardless of subject —
+      // e.g. Disney+ welcome emails ("Welcome to Disney+") don't have billing keywords
+      // in the subject but carry cadence, price, and renewal date in the body.
       const looksRelevant =
+        isKnownSender ||
         subject.includes("receipt") ||
         subject.includes("invoice") ||
         subject.includes("subscription") ||
@@ -122,9 +130,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         subject.includes("billing") ||
         subject.includes("auto-renew") ||
         subject.includes("your plan") ||
-        subject.includes("charged");
-        // NOTE: "payment", "order confirmation" deliberately excluded —
-        // they fire on one-time purchases (Amazon etc.) and dominate results
+        subject.includes("charged") ||
+        subject.includes("payment") ||
+        subject.includes("welcome");
+        // NOTE: "order confirmation" deliberately excluded — fires on one-time purchases
 
       if (looksRelevant) {
         relevant.push({ uid: msg.uid, envelope: msg.envelope });
@@ -157,16 +166,32 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           text.includes("your uber eats order")
         ) continue;
 
-        const amount = extractAmount(text);
-        if (!amount) continue;
-
         const envelope = envelopeMap[msg.uid] ?? msg.envelope;
         const from = envelope?.from?.[0];
         const fromHeader = from?.name
           ? `${from.name} <${from.address ?? ""}>`
           : (from?.address ?? "");
         const subject = envelope?.subject ?? "";
+
+        // ── Lifecycle classification ──────────────────────────────────────────
+        // Detect cancellation/expiry emails so we can mark the subscription as
+        // inactive even if we also have a charge email for it. This mirrors the
+        // Gmail scan's lifecycle handling.
+        const emailType = classifyEmail(subject, text);
+        if (emailType === EMAIL_TYPES.CANCELLATION || emailType === EMAIL_TYPES.FAILED_PAYMENT) {
+          if (emailType === EMAIL_TYPES.CANCELLATION) {
+            const merchant = extractMerchant(fromHeader, text, subject);
+            if (merchant && merchant !== "unknown") cancellations.push(merchant);
+          }
+          continue; // not a charge
+        }
+
+        const amount = extractAmount(text);
+        if (!amount) continue;
+
         const merchant = extractMerchant(fromHeader, text, subject);
+        if (merchant === "unknown") continue;
+
         const parsedDate = envelope?.date ? new Date(envelope.date) : null;
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
@@ -193,6 +218,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         if (text.includes("receipt"))                    intentScore += 1;
         if (text.includes("billing"))                    intentScore += 1;
 
+        const renewalDate = extractRenewalDate(text);
+
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
         charges.push({
@@ -200,6 +227,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           amount,
           currency: extractCurrencyCode(text),
           date,
+          renewalDate,
           subscriptionIntent: intentScore >= 2,
         });
       } catch {
@@ -210,7 +238,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     try { await client.logout(); } catch { /* connection may already be closed */ }
   }
 
-  return { charges, scannedCount };
+  return { charges, cancellations, scannedCount };
 }
 
 function normaliseImapError(err) {

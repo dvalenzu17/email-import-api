@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap } from "../db/index.js";
+import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
 
 const PROVIDERS = ["yahoo", "outlook", "icloud"];
@@ -99,7 +99,7 @@ export function registerImapScanRoutes(server) {
     const started = Date.now();
 
     try {
-      const { charges, scannedCount } = await scanImapInbox({
+      const { charges, cancellations, scannedCount } = await scanImapInbox({
         provider, user, pass, daysBack,
       });
 
@@ -113,6 +113,13 @@ export function registerImapScanRoutes(server) {
       }));
 
       await batchUpsertSubscriptions(userId, subscriptions.filter((s) => s.confidence >= 0.7));
+
+      // Apply lifecycle cancellations detected in scan (mirrors Gmail scan behaviour).
+      if (cancellations.length) {
+        await Promise.allSettled(
+          cancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
+        );
+      }
 
       await saveScanMetadata(userId, {
         scannedMessages: scannedCount,

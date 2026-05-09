@@ -1,4 +1,4 @@
-export { cleanEmailHtml, extractAmount, extractMerchant } from "./services/emailParser.js";
+export { cleanEmailHtml, extractAmount, extractMerchant, extractRenewalDate } from "./services/emailParser.js";
 
 export async function listRecentMessages(accessToken) {
   const url =
@@ -47,25 +47,4 @@ export function extractText(payload) {
 }
 
 
-export function extractRenewalDate(text) {
-  const patterns = [
-    /starting from\s+(\d{1,2}\s+\w+\s+\d{4})/i,
-    /renews on\s+(\w+\s+\d{1,2},?\s+\d{4})/i,
-    /renews\s+(\w+\s+\d{1,2},?\s+\d{4})/i,
-    /next billing date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})/i,
-    /renewal date[:\s]+(\w+\s+\d{1,2},?\s+\d{4})/i,
-    /will renew on\s+(\w+\s+\d{1,2},?\s+\d{4})/i,
-    /automatically renews\s+(?:on\s+)?(\w+\s+\d{1,2},?\s+\d{4})/i,
-  ];
-
-  for (const p of patterns) {
-    const m = text.match(p);
-    if (m) {
-      const d = new Date(m[1]);
-      if (!isNaN(d.getTime())) return d;
-    }
-  }
-
-  return null;
-}
 

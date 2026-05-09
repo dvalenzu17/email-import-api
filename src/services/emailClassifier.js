@@ -52,7 +52,16 @@ export function classifyEmail(subject, body) {
     b.includes("subscription cancelled") ||
     b.includes("subscription canceled") ||
     b.includes("membership has been cancelled") ||
-    b.includes("membership has been canceled")
+    b.includes("membership has been canceled") ||
+    // Apple App Store — sent when user turns off auto-renew
+    b.includes("will not be renewed") ||
+    b.includes("will not renew") ||
+    b.includes("turned off auto-renew") ||
+    b.includes("auto-renewal has been turned off") ||
+    b.includes("subscription will expire") ||
+    b.includes("access will end on") ||
+    b.includes("access ends on") ||
+    /subscription.{0,10}expir/i.test(s)
   ) return EMAIL_TYPES.CANCELLATION;
 
   // ── Failed payment ────────────────────────────────────────────────────────
