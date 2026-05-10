@@ -7,6 +7,7 @@ const QUEUE_ENABLED = process.env.QUEUE_ENABLED === "true";
 const SCAN_RATE_LIMIT = {
   max: 3,
   timeWindow: "15 minutes",
+  statusCode: 429,
   keyGenerator: (req) => {
     try {
       const token = req.headers.authorization?.split(" ")[1];
@@ -16,7 +17,8 @@ const SCAN_RATE_LIMIT = {
       return req.ip;
     }
   },
-  errorResponseBuilder: () => ({
+  errorResponseBuilder: (req, context) => ({
+    statusCode: 429,
     error: "rate_limited",
     message: "Too many scans. Please wait 15 minutes before scanning again.",
   }),
@@ -78,6 +80,11 @@ export function registerScanRoutes(server) {
       }
       if (err.message === "circuit_open") {
         return reply.code(503).send({ error: "scan_paused", message: "Gmail API is rate limited. Try again shortly." });
+      }
+      // Token refresh failed — stored refresh token is invalid/revoked.
+      // Return a specific error so the frontend can prompt the user to reconnect.
+      if (err.message?.includes("TOKEN_REFRESH_FAILED")) {
+        return reply.code(401).send({ error: "gmail_auth_expired" });
       }
       req.log.error({ err }, "scan_error");
       return reply.code(500).send({ error: "scan_failed" });

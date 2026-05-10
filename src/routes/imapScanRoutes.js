@@ -30,7 +30,8 @@ const IMAP_RATE_LIMIT = {
       return decoded?.sub ?? req.ip;
     } catch { return req.ip; }
   },
-  errorResponseBuilder: () => ({ error: "rate_limited", message: "Too many scans. Please wait 15 minutes." }),
+  statusCode: 429,
+  errorResponseBuilder: (req, context) => ({ statusCode: 429, error: "rate_limited", message: "Too many scans. Please wait 15 minutes." }),
 };
 
 export function registerImapScanRoutes(server) {
