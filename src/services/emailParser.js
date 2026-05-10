@@ -165,6 +165,8 @@ export function extractMerchant(fromHeader, bodyText = "", subject = "") {
 function cleanAppleName(raw) {
   return raw
     .trim()
+    // Strip " - 1 Year Subscription" / " - 3 Month Plan" Apple receipt suffixes
+    .replace(/\s*-\s*\d+\s*(?:year|month|yr|mo)s?.*$/i, "")
     .replace(/\s+(annual|monthly|yearly|weekly|plan|subscription|premium|plus|pro|basic|standard|free\s+trial)$/i, "")
     .trim();
 }
@@ -220,11 +222,11 @@ function extractAppleAppName(text) {
     if (isValidAppleName(name)) return name;
   }
 
-  // Strategy 5: "App Name  1 Month Subscription" — Apple receipt table layout (no parens).
-  // Word-by-word matching (max 4 words) with negative lookahead to skip common header words
-  // (subscriptions, apple, receipt, from, your) that precede the actual app name.
+  // Strategy 5: "App Name  1 Month Subscription" or "App Name - 1 Year Subscription"
+  // Apple receipt table layout (no parens). Handles both "App Name 1 Month Subscription"
+  // and the more common "App Name - 1 Year Subscription" (dash separator).
   const beforeDuration = text.match(
-    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:-\s+)?(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
   );
   if (beforeDuration) {
     const name = cleanAppleName(beforeDuration[1]);
@@ -241,10 +243,10 @@ function extractAppleAppName(text) {
     if (isValidAppleName(name)) return name;
   }
 
-  // Strategy 7: "App Name  US$X.XX" — bare price anchor without /month (Apple receipt).
+  // Strategy 7: "App Name  US$X.XX" or "App Name - US$X.XX" — bare price anchor (Apple receipt).
   // Skips same common header words as strategy 5.
   const barePrice = text.match(
-    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+us\$[0-9]+\.[0-9]{2}/i
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:-\s+)?us\$[0-9]+\.[0-9]{2}/i
   );
   if (barePrice) {
     const name = cleanAppleName(barePrice[1]);
