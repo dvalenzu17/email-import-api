@@ -202,21 +202,23 @@ export function extractAppleAppNameFromHtml(html) {
     let found = null;
 
     // ── Strategy A: App Store icon alt text ─────────────────────────────────
-    // Apple receipt emails always embed the app icon served from mzstatic.com
-    // (Apple's App Store asset CDN). The img alt is always the exact app name.
-    // This is the most reliable extraction point — no HTML table parsing needed.
+    // Apple receipt emails embed the app icon from mzstatic.com (App Store CDN).
+    // Collect ALL mzstatic.com image alts so we can log them for debugging.
+    const mzAlts = [];
     $("img[alt]").each((_, el) => {
-      if (found) return false;
       const src = $(el).attr("src") || "";
       const alt = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
-      if (
-        src.includes("mzstatic.com") &&
-        alt.length > 1 && alt.length < 50 &&
-        !/^(apple|app store|apple logo|apple pay)$/i.test(alt)
-      ) {
-        found = alt;
-      }
+      if (src.includes("mzstatic.com") && alt.length > 0) mzAlts.push(alt);
     });
+    console.log(`[apple-html] mzstatic_alts=${JSON.stringify(mzAlts)}`);
+
+    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard)$/i;
+    for (const alt of mzAlts) {
+      if (alt.length > 1 && alt.length < 50 && !GENERIC_ALT.test(alt)) {
+        found = alt;
+        break;
+      }
+    }
     if (found) return found;
 
     // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0)

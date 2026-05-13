@@ -235,6 +235,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           }
         }
 
+        if (isAppleSender) {
+          console.log(`[apple-result] subject="${subject?.slice(0, 80)}" extracted="${appleAppName}"`);
+        }
+
         const merchant = appleAppName
           ? appleAppName.toLowerCase().trim()
           : extractMerchant(fromHeader, text, subject);
