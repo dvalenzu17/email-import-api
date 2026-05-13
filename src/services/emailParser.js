@@ -201,41 +201,68 @@ export function extractAppleAppNameFromHtml(html) {
     const $ = cheerio.load(html);
     let found = null;
 
-    // Look for a <td> whose exact text is "App" — next sibling is the name
-    $("td").each((_, el) => {
+    const LABEL_NAMES = ["app", "app:", "subscription", "subscription:"];
+
+    // Iterate every <tr>, collect its <td> texts, find "App" or "Subscription"
+    // label and grab the next non-empty cell — handles spacer <td>s Apple uses.
+    $("tr").each((_, row) => {
       if (found) return false;
-      const label = $(el).text().trim().toLowerCase();
-      if (label === "app") {
-        const value = $(el).next("td").text().trim();
-        if (value && value.length > 1 && value.length < 60) {
-          found = value;
-          return false;
+      const cells = $(row).find("td");
+      const texts = cells.map((_, c) => $(c).text().trim()).get();
+
+      for (let i = 0; i < texts.length; i++) {
+        const lbl = texts[i].toLowerCase();
+        if (lbl !== "app" && lbl !== "app:") continue;
+
+        // Scan forward for the first non-empty cell (skip spacers)
+        for (let j = i + 1; j < texts.length; j++) {
+          const val = texts[j];
+          if (val && val.length > 1 && val.length < 60) {
+            found = val;
+            return false;
+          }
         }
       }
     });
 
     if (found) return found;
 
-    // Fallback: "Subscription" cell — strip the plan duration suffix
-    $("td").each((_, el) => {
+    // Fallback: "Subscription" row — value cell, strip plan duration suffix
+    $("tr").each((_, row) => {
       if (found) return false;
-      const label = $(el).text().trim().toLowerCase();
-      if (label === "subscription") {
-        const raw = $(el).next("td").text().trim();
-        // "Paramount+ (1 month)" → "Paramount+"
-        // "SketchUp Go Monthly" → kept as-is
-        const cleaned = raw
-          .replace(/\s*\([^)]*\).*$/, "")
-          .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
-          .trim();
-        if (cleaned && cleaned.length > 1 && cleaned.length < 60) {
-          found = cleaned;
-          return false;
+      const cells = $(row).find("td");
+      const texts = cells.map((_, c) => $(c).text().trim()).get();
+
+      for (let i = 0; i < texts.length; i++) {
+        const lbl = texts[i].toLowerCase();
+        if (lbl !== "subscription" && lbl !== "subscription:") continue;
+
+        for (let j = i + 1; j < texts.length; j++) {
+          const raw = texts[j];
+          if (!raw || raw.length < 2) continue;
+          const cleaned = raw
+            .replace(/\s*\([^)]*\).*$/, "")          // strip "(1 month)..."
+            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
+            .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic).*$/i, "")
+            .trim();
+          if (cleaned && cleaned.length > 1 && cleaned.length < 60) {
+            found = cleaned;
+            return false;
+          }
         }
       }
     });
 
-    return found || null;
+    if (found) return found;
+
+    // Last resort: raw HTML regex — catches layouts cheerio misses.
+    // Looks for the "App" label cell text and grabs the adjacent value cell.
+    const rawMatch = html.match(
+      />\s*App\s*<\/td>(?:\s*<td[^>]*>(?:\s*(?:&nbsp;|\s)*)<\/td>)*\s*<td[^>]*>\s*([^<]{2,60}?)\s*<\//i
+    );
+    if (rawMatch) return rawMatch[1].trim();
+
+    return null;
   } catch {
     return null;
   }
