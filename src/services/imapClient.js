@@ -1,6 +1,6 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate } from "./emailParser.js";
+import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractAppleAppNameFromHtml } from "./emailParser.js";
 import { getBrandInfo } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
@@ -210,7 +210,17 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const amount = extractAmount(text);
         if (!amount) continue;
 
-        const merchant = extractMerchant(fromHeader, text, subject);
+        // For Apple IAP emails parse the app name from raw HTML table cells —
+        // the cleaned-text strategies are confused by Apple's repeated app name
+        // across multiple table rows (icon alt, App row, Subscription row).
+        const isAppleSender = fromHeader.toLowerCase().includes("apple.com");
+        const appleAppName = isAppleSender && parsed.html
+          ? extractAppleAppNameFromHtml(parsed.html)
+          : null;
+
+        const merchant = appleAppName
+          ? appleAppName.toLowerCase().trim()
+          : extractMerchant(fromHeader, text, subject);
         if (merchant === "unknown") continue;
 
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();

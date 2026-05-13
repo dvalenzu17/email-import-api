@@ -187,6 +187,60 @@ function isValidAppleName(name) {
   );
 }
 
+/**
+ * Parses the app name directly from Apple IAP receipt HTML using the table
+ * cell structure. Far more reliable than regex on cleaned text because it
+ * targets the specific <td> labels Apple always uses.
+ *
+ * Apple receipt tables always have a "App" label cell whose next sibling is
+ * the app name. Falls back to the "Subscription" cell (strips the plan suffix).
+ */
+export function extractAppleAppNameFromHtml(html) {
+  if (!html) return null;
+  try {
+    const $ = cheerio.load(html);
+    let found = null;
+
+    // Look for a <td> whose exact text is "App" — next sibling is the name
+    $("td").each((_, el) => {
+      if (found) return false;
+      const label = $(el).text().trim().toLowerCase();
+      if (label === "app") {
+        const value = $(el).next("td").text().trim();
+        if (value && value.length > 1 && value.length < 60) {
+          found = value;
+          return false;
+        }
+      }
+    });
+
+    if (found) return found;
+
+    // Fallback: "Subscription" cell — strip the plan duration suffix
+    $("td").each((_, el) => {
+      if (found) return false;
+      const label = $(el).text().trim().toLowerCase();
+      if (label === "subscription") {
+        const raw = $(el).next("td").text().trim();
+        // "Paramount+ (1 month)" → "Paramount+"
+        // "SketchUp Go Monthly" → kept as-is
+        const cleaned = raw
+          .replace(/\s*\([^)]*\).*$/, "")
+          .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
+          .trim();
+        if (cleaned && cleaned.length > 1 && cleaned.length < 60) {
+          found = cleaned;
+          return false;
+        }
+      }
+    });
+
+    return found || null;
+  } catch {
+    return null;
+  }
+}
+
 function extractAppleAppName(text) {
   // Strategy 0: Apple receipt table — "Subscription [Name] Content Provider" or
   // "Subscription [Name] Renewal Price" or "Subscription [Name] Date of Purchase".
