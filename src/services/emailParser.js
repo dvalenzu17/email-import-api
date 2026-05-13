@@ -201,7 +201,23 @@ export function extractAppleAppNameFromHtml(html) {
     const $ = cheerio.load(html);
     let found = null;
 
-    const LABEL_NAMES = ["app", "app:", "subscription", "subscription:"];
+    // ── Strategy A: App Store icon alt text ─────────────────────────────────
+    // Apple receipt emails always embed the app icon served from mzstatic.com
+    // (Apple's App Store asset CDN). The img alt is always the exact app name.
+    // This is the most reliable extraction point — no HTML table parsing needed.
+    $("img[alt]").each((_, el) => {
+      if (found) return false;
+      const src = $(el).attr("src") || "";
+      const alt = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
+      if (
+        src.includes("mzstatic.com") &&
+        alt.length > 1 && alt.length < 50 &&
+        !/^(apple|app store|apple logo|apple pay)$/i.test(alt)
+      ) {
+        found = alt;
+      }
+    });
+    if (found) return found;
 
     // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0)
     // Apple pads label cells with &nbsp;, which `.trim()` does NOT remove.
@@ -209,8 +225,7 @@ export function extractAppleAppNameFromHtml(html) {
       return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
     }
 
-    // Iterate every <tr>, collect its <td> texts, find "App" label
-    // and grab the next non-empty value cell — skips spacer <td>s Apple uses.
+    // ── Strategy B: "App" label row traversal ───────────────────────────────
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
