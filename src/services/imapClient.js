@@ -6,6 +6,7 @@ import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
 
 const IMAP_CONFIGS = {
+  gmail:   { host: "imap.gmail.com",           port: 993, secure: true },
   yahoo:   { host: "imap.mail.yahoo.com",      port: 993, secure: true },
   outlook: { host: "outlook.office365.com",    port: 993, secure: true },
   icloud:  { host: "imap.mail.me.com",         port: 993, secure: true },
