@@ -33,6 +33,27 @@ const IMAP_KNOWN_DOMAINS = new Set([
   "uber.com",
 ]);
 
+// Extract billing interval from email text.
+function extractBillingInterval(text) {
+  const t = text.toLowerCase();
+  if (/\b(annual|annually|yearly|year|1[- ]year|12[- ]month)\b/.test(t)) return "yearly";
+  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))       return "semiannual";
+  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))                    return "quarterly";
+  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t)) return "biweekly";
+  if (/\b(weekly|per week|every week)\b/.test(t))                          return "weekly";
+  if (/\b(monthly|per month|\/month|month[- ]to[- ]month)\b/.test(t))      return "monthly";
+  return null;
+}
+
+// Extract primary sender domain (e.g. "apple.com" from "noreply@email.apple.com").
+function extractSenderDomain(fromHeader) {
+  const match = fromHeader.match(/@([\w.-]+\.\w+)/);
+  if (!match) return null;
+  // Return the last two parts: email.apple.com → apple.com
+  const parts = match[1].split(".");
+  return parts.length >= 2 ? parts.slice(-2).join(".") : match[1];
+}
+
 export function getImapConfig(provider) {
   const config = IMAP_CONFIGS[provider];
   if (!config) throw new Error(`unsupported_provider: ${provider}`);
@@ -231,11 +252,13 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
             if (cancelAmount) {
               const cancelDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
               cancelledCharges.push({
-                merchant:      cancelMerchant,
-                renewalAmount: cancelAmount,
-                currency:      extractCurrencyCode(text),
-                renewalDate:   extractRenewalDate(text),
-                date:          cancelDate,
+                merchant:        cancelMerchant,
+                renewalAmount:   cancelAmount,
+                currency:        extractCurrencyCode(text),
+                renewalDate:     extractRenewalDate(text),
+                billingInterval: extractBillingInterval(text),
+                senderDomain:    extractSenderDomain(fromHeader),
+                date:            cancelDate,
               });
             }
           }
@@ -315,6 +338,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         if (text.includes("billing"))                    intentScore += 1;
 
         const renewalDate = extractRenewalDate(text);
+        const billingInterval = extractBillingInterval(text);
+        const senderDomain = extractSenderDomain(fromHeader);
 
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
@@ -324,6 +349,9 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           currency: extractCurrencyCode(text),
           date,
           renewalDate,
+          billingInterval,
+          senderDomain,
+          isAppleIAP: isAppleSender,
           subscriptionIntent: intentScore >= 2,
         });
       } catch {

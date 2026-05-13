@@ -269,9 +269,10 @@ export function extractAppleAppNameFromHtml(html) {
             .replace(/\s*\([^)]*\).*$/, "")
             .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
             .replace(/\s+-\s+.+$/, "")
-            .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic).*$/i, "")
+            .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic|career|elite|essential|standard|lite).*$/i, "")
             .trim();
-          if (cleaned && cleaned.length > 1 && cleaned.length < 36) {
+          const GENERIC_NAMES = new Set(["premium", "pro", "plus", "basic", "standard", "lite", "free", "subscription", "plan", "elite", "essential"]);
+          if (cleaned && cleaned.length > 1 && cleaned.length < 36 && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
             found = cleaned;
             return false;
           }

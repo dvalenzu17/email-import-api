@@ -108,13 +108,58 @@ export function registerImapScanRoutes(server) {
 
       const feedbackMap = await getFeedbackMerchantMap(userId);
 
-      const allSubscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => ({
-        ...s,
-        source: provider,
-      }));
+      // Build a lookup of raw charge data keyed by merchant for post-detection enrichment.
+      // When multiple charges exist for the same merchant, prefer yearly over monthly (more specific).
+      const chargeDataMap = {};
+      for (const c of charges) {
+        const key = c.merchant.toLowerCase();
+        const prev = chargeDataMap[key];
+        if (!prev || (c.billingInterval === "yearly" && prev.billingInterval !== "yearly")) {
+          chargeDataMap[key] = c;
+        }
+      }
+
+      const allSubscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => {
+        const raw = chargeDataMap[s.merchant.toLowerCase()];
+        return {
+          ...s,
+          source: provider,
+          // Override billingInterval if the engine returned null/unknown and we extracted one from the email.
+          billingInterval: s.billingInterval && s.billingInterval !== "unknown"
+            ? s.billingInterval
+            : (raw?.billingInterval ?? s.billingInterval),
+          senderDomain: raw?.senderDomain ?? null,
+        };
+      });
       const confident = allSubscriptions.filter((s) => s.confidence >= 0.7);
 
-      await batchUpsertSubscriptions(userId, confident);
+      // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
+      // engine didn't detect them (insufficient recurrence data), add them manually
+      // with a moderate confidence so they appear in the review candidates page.
+      const detectedMerchants = new Set(allSubscriptions.map((s) => s.merchant.toLowerCase()));
+      const appleBypass = [];
+      const appleBypassSeen = new Set();
+      for (const c of charges) {
+        if (!c.isAppleIAP) continue;
+        const key = c.merchant.toLowerCase();
+        if (detectedMerchants.has(key)) continue;
+        if (appleBypassSeen.has(key)) continue;
+        appleBypassSeen.add(key);
+        appleBypass.push({
+          merchant:        c.merchant,
+          amount:          c.amount,
+          currency:        c.currency,
+          billingInterval: c.billingInterval ?? "monthly",
+          renewalDate:     c.renewalDate ?? null,
+          confidence:      0.75,
+          isActive:        true,
+          isSuggested:     true,
+          source:          provider,
+          senderDomain:    c.senderDomain ?? null,
+        });
+      }
+
+      await batchUpsertSubscriptions(userId, [...confident, ...appleBypass]);
 
       // Upsert + collect cancelled subscriptions from expiry/cancellation emails.
       // These appear in the scan review as candidates (with mayBeCancelled flag)
@@ -132,7 +177,8 @@ export function registerImapScanRoutes(server) {
             renewalAmount:   c.renewalAmount,
             currency:        c.currency,
             renewalDate:     c.renewalDate ?? null,
-            billingInterval: null,
+            billingInterval: c.billingInterval ?? null,
+            senderDomain:    c.senderDomain ?? null,
             confidence:      0.6,
             isActive:        false,
             isSuggested:     true,
@@ -156,10 +202,10 @@ export function registerImapScanRoutes(server) {
 
       return {
         success: true,
-        // Return active + cancelled subscriptions for the review/candidates page.
+        // Return active + cancelled + Apple IAP bypass subscriptions for the review/candidates page.
         // The frontend shows all of these as candidates requiring user confirmation.
-        subscriptions: [...confident, ...cancelledForReview],
-        detectedSubscriptions: confident.length,
+        subscriptions: [...confident, ...cancelledForReview, ...appleBypass],
+        detectedSubscriptions: confident.length + appleBypass.length,
         meta: {
           scannedMessages: scannedCount,
           detectedCharges: charges.length,
