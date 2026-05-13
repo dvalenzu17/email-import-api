@@ -200,6 +200,10 @@ export function extractAppleAppNameFromHtml(html) {
   try {
     const $ = cheerio.load(html);
     let found = null;
+    // Holds a stripped App Store name when the full value had a subtitle colon
+    // (e.g. "LinkedIn: Job Search & News" → strategyAFallback = "LinkedIn").
+    // Strategy B may override this with a richer name like "LinkedIn Premium".
+    let strategyAFallback = null;
 
     // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0).
     // Apple pads label cells with &nbsp;, which standard .trim() does NOT strip.
@@ -209,9 +213,11 @@ export function extractAppleAppNameFromHtml(html) {
 
     // ── Strategy A: "App" label row traversal (primary) ─────────────────────
     // Apple IAP receipts have a table row with an "App" label cell whose next
-    // non-empty sibling cell contains the exact app name. Prefer this over CDN
-    // image alts because image alts often carry the subscription TIER name
-    // ("Premium Career", "Couple Joy Premium") rather than the app name.
+    // non-empty sibling cell contains the exact app name.
+    // When the App Store name includes a subtitle colon ("LinkedIn: Job Search & News"),
+    // we strip the subtitle and save it as a fallback rather than returning immediately,
+    // because Strategy B (img alt) may yield a richer name that includes the plan tier
+    // (e.g. "LinkedIn Premium" from the subscription product image).
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
@@ -223,10 +229,15 @@ export function extractAppleAppNameFromHtml(html) {
 
         for (let j = i + 1; j < texts.length; j++) {
           const val = texts[j];
-          if (val && val.length > 1 && val.length < 60) {
+          if (!val || val.length <= 1 || val.length >= 60) continue;
+          // App Store subtitle format: "AppName: Tagline" — strip the subtitle.
+          // Don't return immediately; let Strategy B try for a plan-qualified name.
+          if (/:\s+/.test(val)) {
+            strategyAFallback = val.replace(/\s*:\s+.+$/, "").trim();
+          } else {
             found = val;
-            return false;
           }
+          return false;
         }
       }
     });
@@ -238,7 +249,8 @@ export function extractAppleAppNameFromHtml(html) {
     // images carry the subscription product name. Strip common tier suffixes so
     // "Couple Joy Premium" → "Couple Joy", "Liftoff Pro" → "Liftoff".
     const TIER_SUFFIX = /\s+(premium|pro|plus|essential|career|basic|standard|lite)$/i;
-    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly)$/i;
+    // Generic single-word plan/tier names that are not app names on their own.
+    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free)$/i;
     $("img[alt]").each((_, el) => {
       if (found) return false;
       const src = $(el).attr("src") || "";
@@ -288,7 +300,8 @@ export function extractAppleAppNameFromHtml(html) {
     );
     if (rawMatch) return rawMatch[1].trim();
 
-    return null;
+    // Fall back to the stripped Strategy A subtitle name if nothing else matched.
+    return strategyAFallback ?? null;
   } catch {
     return null;
   }

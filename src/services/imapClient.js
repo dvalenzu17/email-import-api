@@ -34,14 +34,17 @@ const IMAP_KNOWN_DOMAINS = new Set([
 ]);
 
 // Extract billing interval from email text.
+// NOTE: bare "year" is intentionally excluded — it matches too many non-billing
+// contexts (e.g. "last year", "this year", "10 years ago"). Only explicit billing
+// phrases like "annual", "per year", "/year", or "1-year" are treated as yearly.
 function extractBillingInterval(text) {
   const t = text.toLowerCase();
-  if (/\b(annual|annually|yearly|year|1[- ]year|12[- ]month)\b/.test(t)) return "yearly";
-  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))       return "semiannual";
-  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))                    return "quarterly";
-  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t)) return "biweekly";
-  if (/\b(weekly|per week|every week)\b/.test(t))                          return "weekly";
-  if (/\b(monthly|per month|\/month|month[- ]to[- ]month)\b/.test(t))      return "monthly";
+  if (/\b(annual|annually|yearly|per year|\/year|each year|every year|\bone[- ]?year\b|\b1[- ]?year\b|\b12[- ]?month)\b/.test(t)) return "yearly";
+  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))                                                               return "semiannual";
+  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))                                                                           return "quarterly";
+  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t))                                                       return "biweekly";
+  if (/\b(weekly|per week|every week)\b/.test(t))                                                                                 return "weekly";
+  if (/\b(monthly|per month|\/month|month[- ]to[- ]month)\b/.test(t))                                                            return "monthly";
   return null;
 }
 
@@ -339,7 +342,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 
         const renewalDate = extractRenewalDate(text);
         const billingInterval = extractBillingInterval(text);
-        const senderDomain = extractSenderDomain(fromHeader);
+        // For Apple IAP emails the sender domain is always apple.com, which would
+        // cause BrandAvatar to show the Apple logo for every app. Leave it null so
+        // the brand resolver falls back to the merchant name instead.
+        const senderDomain = isAppleSender ? null : extractSenderDomain(fromHeader);
 
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
