@@ -235,8 +235,18 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           }
         }
 
-        if (isAppleSender) {
-          console.log(`[apple-result] subject="${subject?.slice(0, 80)}" extracted="${appleAppName}"`);
+        // For Apple emails where we couldn't identify the specific app/service,
+        // require a subscription signal in the body text before processing.
+        // This filters out one-time purchase receipts, order confirmations,
+        // hardware invoices, and marketing emails that slip through.
+        if (isAppleSender && !appleAppName) {
+          const hasSubSignal =
+            text.includes("subscription") ||
+            text.includes("renewal") ||
+            text.includes("automatically renew") ||
+            text.includes("next billing") ||
+            text.includes("suscripci");  // Spanish "suscripción"
+          if (!hasSubSignal) continue;
         }
 
         const merchant = appleAppName

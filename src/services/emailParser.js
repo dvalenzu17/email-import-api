@@ -201,33 +201,17 @@ export function extractAppleAppNameFromHtml(html) {
     const $ = cheerio.load(html);
     let found = null;
 
-    // ── Strategy A: App Store icon alt text ─────────────────────────────────
-    // Apple receipt emails embed the app icon from mzstatic.com (App Store CDN).
-    // Collect ALL mzstatic.com image alts so we can log them for debugging.
-    const mzAlts = [];
-    $("img[alt]").each((_, el) => {
-      const src = $(el).attr("src") || "";
-      const alt = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
-      if (src.includes("mzstatic.com") && alt.length > 0) mzAlts.push(alt);
-    });
-    console.log(`[apple-html] mzstatic_alts=${JSON.stringify(mzAlts)}`);
-
-    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard)$/i;
-    for (const alt of mzAlts) {
-      if (alt.length > 1 && alt.length < 50 && !GENERIC_ALT.test(alt)) {
-        found = alt;
-        break;
-      }
-    }
-    if (found) return found;
-
-    // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0)
-    // Apple pads label cells with &nbsp;, which `.trim()` does NOT remove.
+    // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0).
+    // Apple pads label cells with &nbsp;, which standard .trim() does NOT strip.
     function cellText(el) {
       return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
     }
 
-    // ── Strategy B: "App" label row traversal ───────────────────────────────
+    // ── Strategy A: "App" label row traversal (primary) ─────────────────────
+    // Apple IAP receipts have a table row with an "App" label cell whose next
+    // non-empty sibling cell contains the exact app name. Prefer this over CDN
+    // image alts because image alts often carry the subscription TIER name
+    // ("Premium Career", "Couple Joy Premium") rather than the app name.
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
@@ -237,10 +221,9 @@ export function extractAppleAppNameFromHtml(html) {
         const lbl = texts[i].toLowerCase();
         if (lbl !== "app" && lbl !== "app:") continue;
 
-        // Scan forward for the first non-empty cell (skip spacers)
         for (let j = i + 1; j < texts.length; j++) {
           const val = texts[j];
-          if (val && val.length > 1 && val.length < 50) {
+          if (val && val.length > 1 && val.length < 60) {
             found = val;
             return false;
           }
@@ -250,9 +233,26 @@ export function extractAppleAppNameFromHtml(html) {
 
     if (found) return found;
 
-    // Fallback: "Subscription" row — value cell, strip plan duration + description suffix.
-    // Apple subscription names often look like "App Name - Plan Description (1 year)".
-    // Take only the part before " - " and strip trailing plan words.
+    // ── Strategy B: mzstatic.com img alt (fallback) ─────────────────────────
+    // When the "App" row is absent (e.g. renewal notices), Apple's App Store CDN
+    // images carry the subscription product name. Strip common tier suffixes so
+    // "Couple Joy Premium" → "Couple Joy", "Liftoff Pro" → "Liftoff".
+    const TIER_SUFFIX = /\s+(premium|pro|plus|essential|career|basic|standard|lite)$/i;
+    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly)$/i;
+    $("img[alt]").each((_, el) => {
+      if (found) return false;
+      const src = $(el).attr("src") || "";
+      const raw = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
+      if (!src.includes("mzstatic.com") || raw.length < 2 || raw.length > 60) return;
+      if (GENERIC_ALT.test(raw)) return;
+      const alt = raw.replace(TIER_SUFFIX, "").trim();
+      if (alt.length > 1) found = alt;
+    });
+
+    if (found) return found;
+
+    // ── Strategy C: "Subscription" label row (last resort) ──────────────────
+    // Value cell strips plan duration + description suffix.
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
@@ -266,12 +266,11 @@ export function extractAppleAppNameFromHtml(html) {
           const raw = texts[j];
           if (!raw || raw.length < 2) continue;
           const cleaned = raw
-            .replace(/\s*\([^)]*\).*$/, "")          // strip "(1 month)..."
-            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")  // "- 1 Year..."
-            .replace(/\s+-\s+.+$/, "")               // strip " - Plan/Description suffix"
+            .replace(/\s*\([^)]*\).*$/, "")
+            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
+            .replace(/\s+-\s+.+$/, "")
             .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic).*$/i, "")
             .trim();
-          // Keep stricter length limit for Subscription row (app names rarely exceed 35 chars)
           if (cleaned && cleaned.length > 1 && cleaned.length < 36) {
             found = cleaned;
             return false;
@@ -282,8 +281,7 @@ export function extractAppleAppNameFromHtml(html) {
 
     if (found) return found;
 
-    // Last resort: raw HTML regex — catches layouts cheerio misses.
-    // Looks for the "App" label cell text and grabs the adjacent value cell.
+    // ── Strategy D: raw HTML regex ───────────────────────────────────────────
     const rawMatch = html.match(
       />\s*App\s*<\/td>(?:\s*<td[^>]*>(?:\s*(?:&nbsp;|\s)*)<\/td>)*\s*<td[^>]*>\s*([^<]{2,60}?)\s*<\//i
     );
