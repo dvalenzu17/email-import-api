@@ -181,11 +181,24 @@ function isValidAppleName(name) {
   return (
     name.length > 2 &&
     name.length <= 60 &&
-    !APPLE_NAME_BLOCKLIST.has(name.toLowerCase())
+    !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
+    !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
+    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at)\s/i.test(name)
   );
 }
 
 function extractAppleAppName(text) {
+  // Strategy 0: Apple receipt table — "Subscription [Name] Content Provider" or
+  // "Subscription [Name] Renewal Price" or "Subscription [Name] Date of Purchase".
+  // This is the most direct read of the structured Apple IAP email table.
+  const receiptTable = text.match(
+    /\bsubscription\s+([a-z0-9][a-z0-9\s\-\+\!\:\&]{2,40}?)\s+(?:content provider|renewal price|date of purchase|\([0-9])/i
+  );
+  if (receiptTable) {
+    const name = cleanAppleName(receiptTable[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
   // Strategy 1: "App Name (1 year)" or "App Name Premium (1 month)" — most reliable
   const durationMatch = text.match(
     /([a-z0-9][a-z0-9\s\-\+\:\&]{2,55}?)\s+\([0-9]+\s+(?:year|month|yr|mo)s?\)/i

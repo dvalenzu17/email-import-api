@@ -111,7 +111,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     const allUids = await client.search({ since }, { uid: true });
     if (!allUids.length) return { charges, scannedCount };
 
-    const uids = allUids.slice(-500);
+    const uids = allUids.slice(-1500);
 
     // Pass 1 — envelopes only, UID mode
     const relevant = [];
