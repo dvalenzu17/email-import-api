@@ -203,12 +203,18 @@ export function extractAppleAppNameFromHtml(html) {
 
     const LABEL_NAMES = ["app", "app:", "subscription", "subscription:"];
 
-    // Iterate every <tr>, collect its <td> texts, find "App" or "Subscription"
-    // label and grab the next non-empty cell — handles spacer <td>s Apple uses.
+    // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0)
+    // Apple pads label cells with &nbsp;, which `.trim()` does NOT remove.
+    function cellText(el) {
+      return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
+    }
+
+    // Iterate every <tr>, collect its <td> texts, find "App" label
+    // and grab the next non-empty value cell — skips spacer <td>s Apple uses.
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
-      const texts = cells.map((_, c) => $(c).text().trim()).get();
+      const texts = cells.map((_, c) => cellText(c)).get();
 
       for (let i = 0; i < texts.length; i++) {
         const lbl = texts[i].toLowerCase();
@@ -217,7 +223,7 @@ export function extractAppleAppNameFromHtml(html) {
         // Scan forward for the first non-empty cell (skip spacers)
         for (let j = i + 1; j < texts.length; j++) {
           const val = texts[j];
-          if (val && val.length > 1 && val.length < 60) {
+          if (val && val.length > 1 && val.length < 50) {
             found = val;
             return false;
           }
@@ -227,11 +233,13 @@ export function extractAppleAppNameFromHtml(html) {
 
     if (found) return found;
 
-    // Fallback: "Subscription" row — value cell, strip plan duration suffix
+    // Fallback: "Subscription" row — value cell, strip plan duration + description suffix.
+    // Apple subscription names often look like "App Name - Plan Description (1 year)".
+    // Take only the part before " - " and strip trailing plan words.
     $("tr").each((_, row) => {
       if (found) return false;
       const cells = $(row).find("td");
-      const texts = cells.map((_, c) => $(c).text().trim()).get();
+      const texts = cells.map((_, c) => cellText(c)).get();
 
       for (let i = 0; i < texts.length; i++) {
         const lbl = texts[i].toLowerCase();
@@ -242,10 +250,12 @@ export function extractAppleAppNameFromHtml(html) {
           if (!raw || raw.length < 2) continue;
           const cleaned = raw
             .replace(/\s*\([^)]*\).*$/, "")          // strip "(1 month)..."
-            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
+            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")  // "- 1 Year..."
+            .replace(/\s+-\s+.+$/, "")               // strip " - Plan/Description suffix"
             .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic).*$/i, "")
             .trim();
-          if (cleaned && cleaned.length > 1 && cleaned.length < 60) {
+          // Keep stricter length limit for Subscription row (app names rarely exceed 35 chars)
+          if (cleaned && cleaned.length > 1 && cleaned.length < 36) {
             found = cleaned;
             return false;
           }

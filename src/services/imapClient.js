@@ -214,9 +214,26 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // the cleaned-text strategies are confused by Apple's repeated app name
         // across multiple table rows (icon alt, App row, Subscription row).
         const isAppleSender = fromHeader.toLowerCase().includes("apple.com");
-        const appleAppName = isAppleSender && parsed.html
+        let appleAppName = isAppleSender && parsed.html
           ? extractAppleAppNameFromHtml(parsed.html)
           : null;
+
+        // Subject-based fallback for Apple emails where HTML extraction fails.
+        // Apple subjects often embed the app name:
+        //   "Your SketchUp Go receipt from Apple."
+        //   "Your Paramount+ Essential subscription is expiring."
+        //   "Your subscription to Couple Joy has been confirmed."
+        if (!appleAppName && isAppleSender && subject) {
+          const sub = subject.trim();
+          const m1 = sub.match(/^Your\s+(.+?)\s+receipt(?:\s+from\s+Apple)?\.?$/i);
+          const m2 = sub.match(/^Your\s+(.+?)\s+subscription\b/i);
+          const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
+          const rawName = (m1 || m2 || m3)?.[1]?.trim();
+          if (rawName && rawName.length > 1 && rawName.length < 50 &&
+              !/^(apple|receipt|invoice|payment|free|trial)$/i.test(rawName)) {
+            appleAppName = rawName;
+          }
+        }
 
         const merchant = appleAppName
           ? appleAppName.toLowerCase().trim()
