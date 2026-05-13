@@ -29,6 +29,7 @@ const IMAP_KNOWN_DOMAINS = new Set([
   "calm.com", "peloton.com", "substack.com", "patreon.com",
   "medium.com", "crunchyroll.com", "twitch.tv", "audible.com",
   "vercel.com", "netlify.com", "airtable.com", "hubspot.com",
+  "uber.com",
 ]);
 
 export function getImapConfig(provider) {
