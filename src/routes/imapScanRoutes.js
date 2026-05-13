@@ -2,7 +2,7 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { batchUpsertSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant } from "../db/index.js";
+import { batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
 
 const PROVIDERS = ["gmail", "yahoo", "outlook", "icloud"];
@@ -100,7 +100,7 @@ export function registerImapScanRoutes(server) {
     const started = Date.now();
 
     try {
-      const { charges, cancellations, scannedCount } = await scanImapInbox({
+      const { charges, cancellations, cancelledCharges, scannedCount } = await scanImapInbox({
         provider, user, pass, daysBack,
       });
 
@@ -115,6 +115,18 @@ export function registerImapScanRoutes(server) {
       const confident = allSubscriptions.filter((s) => s.confidence >= 0.7);
 
       await batchUpsertSubscriptions(userId, confident);
+
+      // Upsert subscriptions from cancellation/expiry emails as inactive.
+      // Skip any merchant already saved as active in this scan to avoid overriding.
+      if (cancelledCharges.length) {
+        const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
+        const newlyCancelled = cancelledCharges
+          .filter((c) => !activeMerchants.has(c.merchant.toLowerCase()))
+          .map((c) => ({ ...c, source: provider }));
+        if (newlyCancelled.length) {
+          await upsertCancelledSubscriptions(userId, newlyCancelled);
+        }
+      }
 
       // Apply lifecycle cancellations detected in scan (mirrors Gmail scan behaviour).
       if (cancellations.length) {

@@ -99,6 +99,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 
   const charges = [];
   const cancellations = [];
+  const cancelledCharges = []; // subscriptions detected from cancellation/expiry emails
   let scannedCount = 0;
 
   try {
@@ -109,7 +110,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 
     // Use UID search explicitly
     const allUids = await client.search({ since }, { uid: true });
-    if (!allUids.length) return { charges, scannedCount };
+    if (!allUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
 
     const uids = allUids.slice(-1500);
 
@@ -149,7 +150,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
       }
     }
 
-    if (!relevant.length) return { charges, scannedCount };
+    if (!relevant.length) return { charges, cancellations, cancelledCharges, scannedCount };
 
     const relevantUids = relevant.map((r) => r.uid);
     const envelopeMap = Object.fromEntries(
@@ -199,12 +200,46 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // inactive even if we also have a charge email for it. This mirrors the
         // Gmail scan's lifecycle handling.
         const emailType = classifyEmail(subject, text);
-        if (emailType === EMAIL_TYPES.CANCELLATION || emailType === EMAIL_TYPES.FAILED_PAYMENT) {
-          if (emailType === EMAIL_TYPES.CANCELLATION) {
-            const merchant = extractMerchant(fromHeader, text, subject);
-            if (merchant && merchant !== "unknown") cancellations.push(merchant);
+        if (emailType === EMAIL_TYPES.FAILED_PAYMENT) {
+          continue; // payment failed — not a successful charge
+        }
+        if (emailType === EMAIL_TYPES.CANCELLATION) {
+          // Extract the app/merchant and amount so we can save it as an inactive
+          // subscription — important for Apple "Your Subscription is Expiring" emails
+          // where the subscription may not have been seen before (first iCloud scan).
+          const isAppleSenderC = fromHeader.toLowerCase().includes("apple.com");
+          let appleAppNameC = isAppleSenderC && parsed.html
+            ? extractAppleAppNameFromHtml(parsed.html)
+            : null;
+          if (!appleAppNameC && isAppleSenderC && subject) {
+            const sub = subject.trim();
+            const m1 = sub.match(/^Your\s+(.+?)\s+receipt(?:\s+from\s+Apple)?\.?$/i);
+            const m2 = sub.match(/^Your\s+(.+?)\s+subscription\b/i);
+            const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
+            const rawName = (m1 || m2 || m3)?.[1]?.trim();
+            if (rawName && rawName.length > 1 && rawName.length < 50 &&
+                !/^(apple|receipt|invoice|payment|free|trial|subscription)$/i.test(rawName)) {
+              appleAppNameC = rawName;
+            }
           }
-          continue; // not a charge
+          const cancelMerchant = appleAppNameC
+            ? appleAppNameC.toLowerCase().trim()
+            : extractMerchant(fromHeader, text, subject);
+          if (cancelMerchant && cancelMerchant !== "unknown") {
+            cancellations.push(cancelMerchant);
+            const cancelAmount = extractAmount(text);
+            if (cancelAmount) {
+              const cancelDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
+              cancelledCharges.push({
+                merchant:      cancelMerchant,
+                renewalAmount: cancelAmount,
+                currency:      extractCurrencyCode(text),
+                renewalDate:   extractRenewalDate(text),
+                date:          cancelDate,
+              });
+            }
+          }
+          continue; // not a successful charge
         }
 
         const amount = extractAmount(text);
@@ -305,7 +340,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     try { await client.logout(); } catch { /* connection may already be closed */ }
   }
 
-  return { charges, cancellations, scannedCount };
+  return { charges, cancellations, cancelledCharges, scannedCount };
 }
 
 function normaliseImapError(err) {

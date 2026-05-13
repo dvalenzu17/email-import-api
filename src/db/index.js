@@ -375,6 +375,56 @@ export async function getAdminUsersData() {
 // -------------------------
 
 /**
+ * Upserts subscriptions detected from cancellation/expiry emails.
+ * Saves them with is_active = false so they appear in the UI as cancelled.
+ * On conflict: updates amount/currency but never sets is_active = true.
+ * Skips merchants already saved as active in the same scan (caller filters these out).
+ *
+ * @param {string} userId
+ * @param {Array<{ merchant, renewalAmount, currency, renewalDate, source }>} subscriptions
+ */
+export async function upsertCancelledSubscriptions(userId, subscriptions) {
+  if (!subscriptions.length) return;
+  try {
+    await pool.query(
+      `INSERT INTO subscriptions
+         (user_id, merchant, renewal_amount, currency, renewal_date,
+          confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+       SELECT * FROM unnest(
+         $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::timestamptz[],
+         $6::numeric[], $7::boolean[], $8::boolean[], $9::text[], $10::text[],
+         $11::timestamptz[]
+       ) AS t(user_id, merchant, renewal_amount, currency, renewal_date,
+              confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+       ON CONFLICT (user_id, merchant) DO UPDATE SET
+         renewal_amount = EXCLUDED.renewal_amount,
+         currency       = EXCLUDED.currency,
+         last_seen_at   = EXCLUDED.last_seen_at,
+         is_active      = CASE
+           WHEN subscriptions.user_status = 'confirmed' THEN true
+           ELSE false
+         END,
+         updated_at     = NOW()`,
+      [
+        subscriptions.map(() => userId),
+        subscriptions.map((s) => s.merchant),
+        subscriptions.map((s) => s.renewalAmount),
+        subscriptions.map((s) => s.currency),
+        subscriptions.map((s) => s.renewalDate ?? null),
+        subscriptions.map(() => 0.6),
+        subscriptions.map(() => false),
+        subscriptions.map(() => true),
+        subscriptions.map((s) => s.source),
+        subscriptions.map(() => null),
+        subscriptions.map(() => new Date()),
+      ]
+    );
+  } catch (err) {
+    throw new Error(`db_upsert_cancelled_subscriptions_failed: ${err.message}`);
+  }
+}
+
+/**
  * Marks a subscription as cancelled by merchant name.
  * Only updates rows that haven't been manually set to 'confirmed' by the user.
  * Used when the scan detects a cancellation email for a known merchant.

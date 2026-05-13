@@ -19,9 +19,9 @@ import {
   extractMerchant,
   cleanEmailHtml,
 } from "../gmailClient.js";
-import { extractCurrencyCode } from "./emailParser.js";
+import { extractCurrencyCode, extractAppleAppNameFromHtml } from "./emailParser.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
-import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens, cancelSubscriptionByMerchant, getFeedbackMerchantMap } from "../db/index.js";
+import { getOAuthToken, batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveOAuthTokens, cancelSubscriptionByMerchant, getFeedbackMerchantMap } from "../db/index.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { decryptCredential } from "./crypto.js";
 import { refreshAccessToken } from "../googleOAuth.js";
@@ -185,6 +185,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // ── Step 5: Extract charges ───────────────────────────────────────────────
   const charges = [];
   const cancellations = []; // merchants whose cancellation emails were detected
+  const cancelledCharges = []; // subscriptions detected from cancellation/expiry emails
 
   // Diagnostic counters — returned alongside scan results for visibility.
   let filtered_no_payload = 0, filtered_no_text = 0, filtered_negative = 0,
@@ -207,17 +208,49 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     // ── Email type classification ───────────────────────────────────────────
     const emailType = classifyEmail(subject, text);
 
-    if (emailType === EMAIL_TYPES.CANCELLATION) {
-      // Extract which merchant was cancelled and queue for lifecycle update.
-      const merchant = extractMerchant(fromHeader, text, subject);
-      if (merchant && merchant !== "unknown") cancellations.push(merchant);
-      filtered_lifecycle++;
-      continue; // not a charge
-    }
-
     if (emailType === EMAIL_TYPES.FAILED_PAYMENT) {
       filtered_lifecycle++;
       continue; // payment failed — not a successful charge
+    }
+
+    if (emailType === EMAIL_TYPES.CANCELLATION) {
+      // Extract merchant + amount so we can save as an inactive subscription.
+      // Important for Apple "Subscription Expiring" emails where the subscription
+      // may not have a prior confirmed receipt.
+      const isAppleSenderC = fromHeader.toLowerCase().includes("apple.com");
+      let appleAppNameC = isAppleSenderC
+        ? extractAppleAppNameFromHtml(rawHtml)
+        : null;
+      if (!appleAppNameC && isAppleSenderC && subject) {
+        const sub = subject.trim();
+        const m1 = sub.match(/^Your\s+(.+?)\s+receipt(?:\s+from\s+Apple)?\.?$/i);
+        const m2 = sub.match(/^Your\s+(.+?)\s+subscription\b/i);
+        const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
+        const rawName = (m1 || m2 || m3)?.[1]?.trim();
+        if (rawName && rawName.length > 1 && rawName.length < 50 &&
+            !/^(apple|receipt|invoice|payment|free|trial|subscription)$/i.test(rawName)) {
+          appleAppNameC = rawName;
+        }
+      }
+      const cancelMerchant = appleAppNameC
+        ? appleAppNameC.toLowerCase().trim()
+        : extractMerchant(fromHeader, text, subject);
+      if (cancelMerchant && cancelMerchant !== "unknown") {
+        cancellations.push(cancelMerchant);
+        const cancelAmount = extractAmount(text);
+        if (cancelAmount) {
+          const cancelDate = new Date(Number(full.internalDate));
+          cancelledCharges.push({
+            merchant:      cancelMerchant,
+            renewalAmount: cancelAmount,
+            currency:      extractCurrencyCode(text),
+            renewalDate:   extractRenewalDate(text),
+            date:          cancelDate,
+          });
+        }
+      }
+      filtered_lifecycle++;
+      continue; // not a successful charge
     }
 
     // trial_start, trial_ending, upgrade, renewal_notice, receipt → continue
@@ -301,6 +334,19 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   const confident = subscriptions.filter((s) => s.confidence >= 0.7);
   console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
   await batchUpsertSubscriptions(userId, confident);
+
+  // Upsert subscriptions from cancellation/expiry emails as inactive.
+  // Skip any merchant already saved as active in this scan.
+  if (cancelledCharges.length) {
+    const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
+    const newlyCancelled = cancelledCharges
+      .filter((c) => !activeMerchants.has(c.merchant.toLowerCase()))
+      .map((c) => ({ ...c, source: "gmail" }));
+    if (newlyCancelled.length) {
+      console.log(`[scan] upserting_cancelled: ${newlyCancelled.map(c => c.merchant).join(", ")}`);
+      await upsertCancelledSubscriptions(userId, newlyCancelled);
+    }
+  }
 
   // ── Step 7: Lifecycle events ──────────────────────────────────────────────
   // Apply cancellations detected during scan (cancellation emails auto-mark
