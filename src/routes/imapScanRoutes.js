@@ -129,6 +129,7 @@ export function registerImapScanRoutes(server) {
             ? s.billingInterval
             : (raw?.billingInterval ?? s.billingInterval),
           senderDomain: raw?.senderDomain ?? null,
+          iconUrl:      raw?.iconUrl ?? null,
         };
       });
       const confident = allSubscriptions.filter((s) => s.confidence >= 0.7);
@@ -156,6 +157,7 @@ export function registerImapScanRoutes(server) {
           isSuggested:     true,
           source:          provider,
           senderDomain:    c.senderDomain ?? null,
+          iconUrl:         c.iconUrl ?? null,
         });
       }
 
@@ -179,6 +181,7 @@ export function registerImapScanRoutes(server) {
             renewalDate:     c.renewalDate ?? null,
             billingInterval: c.billingInterval ?? null,
             senderDomain:    c.senderDomain ?? null,
+            iconUrl:         c.iconUrl ?? null,
             confidence:      0.6,
             isActive:        false,
             isSuggested:     true,

@@ -183,9 +183,15 @@ function isValidAppleName(name) {
     name.length <= 60 &&
     !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
     !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
-    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at)\s/i.test(name)
+    // Reject names that start with a billing/boilerplate word — these are receipt
+    // metadata cells accidentally matched by Strategy A, not actual app names.
+    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name)
   );
 }
+
+// mzstatic.com image alt values that are Apple boilerplate, not app names.
+// Shared between extractAppleAppNameFromHtml and extractAppleIconUrl.
+const APPLE_GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free)$/i;
 
 /**
  * Parses the app name directly from Apple IAP receipt HTML using the table
@@ -230,12 +236,16 @@ export function extractAppleAppNameFromHtml(html) {
         for (let j = i + 1; j < texts.length; j++) {
           const val = texts[j];
           if (!val || val.length <= 1 || val.length >= 60) continue;
-          // App Store subtitle format: "AppName: Tagline" — strip the subtitle.
-          // Don't return immediately; let Strategy B try for a plan-qualified name.
-          if (/:\s+/.test(val)) {
-            strategyAFallback = val.replace(/\s*:\s+.+$/, "").trim();
+          // App Store subtitle formats: "AppName: Tagline" or "AppName - Description"
+          // Strip the subtitle and save as fallback; Strategy B may yield a richer
+          // plan-qualified name (e.g. "LinkedIn Premium").
+          const hasSubtitle = /:\s+/.test(val) || /\s+-\s+/.test(val);
+          const clean = val.replace(/\s*:\s+.+$/, "").replace(/\s+-\s+.+$/, "").trim();
+          if (!isValidAppleName(clean)) return false; // metadata cell, skip entirely
+          if (hasSubtitle) {
+            strategyAFallback = clean;
           } else {
-            found = val;
+            found = clean;
           }
           return false;
         }
@@ -249,14 +259,12 @@ export function extractAppleAppNameFromHtml(html) {
     // images carry the subscription product name. Strip common tier suffixes so
     // "Couple Joy Premium" → "Couple Joy", "Liftoff Pro" → "Liftoff".
     const TIER_SUFFIX = /\s+(premium|pro|plus|essential|career|basic|standard|lite)$/i;
-    // Generic single-word plan/tier names that are not app names on their own.
-    const GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free)$/i;
     $("img[alt]").each((_, el) => {
       if (found) return false;
       const src = $(el).attr("src") || "";
       const raw = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
       if (!src.includes("mzstatic.com") || raw.length < 2 || raw.length > 60) return;
-      if (GENERIC_ALT.test(raw)) return;
+      if (APPLE_GENERIC_ALT.test(raw)) return;
       const alt = raw.replace(TIER_SUFFIX, "").trim();
       if (alt.length > 1) found = alt;
     });
@@ -302,6 +310,31 @@ export function extractAppleAppNameFromHtml(html) {
 
     // Fall back to the stripped Strategy A subtitle name if nothing else matched.
     return strategyAFallback ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extracts the App Store app icon URL from an Apple IAP receipt HTML.
+ * Apple embeds the actual app icon as an mzstatic.com <img> in the receipt.
+ * Returns the first mzstatic.com image URL whose alt is not Apple boilerplate.
+ */
+export function extractAppleIconUrl(html) {
+  if (!html) return null;
+  try {
+    const $ = cheerio.load(html);
+    let iconUrl = null;
+    $("img[src]").each((_, el) => {
+      if (iconUrl) return false;
+      const src = $(el).attr("src") || "";
+      if (!src.includes("mzstatic.com")) return;
+      const alt = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
+      // Skip images that are clearly Apple branding, not the app icon.
+      if (alt && APPLE_GENERIC_ALT.test(alt)) return;
+      iconUrl = src;
+    });
+    return iconUrl;
   } catch {
     return null;
   }

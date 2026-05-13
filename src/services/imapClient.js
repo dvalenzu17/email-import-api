@@ -1,7 +1,7 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractAppleAppNameFromHtml } from "./emailParser.js";
-import { getBrandInfo } from "./knownBrands.js";
+import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractAppleAppNameFromHtml, extractAppleIconUrl } from "./emailParser.js";
+import { getBrandInfo, getKnownDomains } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
 
@@ -19,19 +19,8 @@ const SEARCH_KEYWORDS = [
 ];
 
 // Domains where any charge email is a subscription by definition.
-// Used to boost intent score so single receipts aren't filtered out.
-const IMAP_KNOWN_DOMAINS = new Set([
-  "netflix.com", "spotify.com", "openai.com", "adobe.com",
-  "apple.com", "microsoft.com", "dropbox.com", "slack.com",
-  "notion.so", "figma.com", "github.com", "anthropic.com",
-  "hulu.com", "disneyplus.com", "youtube.com", "linkedin.com",
-  "zoom.us", "shopify.com", "squarespace.com", "webflow.io",
-  "canva.com", "grammarly.com", "duolingo.com", "headspace.com",
-  "calm.com", "peloton.com", "substack.com", "patreon.com",
-  "medium.com", "crunchyroll.com", "twitch.tv", "audible.com",
-  "vercel.com", "netlify.com", "airtable.com", "hubspot.com",
-  "uber.com",
-]);
+// Derived from KNOWN_BRANDS — add the domain field there to expand this set.
+const IMAP_KNOWN_DOMAINS = getKnownDomains();
 
 // Extract billing interval from email text.
 // NOTE: bare "year" is intentionally excluded — it matches too many non-billing
@@ -260,7 +249,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
                 currency:        extractCurrencyCode(text),
                 renewalDate:     extractRenewalDate(text),
                 billingInterval: extractBillingInterval(text),
-                senderDomain:    extractSenderDomain(fromHeader),
+                senderDomain:    isAppleSenderC ? null : extractSenderDomain(fromHeader),
+                iconUrl:         isAppleSenderC && parsed.html ? extractAppleIconUrl(parsed.html) : null,
                 date:            cancelDate,
               });
             }
@@ -346,6 +336,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // cause BrandAvatar to show the Apple logo for every app. Leave it null so
         // the brand resolver falls back to the merchant name instead.
         const senderDomain = isAppleSender ? null : extractSenderDomain(fromHeader);
+        // Extract the actual app icon embedded in the Apple receipt HTML.
+        // This is an mzstatic.com CDN image — use it directly in the UI so we
+        // don't need any external brand lookup for Apple IAP apps.
+        const iconUrl = isAppleSender && parsed.html ? extractAppleIconUrl(parsed.html) : null;
 
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
@@ -357,6 +351,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           renewalDate,
           billingInterval,
           senderDomain,
+          iconUrl,
           isAppleIAP: isAppleSender,
           subscriptionIntent: intentScore >= 2,
         });
