@@ -60,8 +60,7 @@ export function classifyEmail(subject, body) {
     b.includes("auto-renewal has been turned off") ||
     b.includes("subscription will expire") ||
     b.includes("access will end on") ||
-    b.includes("access ends on") ||
-    /subscription.{0,10}expir/i.test(s)
+    b.includes("access ends on")
   ) return EMAIL_TYPES.CANCELLATION;
 
   // ── Failed payment ────────────────────────────────────────────────────────
@@ -114,6 +113,9 @@ export function classifyEmail(subject, body) {
   // ── Renewal notice (upcoming, not yet charged) ────────────────────────────
   if (
     (s.includes("renewal") && !s.includes("receipt") && !s.includes("invoice") && !s.includes("renew")) ||
+    // Apple "Your Subscription is Expiring" — subscription is expiring but price is still actionable
+    /subscription.{0,15}expir/i.test(s) ||
+    s.includes("subscription is expiring") ||
     b.includes("will be charged") ||
     b.includes("will automatically renew") ||
     b.includes("will renew on") ||

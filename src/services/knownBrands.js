@@ -62,9 +62,9 @@ const KNOWN_BRANDS = {
   "medium":         { interval: "monthly",    minAmount: 5,    maxAmount: 20,   confirmSingle: true,  displayName: "Medium"         },
   // Commerce
   "uber one":       { interval: "monthly",    minAmount: 9,    maxAmount: 30,   confirmSingle: true,  displayName: "Uber One"       },
-  // Multi-product brands: not safe to confirm on a single charge because they
-  // also send one-time purchase receipts.
-  "apple":          { interval: "monthly",    minAmount: 0.99, maxAmount: 150,  confirmSingle: false, displayName: "Apple"          },
+  // Multi-product brands: Apple one-time purchase receipts have no /month or /year
+  // amount pattern and different subjects, so false positives are low.
+  "apple":          { interval: "monthly",    minAmount: 0.99, maxAmount: 150,  confirmSingle: true,  displayName: "Apple"          },
   "google":         { interval: "monthly",    minAmount: 1,    maxAmount: 400,  confirmSingle: false, displayName: "Google"         },
   "amazon":         { interval: "yearly",     minAmount: 10,   maxAmount: 250,  confirmSingle: false, displayName: "Amazon"         },
 };
