@@ -335,8 +335,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
   await batchUpsertSubscriptions(userId, confident);
 
-  // Upsert subscriptions from cancellation/expiry emails as inactive.
-  // Skip any merchant already saved as active in this scan.
+  // Upsert + collect cancelled subscriptions from expiry/cancellation emails.
+  // Returned in scan response so they appear as candidates in the review page.
+  let cancelledForReview = [];
   if (cancelledCharges.length) {
     const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
     const newlyCancelled = cancelledCharges
@@ -345,6 +346,17 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     if (newlyCancelled.length) {
       console.log(`[scan] upserting_cancelled: ${newlyCancelled.map(c => c.merchant).join(", ")}`);
       await upsertCancelledSubscriptions(userId, newlyCancelled);
+      cancelledForReview = newlyCancelled.map((c) => ({
+        merchant:        c.merchant,
+        renewalAmount:   c.renewalAmount,
+        currency:        c.currency,
+        renewalDate:     c.renewalDate ?? null,
+        billingInterval: null,
+        confidence:      0.6,
+        isActive:        false,
+        isSuggested:     true,
+        source:          "gmail",
+      }));
     }
   }
 
@@ -377,9 +389,8 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   progress(100, "Done");
 
   return {
-    // Return subscriptions so the frontend can display them directly without
-    // falling back to GET /subscriptions (which returns all providers).
-    subscriptions: confident,
+    // Return active + cancelled subscriptions for the review/candidates page.
+    subscriptions: [...confident, ...cancelledForReview],
     detectedSubscriptions: subscriptions.length,
     scannedMessages: allIds.length,
     newMessages: newIds.length,

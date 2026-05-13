@@ -116,8 +116,10 @@ export function registerImapScanRoutes(server) {
 
       await batchUpsertSubscriptions(userId, confident);
 
-      // Upsert subscriptions from cancellation/expiry emails as inactive.
-      // Skip any merchant already saved as active in this scan to avoid overriding.
+      // Upsert + collect cancelled subscriptions from expiry/cancellation emails.
+      // These appear in the scan review as candidates (with mayBeCancelled flag)
+      // but are NOT auto-added to the home screen — user must confirm.
+      let cancelledForReview = [];
       if (cancelledCharges.length) {
         const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
         const newlyCancelled = cancelledCharges
@@ -125,6 +127,17 @@ export function registerImapScanRoutes(server) {
           .map((c) => ({ ...c, source: provider }));
         if (newlyCancelled.length) {
           await upsertCancelledSubscriptions(userId, newlyCancelled);
+          cancelledForReview = newlyCancelled.map((c) => ({
+            merchant:        c.merchant,
+            renewalAmount:   c.renewalAmount,
+            currency:        c.currency,
+            renewalDate:     c.renewalDate ?? null,
+            billingInterval: null,
+            confidence:      0.6,
+            isActive:        false,
+            isSuggested:     true,
+            source:          provider,
+          }));
         }
       }
 
@@ -143,10 +156,9 @@ export function registerImapScanRoutes(server) {
 
       return {
         success: true,
-        // Return the subscriptions this scan found so the frontend can display
-        // them directly without falling back to GET /subscriptions (which would
-        // return all subscriptions across all providers for this user).
-        subscriptions: confident,
+        // Return active + cancelled subscriptions for the review/candidates page.
+        // The frontend shows all of these as candidates requiring user confirmation.
+        subscriptions: [...confident, ...cancelledForReview],
         detectedSubscriptions: confident.length,
         meta: {
           scannedMessages: scannedCount,
