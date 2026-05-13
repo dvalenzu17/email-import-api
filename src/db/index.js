@@ -412,8 +412,8 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
         subscriptions.map((s) => s.currency),
         subscriptions.map((s) => s.renewalDate ?? null),
         subscriptions.map(() => 0.6),
-        subscriptions.map(() => false),
-        subscriptions.map(() => true),
+        subscriptions.map(() => false),  // is_active = false
+        subscriptions.map(() => false),  // is_suggested = false (real sub, just cancelled)
         subscriptions.map((s) => s.source),
         subscriptions.map(() => null),
         subscriptions.map(() => new Date()),
