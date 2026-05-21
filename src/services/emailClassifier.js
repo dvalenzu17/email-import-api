@@ -60,7 +60,15 @@ export function classifyEmail(subject, body) {
     b.includes("auto-renewal has been turned off") ||
     b.includes("subscription will expire") ||
     b.includes("access will end on") ||
-    b.includes("access ends on")
+    b.includes("access ends on") ||
+    b.includes("subscription has ended") ||
+    b.includes("subscription ended on") ||
+    b.includes("your account is now inactive") ||
+    b.includes("account has been terminated") ||
+    b.includes("your membership has expired") ||
+    b.includes("account is deactivated") ||
+    b.includes("your subscription is now cancelled") ||
+    b.includes("your subscription is now canceled")
   ) return EMAIL_TYPES.CANCELLATION;
 
   // ── Failed payment ────────────────────────────────────────────────────────

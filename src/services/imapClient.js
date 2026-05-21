@@ -1,6 +1,6 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractAppleAppNameFromHtml, extractAppleIconUrl } from "./emailParser.js";
+import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractBillingInterval, extractAppleAppNameFromHtml, extractAppleIconUrl } from "./emailParser.js";
 import { getBrandInfo, getKnownDomains } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
@@ -21,21 +21,6 @@ const SEARCH_KEYWORDS = [
 // Domains where any charge email is a subscription by definition.
 // Derived from KNOWN_BRANDS — add the domain field there to expand this set.
 const IMAP_KNOWN_DOMAINS = getKnownDomains();
-
-// Extract billing interval from email text.
-// NOTE: bare "year" is intentionally excluded — it matches too many non-billing
-// contexts (e.g. "last year", "this year", "10 years ago"). Only explicit billing
-// phrases like "annual", "per year", "/year", or "1-year" are treated as yearly.
-function extractBillingInterval(text) {
-  const t = text.toLowerCase();
-  if (/\b(annual|annually|yearly|per year|\/year|each year|every year|\bone[- ]?year\b|\b1[- ]?year\b|\b12[- ]?month)\b/.test(t)) return "yearly";
-  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))                                                               return "semiannual";
-  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))                                                                           return "quarterly";
-  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t))                                                       return "biweekly";
-  if (/\b(weekly|per week|every week)\b/.test(t))                                                                                 return "weekly";
-  if (/\b(monthly|per month|\/month|month[- ]to[- ]month)\b/.test(t))                                                            return "monthly";
-  return null;
-}
 
 // Extract primary sender domain (e.g. "apple.com" from "noreply@email.apple.com").
 function extractSenderDomain(fromHeader) {

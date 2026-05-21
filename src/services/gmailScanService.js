@@ -19,7 +19,7 @@ import {
   extractMerchant,
   cleanEmailHtml,
 } from "../gmailClient.js";
-import { extractCurrencyCode, extractAppleAppNameFromHtml } from "./emailParser.js";
+import { extractCurrencyCode, extractBillingInterval, extractAppleAppNameFromHtml } from "./emailParser.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
 import { getOAuthToken, batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveOAuthTokens, cancelSubscriptionByMerchant, getFeedbackMerchantMap } from "../db/index.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
@@ -313,7 +313,8 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
     // Threshold lowered from 4 → 2: a single mention of "subscription" or
     // "membership" is enough intent signal when paired with a valid amount.
-    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, _msgId: full.id });
+    const isAppleIAP = fromHeader.toLowerCase().includes("apple.com");
+    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), isAppleIAP, _msgId: full.id });
   }
 
   console.log(`[scan] charges_extracted: ${charges.length} | filters: noPayload=${filtered_no_payload} noText=${filtered_no_text} negative=${filtered_negative} notTransactional=${filtered_not_transactional} noAmount=${filtered_no_amount} noMerchant=${filtered_no_merchant} lifecycle=${filtered_lifecycle} cancellations=${cancellations.length}`);
@@ -329,11 +330,61 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // Fetch per-user feedback labels to personalise confidence scores.
   const feedbackMap = await getFeedbackMerchantMap(userId);
 
-  const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap });
+  // Build a lookup of raw charge data keyed by merchant for post-detection enrichment.
+  // When multiple charges exist for the same merchant, prefer yearly over monthly (more specific).
+  const chargeDataMap = {};
+  for (const c of charges) {
+    const key = c.merchant.toLowerCase();
+    const prev = chargeDataMap[key];
+    if (!prev || (c.billingInterval === "yearly" && prev.billingInterval !== "yearly")) {
+      chargeDataMap[key] = c;
+    }
+  }
+
+  const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => {
+    const raw = chargeDataMap[s.merchant.toLowerCase()];
+    return {
+      ...s,
+      // Override billingInterval if the engine returned null/unknown and the email text had one.
+      billingInterval: s.billingInterval && s.billingInterval !== "unknown"
+        ? s.billingInterval
+        : (raw?.billingInterval ?? s.billingInterval),
+    };
+  });
   console.log(`[scan] subscriptions_detected: ${subscriptions.length}`, subscriptions.map(s => `${s.merchant}(${s.confidence})`));
   const confident = subscriptions.filter((s) => s.confidence >= 0.7);
   console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
-  await batchUpsertSubscriptions(userId, confident);
+
+  // Apple IAP bypass: Apple IAP Gmail receipts are almost always real subscriptions.
+  // If the engine didn't detect them (insufficient recurrence data — e.g. a single
+  // annual charge), add them manually with a moderate confidence so they appear in
+  // the review candidates page. Mirrors the same logic in imapScanRoutes.js.
+  const detectedMerchants = new Set(subscriptions.map((s) => s.merchant.toLowerCase()));
+  const appleBypass = [];
+  const appleBypassSeen = new Set();
+  for (const c of charges) {
+    if (!c.isAppleIAP) continue;
+    const key = c.merchant.toLowerCase();
+    if (detectedMerchants.has(key)) continue;
+    if (appleBypassSeen.has(key)) continue;
+    appleBypassSeen.add(key);
+    appleBypass.push({
+      merchant:        c.merchant,
+      amount:          c.amount,
+      currency:        c.currency,
+      billingInterval: c.billingInterval ?? "monthly",
+      renewalDate:     c.renewalDate ?? null,
+      confidence:      0.75,
+      isActive:        true,
+      isSuggested:     true,
+      source:          "gmail",
+    });
+  }
+  if (appleBypass.length) {
+    console.log(`[scan] apple_iap_bypass: ${appleBypass.map(s => s.merchant).join(", ")}`);
+  }
+
+  await batchUpsertSubscriptions(userId, [...confident, ...appleBypass]);
 
   // Upsert + collect cancelled subscriptions from expiry/cancellation emails.
   // Returned in scan response so they appear as candidates in the review page.
@@ -379,9 +430,12 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // Only mark messages as processed if their merchant produced a detected subscription.
   // This ensures that emails filtered by tight thresholds can be re-evaluated on the
   // next scan (e.g. after filters are loosened or more charges accumulate).
-  const detectedMerchants = new Set(subscriptions.map((s) => s.merchant));
+  const allDetectedMerchants = new Set([
+    ...subscriptions.map((s) => s.merchant),
+    ...appleBypass.map((s) => s.merchant),
+  ]);
   const processedIds = charges
-    .filter((c) => detectedMerchants.has(c.merchant) && c._msgId)
+    .filter((c) => allDetectedMerchants.has(c.merchant) && c._msgId)
     .map((c) => c._msgId);
 
   await markProcessedIds(userId, processedIds);
@@ -389,9 +443,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   progress(100, "Done");
 
   return {
-    // Return active + cancelled subscriptions for the review/candidates page.
-    subscriptions: [...confident, ...cancelledForReview],
-    detectedSubscriptions: subscriptions.length,
+    // Return active + cancelled + Apple IAP bypass subscriptions for the review/candidates page.
+    subscriptions: [...confident, ...cancelledForReview, ...appleBypass],
+    detectedSubscriptions: subscriptions.length + appleBypass.length,
     scannedMessages: allIds.length,
     newMessages: newIds.length,
     detectedCharges: charges.length,
