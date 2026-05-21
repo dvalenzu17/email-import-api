@@ -50,7 +50,8 @@ export function normalizeMerchant(raw) {
   }
 
   // Collapse multiple spaces and strip remaining punctuation noise.
-  name = name.replace(/\s{2,}/g, " ").replace(/[^\w\s]/g, "").trim();
+  // Preserve + so brand names like "disney+" and "apple tv+" round-trip correctly.
+  name = name.replace(/\s{2,}/g, " ").replace(/[^\w\s+]/g, "").trim();
 
   return name;
 }

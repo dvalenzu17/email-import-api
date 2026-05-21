@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import he from "he";
+import { isProcessor, extractProcessorMerchant } from "./billingProcessor.js";
 
 /**
  * Strips HTML from an email body and returns clean, lowercased plain text.
@@ -24,30 +25,42 @@ export function cleanEmailHtml(html) {
 
 /**
  * Extracts a charge amount from email text.
- * Supports USD, GBP, EUR. Priority: "total" > "charged" > plan price > first in-range match.
+ * Supports USD, GBP, EUR, CAD, AUD.
+ * Priority: "total" > "charged" > plan price > first in-range match.
+ * Handles comma-formatted thousands ($1,299.00) and European decimal (€9,99).
  */
 export function extractAmount(text) {
   const s = String(text).toLowerCase();
 
-  const totalMatch = s.match(
-    /total\s*[:\-]?\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/
-  );
-  if (totalMatch) return parseFloat(totalMatch[1]);
+  // Normalised number parser — strips thousands commas before converting.
+  function toNum(raw) {
+    return parseFloat(raw.replace(/,/g, ''));
+  }
 
-  const chargedMatch = s.match(
-    /charged\s*(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/
-  );
-  if (chargedMatch) return parseFloat(chargedMatch[1]);
+  // European decimal format: €9,99 — comma is the decimal separator.
+  const euroDecimal = s.match(/(?:€|eur)\s?([0-9]{1,4}),([0-9]{1,2})(?!\d)/);
+  if (euroDecimal) {
+    const v = parseFloat(`${euroDecimal[1]}.${euroDecimal[2]}`);
+    if (v > 0 && v < 10_000) return v;
+  }
 
-  const planMatch = s.match(
-    /(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)\s*(?:\/|\s*per\s*)(?:month|year|mo|yr)/
-  );
-  if (planMatch) return parseFloat(planMatch[1]);
+  // Amount pattern: currency symbol/code + number (with optional comma thousands).
+  const AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
+  const CUR = '(?:usd|us\\$|\\$|gbp|£|eur|€|cad|aud)';
 
-  const fallback = s.match(/(?:usd|us\$|\$|gbp|£|eur|€)\s?([0-9]+(?:\.[0-9]{1,2})?)/);
+  const totalMatch = s.match(new RegExp(`total\\s*[:\\-]?\\s*${CUR}\\s?${AMT}`));
+  if (totalMatch) return toNum(totalMatch[1]);
+
+  const chargedMatch = s.match(new RegExp(`charged\\s*${CUR}\\s?${AMT}`));
+  if (chargedMatch) return toNum(chargedMatch[1]);
+
+  const planMatch = s.match(new RegExp(`${CUR}\\s?${AMT}\\s*(?:\\/|\\s*per\\s*)(?:month|year|mo|yr)`));
+  if (planMatch) return toNum(planMatch[1]);
+
+  const fallback = s.match(new RegExp(`${CUR}\\s?${AMT}`));
   if (fallback) {
-    const v = parseFloat(fallback[1]);
-    if (v > 0 && v <= 500) return v;
+    const v = toNum(fallback[1]);
+    if (v > 0 && v < 2_000) return v; // raised cap: enterprise plans can exceed $500
   }
 
   return null;
@@ -58,8 +71,9 @@ export function extractAmount(text) {
  *
  * @param {string} fromHeader - Raw "From" value: "Name <email@domain.com>" or "email@domain.com"
  * @param {string} bodyText   - Cleaned email body (used for Apple App Store extraction)
+ * @param {string} subject    - Email subject (used for billing processor extraction)
  */
-export function extractMerchant(fromHeader, bodyText = "") {
+export function extractMerchant(fromHeader, bodyText = "", subject = "") {
   if (!fromHeader) return "unknown";
 
   const emailMatch = fromHeader.match(/<(.+?)>/);
@@ -69,10 +83,19 @@ export function extractMerchant(fromHeader, bodyText = "") {
   const parts = domain.split(".");
   const root = parts.length >= 2 ? parts[parts.length - 2] : domain;
 
+  // ── Billing processor passthrough ─────────────────────────────────────────
+  // Stripe, Paddle, PayPal, Lemon Squeezy etc. send receipts on behalf of the
+  // actual merchant. Extract the real merchant from subject/body, not the sender.
+  if (isProcessor(domain)) {
+    const merchant = extractProcessorMerchant(domain, subject, bodyText);
+    return merchant || "unknown"; // unknown if we can't parse the real merchant
+  }
+
   if (root.includes("uber") || parts.some((p) => p.includes("uber"))) {
-    // "Uber One" appears in the email body, not the From header (which just says "Uber")
-    return (fromHeader.toLowerCase().includes("uber one") || bodyText.toLowerCase().includes("uber one"))
-      ? "uber one" : "uber";
+    // Any Uber billing email that reaches this point has already passed the hard-negative
+    // filters ("trip with uber", "thanks for riding", "your uber eats order"), so it is
+    // a membership/subscription email. Always map to "uber one".
+    return "uber one";
   }
 
   // Email service providers and marketing platforms whose From domain is
@@ -100,26 +123,34 @@ export function extractMerchant(fromHeader, bodyText = "") {
   }
 
   const knownMap = {
-    openai: "openai",
-    chatgpt: "openai",
-    netflix: "netflix",
-    spotify: "spotify",
-    apple: "apple",
-    google: "google",
-    youtube: "google",
-    microsoft: "microsoft",
-    adobe: "adobe",
-    dropbox: "dropbox",
-    slack: "slack",
-    amazon: "amazon",
-    hulu: "hulu",
-    disney: "disney+",
-    notion: "notion",
-    figma: "figma",
-    github: "github",
-    anthropic: "anthropic",
-    linkedin: "linkedin",
-    zoom: "zoom",
+    // AI / Dev
+    openai: "openai", chatgpt: "openai", anthropic: "anthropic",
+    // Streaming
+    netflix: "netflix", netflixcommunication: "netflix",
+    hulu: "hulu", disney: "disney+", disneyplus: "disney+",
+    hbo: "hbo", max: "max", peacock: "peacock", paramount: "paramount",
+    crunchyroll: "crunchyroll", twitch: "twitch",
+    // Music / Audio
+    spotify: "spotify", audible: "audible",
+    // Cloud / Productivity
+    apple: "apple", google: "google", youtube: "google",
+    microsoft: "microsoft", adobe: "adobe", dropbox: "dropbox",
+    slack: "slack", notion: "notion", figma: "figma",
+    github: "github", linkedin: "linkedin", zoom: "zoom",
+    canva: "canva", grammarly: "grammarly",
+    // Commerce / Hosting
+    amazon: "amazon", shopify: "shopify",
+    squarespace: "squarespace", wix: "wix", webflow: "webflow",
+    uber: "uber one",
+    // Wellness / Learning
+    duolingo: "duolingo", headspace: "headspace", calm: "calm",
+    peloton: "peloton",
+    // Creator
+    substack: "substack", patreon: "patreon", medium: "medium",
+    // Dev infra
+    vercel: "vercel", netlify: "netlify", airtable: "airtable",
+    hubspot: "hubspot", intercom: "intercom", zendesk: "zendesk",
+    datadog: "datadog", sentry: "sentry",
   };
 
   for (const part of parts) {
@@ -134,6 +165,8 @@ export function extractMerchant(fromHeader, bodyText = "") {
 function cleanAppleName(raw) {
   return raw
     .trim()
+    // Strip " - 1 Year Subscription" / " - 3 Month Plan" Apple receipt suffixes
+    .replace(/\s*-\s*\d+\s*(?:year|month|yr|mo)s?.*$/i, "")
     .replace(/\s+(annual|monthly|yearly|weekly|plan|subscription|premium|plus|pro|basic|standard|free\s+trial)$/i, "")
     .trim();
 }
@@ -148,11 +181,177 @@ function isValidAppleName(name) {
   return (
     name.length > 2 &&
     name.length <= 60 &&
-    !APPLE_NAME_BLOCKLIST.has(name.toLowerCase())
+    !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
+    !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
+    // Reject names that start with a billing/boilerplate word — these are receipt
+    // metadata cells accidentally matched by Strategy A, not actual app names.
+    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name)
   );
 }
 
+// mzstatic.com image alt values that are Apple boilerplate, not app names.
+// Shared between extractAppleAppNameFromHtml and extractAppleIconUrl.
+const APPLE_GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free)$/i;
+
+/**
+ * Parses the app name directly from Apple IAP receipt HTML using the table
+ * cell structure. Far more reliable than regex on cleaned text because it
+ * targets the specific <td> labels Apple always uses.
+ *
+ * Apple receipt tables always have a "App" label cell whose next sibling is
+ * the app name. Falls back to the "Subscription" cell (strips the plan suffix).
+ */
+export function extractAppleAppNameFromHtml(html) {
+  if (!html) return null;
+  try {
+    const $ = cheerio.load(html);
+    let found = null;
+    // Holds a stripped App Store name when the full value had a subtitle colon
+    // (e.g. "LinkedIn: Job Search & News" → strategyAFallback = "LinkedIn").
+    // Strategy B may override this with a richer name like "LinkedIn Premium".
+    let strategyAFallback = null;
+
+    // Helper: normalize cell text — collapses all whitespace including &nbsp; (\u00a0).
+    // Apple pads label cells with &nbsp;, which standard .trim() does NOT strip.
+    function cellText(el) {
+      return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
+    }
+
+    // ── Strategy A: "App" label row traversal (primary) ─────────────────────
+    // Apple IAP receipts have a table row with an "App" label cell whose next
+    // non-empty sibling cell contains the exact app name.
+    // When the App Store name includes a subtitle colon ("LinkedIn: Job Search & News"),
+    // we strip the subtitle and save it as a fallback rather than returning immediately,
+    // because Strategy B (img alt) may yield a richer name that includes the plan tier
+    // (e.g. "LinkedIn Premium" from the subscription product image).
+    $("tr").each((_, row) => {
+      if (found) return false;
+      const cells = $(row).find("td");
+      const texts = cells.map((_, c) => cellText(c)).get();
+
+      for (let i = 0; i < texts.length; i++) {
+        const lbl = texts[i].toLowerCase();
+        if (lbl !== "app" && lbl !== "app:") continue;
+
+        for (let j = i + 1; j < texts.length; j++) {
+          const val = texts[j];
+          if (!val || val.length <= 1 || val.length >= 60) continue;
+          // App Store subtitle formats: "AppName: Tagline" or "AppName - Description"
+          // Strip the subtitle and save as fallback; Strategy B may yield a richer
+          // plan-qualified name (e.g. "LinkedIn Premium").
+          const hasSubtitle = /:\s+/.test(val) || /\s+-\s+/.test(val);
+          const clean = val.replace(/\s*:\s+.+$/, "").replace(/\s+-\s+.+$/, "").trim();
+          if (!isValidAppleName(clean)) return false; // metadata cell, skip entirely
+          if (hasSubtitle) {
+            strategyAFallback = clean;
+          } else {
+            found = clean;
+          }
+          return false;
+        }
+      }
+    });
+
+    if (found) return found;
+
+    // ── Strategy B: mzstatic.com img alt (fallback) ─────────────────────────
+    // When the "App" row is absent (e.g. renewal notices), Apple's App Store CDN
+    // images carry the subscription product name. Strip common tier suffixes so
+    // "Couple Joy Premium" → "Couple Joy", "Liftoff Pro" → "Liftoff".
+    const TIER_SUFFIX = /\s+(premium|pro|plus|essential|career|basic|standard|lite)$/i;
+    $("img[alt]").each((_, el) => {
+      if (found) return false;
+      const src = $(el).attr("src") || "";
+      const raw = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
+      if (!src.includes("mzstatic.com") || raw.length < 2 || raw.length > 60) return;
+      if (APPLE_GENERIC_ALT.test(raw)) return;
+      const alt = raw.replace(TIER_SUFFIX, "").trim();
+      if (alt.length > 1) found = alt;
+    });
+
+    if (found) return found;
+
+    // ── Strategy C: "Subscription" label row (last resort) ──────────────────
+    // Value cell strips plan duration + description suffix.
+    $("tr").each((_, row) => {
+      if (found) return false;
+      const cells = $(row).find("td");
+      const texts = cells.map((_, c) => cellText(c)).get();
+
+      for (let i = 0; i < texts.length; i++) {
+        const lbl = texts[i].toLowerCase();
+        if (lbl !== "subscription" && lbl !== "subscription:") continue;
+
+        for (let j = i + 1; j < texts.length; j++) {
+          const raw = texts[j];
+          if (!raw || raw.length < 2) continue;
+          const cleaned = raw
+            .replace(/\s*\([^)]*\).*$/, "")
+            .replace(/\s*-\s*\d+\s*(year|month|yr|mo).*$/i, "")
+            .replace(/\s+-\s+.+$/, "")
+            .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic|career|elite|essential|standard|lite).*$/i, "")
+            .trim();
+          const GENERIC_NAMES = new Set(["premium", "pro", "plus", "basic", "standard", "lite", "free", "subscription", "plan", "elite", "essential"]);
+          if (cleaned && cleaned.length > 1 && cleaned.length < 36 && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
+            found = cleaned;
+            return false;
+          }
+        }
+      }
+    });
+
+    if (found) return found;
+
+    // ── Strategy D: raw HTML regex ───────────────────────────────────────────
+    const rawMatch = html.match(
+      />\s*App\s*<\/td>(?:\s*<td[^>]*>(?:\s*(?:&nbsp;|\s)*)<\/td>)*\s*<td[^>]*>\s*([^<]{2,60}?)\s*<\//i
+    );
+    if (rawMatch) return rawMatch[1].trim();
+
+    // Fall back to the stripped Strategy A subtitle name if nothing else matched.
+    return strategyAFallback ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extracts the App Store app icon URL from an Apple IAP receipt HTML.
+ * Apple embeds the actual app icon as an mzstatic.com <img> in the receipt.
+ * Returns the first mzstatic.com image URL whose alt is not Apple boilerplate.
+ */
+export function extractAppleIconUrl(html) {
+  if (!html) return null;
+  try {
+    const $ = cheerio.load(html);
+    let iconUrl = null;
+    $("img[src]").each((_, el) => {
+      if (iconUrl) return false;
+      const src = $(el).attr("src") || "";
+      if (!src.includes("mzstatic.com")) return;
+      const alt = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
+      // Skip images that are clearly Apple branding, not the app icon.
+      if (alt && APPLE_GENERIC_ALT.test(alt)) return;
+      iconUrl = src;
+    });
+    return iconUrl;
+  } catch {
+    return null;
+  }
+}
+
 function extractAppleAppName(text) {
+  // Strategy 0: Apple receipt table — "Subscription [Name] Content Provider" or
+  // "Subscription [Name] Renewal Price" or "Subscription [Name] Date of Purchase".
+  // This is the most direct read of the structured Apple IAP email table.
+  const receiptTable = text.match(
+    /\bsubscription\s+([a-z0-9][a-z0-9\s\-\+\!\:\&]{2,40}?)\s+(?:content provider|renewal price|date of purchase|\([0-9])/i
+  );
+  if (receiptTable) {
+    const name = cleanAppleName(receiptTable[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
   // Strategy 1: "App Name (1 year)" or "App Name Premium (1 month)" — most reliable
   const durationMatch = text.match(
     /([a-z0-9][a-z0-9\s\-\+\:\&]{2,55}?)\s+\([0-9]+\s+(?:year|month|yr|mo)s?\)/i
@@ -189,6 +388,59 @@ function extractAppleAppName(text) {
     if (isValidAppleName(name)) return name;
   }
 
+  // Strategy 5: "App Name  1 Month Subscription" or "App Name - 1 Year Subscription"
+  // Apple receipt table layout (no parens). Handles both "App Name 1 Month Subscription"
+  // and the more common "App Name - 1 Year Subscription" (dash separator).
+  const beforeDuration = text.match(
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:-\s+)?(?:\d+[\s-])?(?:month|year|mo|yr)(?:ly)?\s+(?:subscription|plan|access)/i
+  );
+  if (beforeDuration) {
+    const name = cleanAppleName(beforeDuration[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  // Strategy 6: "subscriptions  App Name  US$X.XX / digit" — section header in Apple receipt.
+  // Apple receipts have a "SUBSCRIPTIONS" label before the line item.
+  const subSection = text.match(
+    /subscriptions?\s+([a-z0-9][a-z0-9\s\-\+\:\&]{2,40}?)(?=\s+(?:us\$|\$[0-9]|\d))/i
+  );
+  if (subSection) {
+    const name = cleanAppleName(subSection[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  // Strategy 7: "App Name  US$X.XX" or "App Name - US$X.XX" — bare price anchor (Apple receipt).
+  // Skips same common header words as strategy 5.
+  const barePrice = text.match(
+    /\b(?!subscriptions?\s|apple\s|receipt\s|from\s|your\s)([a-z0-9][a-z0-9\-\+\:\&]*(?:\s+[a-z0-9][a-z0-9\-\+\:\&]*){0,3}?)\s+(?:-\s+)?us\$[0-9]+\.[0-9]{2}/i
+  );
+  if (barePrice) {
+    const name = cleanAppleName(barePrice[1]);
+    if (isValidAppleName(name)) return name;
+  }
+
+  return null;
+}
+
+/**
+ * Extracts the billing cadence from email body text.
+ * Returns one of: "yearly" | "semiannual" | "quarterly" | "biweekly" | "weekly" | "monthly" | null
+ *
+ * NOTE: bare "year" is intentionally excluded — it matches too many non-billing
+ * contexts ("last year", "this year", "10 years ago"). Only explicit billing
+ * phrases like "annual", "per year", "/year", or "1-year" are accepted.
+ *
+ * @param {string} text — cleaned plain text
+ * @returns {string|null}
+ */
+export function extractBillingInterval(text) {
+  const t = String(text || "").toLowerCase();
+  if (/\b(annual|annually|yearly|per year|\/year|each year|every year|\bone[- ]?year\b|\b1[- ]?year\b|\b12[- ]?month)\b/.test(t)) return "yearly";
+  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))                                                               return "semiannual";
+  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))                                                                           return "quarterly";
+  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t))                                                       return "biweekly";
+  if (/\b(weekly|per week|every week)\b/.test(t))                                                                                 return "weekly";
+  if (/\b(monthly|per month|\/month|month[- ]to[- ]month)\b/.test(t))                                                            return "monthly";
   return null;
 }
 
@@ -222,4 +474,49 @@ export function extractCurrencyCode(text) {
   if (/c\$|ca\$/.test(s)) return "CAD";
 
   return "USD";
+}
+
+/**
+ * Extracts a renewal/next-billing date from email body text.
+ * Shared by both Gmail and IMAP scan paths.
+ *
+ * @param {string} text — cleaned plain text
+ * @returns {Date|null}
+ */
+// Parse a date string that may or may not have a comma: "June 15 2026" or "June 15, 2026".
+function parseFlexDate(raw) {
+  if (!raw) return null;
+  // Normalise: ensure a comma between day and year for JS Date parsing
+  const normalised = raw.trim().replace(/(\w+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
+  const d = new Date(normalised);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+export function extractRenewalDate(text) {
+  // DATE_PAT: "Month D, YYYY" or "Month D YYYY" or "D Month YYYY"
+  const DATE_PAT = String.raw`(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w+\s+\d{4})`;
+  const patterns = [
+    new RegExp(String.raw`starting from\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`renews on\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`renews\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`next billing date[:\s]+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`renewal date[:\s]+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`will renew on\s+` + DATE_PAT, "i"),
+    new RegExp(String.raw`automatically renews\s+(?:on\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`subscription renews\s+(?:on\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`your next\s+(?:billing|payment|charge)[^.]{0,30}(?:on|date)\s+(?:is\s+)?` + DATE_PAT, "i"),
+    new RegExp(String.raw`next (?:renewal|billing)[^.]{0,20}(?:is|on|:)\s+` + DATE_PAT, "i"),
+    // ISO date format: "2026-06-15"
+    /(?:renew|next billing|renewal)[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i,
+  ];
+
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) {
+      const d = parseFlexDate(m[1]);
+      if (d) return d;
+    }
+  }
+
+  return null;
 }
