@@ -300,6 +300,18 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           ? extractAppleAppNameFromHtml(parsed.html)
           : null;
 
+        // Belt-and-suspenders: reject legal entity names that slip through any
+        // extraction strategy (e.g. from Strategy C's "Subscription" label row).
+        if (appleAppName) {
+          const LEGAL_ENTITY = /\b(uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i;
+          if (LEGAL_ENTITY.test(appleAppName)) {
+            console.log(`[imap] rejected_legal_entity: "${appleAppName}" subject="${subject}"`);
+            appleAppName = null;
+          } else {
+            console.log(`[imap] apple_app_name: "${appleAppName}" subject="${subject}"`);
+          }
+        }
+
         // Subject-based fallback for Apple emails where HTML extraction fails.
         // Apple subjects often embed the app name:
         //   "Your SketchUp Go receipt from Apple."

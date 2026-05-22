@@ -306,7 +306,9 @@ export function extractAppleAppNameFromHtml(html) {
             "annual plan", "monthly plan", "yearly plan", "weekly subscription",
             "content", "in-app purchase", "in app purchase",
           ]);
-          if (cleaned && cleaned.length > 1 && cleaned.length < 36 && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
+          if (cleaned && cleaned.length > 1 && cleaned.length < 36 &&
+              !GENERIC_NAMES.has(cleaned.toLowerCase()) &&
+              isValidAppleName(cleaned)) {
             found = cleaned;
             return false;
           }
@@ -326,7 +328,9 @@ export function extractAppleAppNameFromHtml(html) {
     }
 
     // Fall back to the stripped Strategy A subtitle name if nothing else matched.
-    return strategyAFallback ?? null;
+    const result = strategyAFallback ?? null;
+    if (result) console.log(`[parser] apple_name_fallback: "${result}"`);
+    return result;
   } catch {
     return null;
   }
