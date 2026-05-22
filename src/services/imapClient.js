@@ -220,7 +220,27 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // Gmail scan's lifecycle handling.
         const emailType = classifyEmail(subject, text);
         if (emailType === EMAIL_TYPES.FAILED_PAYMENT) {
-          continue; // payment failed — not a successful charge
+          // A failed payment means the subscription existed — save it as inactive
+          // so it appears in the app (e.g. Disney+ which only sends payment-failed
+          // emails and no separate receipt emails).
+          const failedAmount = extractAmount(text);
+          if (failedAmount) {
+            const failedMerchant = extractMerchant(fromHeader, text, subject);
+            if (failedMerchant && failedMerchant !== "unknown") {
+              const failedDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
+              cancelledCharges.push({
+                merchant:        failedMerchant,
+                renewalAmount:   failedAmount,
+                currency:        extractCurrencyCode(text),
+                renewalDate:     extractRenewalDate(text),
+                billingInterval: extractBillingInterval(text),
+                senderDomain:    extractSenderDomain(fromHeader),
+                iconUrl:         null,
+                date:            failedDate,
+              });
+            }
+          }
+          continue; // not a successful charge
         }
         if (emailType === EMAIL_TYPES.CANCELLATION) {
           // Extract the app/merchant and amount so we can save it as an inactive
