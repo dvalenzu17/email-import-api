@@ -180,6 +180,13 @@ const APPLE_NAME_BLOCKLIST = new Set([
   "annual plan", "monthly plan", "yearly plan", "weekly subscription",
   // Generic Apple content/media terms that appear in receipt table cells
   "content", "in-app purchase", "in app purchase",
+  // Apple receipt HTML metadata field labels that appear in nested table cells.
+  // Strategy A flattens all descendant <td>s including those in nested <table>s,
+  // so "App | Date Accepted | Feb 5 2025" can appear as sibling cells where
+  // "Date Accepted" is a header label, not the app name.
+  "date accepted", "billed to", "order id", "apple id",
+  "report a problem", "order total", "payment method", "payment type",
+  "receipt type", "service provider", "content provider",
 ]);
 
 function isValidAppleName(name) {
@@ -193,7 +200,10 @@ function isValidAppleName(name) {
     !/\b(uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i.test(name) &&
     // Reject names that start with a billing/boilerplate word — these are receipt
     // metadata cells accidentally matched by Strategy A, not actual app names.
-    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name)
+    !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name) &&
+    // Reject strings ending in receipt-status words — "Date Accepted" is a receipt
+    // field label, not an app name. "Billed To" is another example.
+    !/\s(?:accepted|declined|authorized|processed|pending|confirmed|billed|to|id)$/i.test(name)
   );
 }
 

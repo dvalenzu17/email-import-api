@@ -368,7 +368,12 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // For non-Apple, non-known-domain senders require at least one hard billing
         // signal in the text. Marketing emails, newsletters, and nurture sequences
         // often mention prices and subscription words without being actual receipts.
-        if (!isAppleSender && !isBillingKnownDomain && !brandInfo?.confirmSingle) {
+        // NOTE: brandInfo.confirmSingle is intentionally NOT exempted here — it is a
+        // subscription-engine hint (1 charge = enough to confirm a subscription) and
+        // has nothing to do with whether an email is a billing email. Exempting it
+        // caused Apple marketing emails (whose merchant resolved to "apple" via the
+        // display name) to bypass this filter entirely.
+        if (!isAppleSender && !isBillingKnownDomain) {
           const hasHardBillingSignal =
             text.includes("receipt") ||
             text.includes("you have been charged") ||
