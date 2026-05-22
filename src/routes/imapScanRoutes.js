@@ -169,9 +169,20 @@ export function registerImapScanRoutes(server) {
       let cancelledForReview = [];
       if (cancelledCharges.length) {
         const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
-        const newlyCancelled = cancelledCharges
-          .filter((c) => !activeMerchants.has(c.merchant.toLowerCase()))
-          .map((c) => ({ ...c, source: provider }));
+        // Deduplicate by merchant — multiple emails for the same merchant (e.g. 3
+        // failed-payment emails for disney+) would cause a Postgres ON CONFLICT error
+        // if all rows hit the same unique key in a single unnest() INSERT.
+        // Keep the entry with the largest amount when there are duplicates.
+        const cancelledByMerchant = {};
+        for (const c of cancelledCharges) {
+          const key = c.merchant.toLowerCase();
+          if (activeMerchants.has(key)) continue;
+          const prev = cancelledByMerchant[key];
+          if (!prev || c.renewalAmount > prev.renewalAmount) {
+            cancelledByMerchant[key] = { ...c, source: provider };
+          }
+        }
+        const newlyCancelled = Object.values(cancelledByMerchant);
         if (newlyCancelled.length) {
           await upsertCancelledSubscriptions(userId, newlyCancelled);
           cancelledForReview = newlyCancelled.map((c) => ({
