@@ -195,6 +195,7 @@ function isValidAppleName(name) {
     name.length <= 60 &&
     !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
     !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
+    !/,/.test(name) &&   // App Store names never contain commas; commas indicate a concatenated footer/signature cell (e.g. "Sincerely,Apple" from <td>Sincerely,<br>Apple</td>)
     // Reject legal entity suffixes — these are developer/company names, not app names.
     // e.g. "Reface Lithuania UAB", "LinkedIn Corporation", "SomeApp LLC"
     !/\b(uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i.test(name) &&
