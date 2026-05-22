@@ -205,7 +205,11 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           /\blast\s+day\b/i.test(subject) ||               // "LAST DAY"
           /\bflash\s+sale\b/i.test(subject) ||
           /\blimited[\s-]time\s+offer\b/i.test(subject) ||
-          /\bnewsletter\b/i.test(fromHeader);              // "Sentry Newsletter <...>"
+          /\bnewsletter\b/i.test(fromHeader) ||            // "Sentry Newsletter <...>"
+          // One-time purchase / order confirmations — never subscriptions
+          /\bprocessing your order\b/i.test(subject) ||
+          /\border\s+(acknowledgment|confirmed|confirmation|received)\b/i.test(subject) ||
+          /\bthank you for (your )?(purchase|order)\b/i.test(subject);
         if (isPromoEmail) continue;
 
         const parsedDate = parsed.date ?? (envelopeMap[msg.uid]?.date ? new Date(envelopeMap[msg.uid].date) : null);
@@ -321,6 +325,31 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const fromLow = fromHeader.toLowerCase();
         const isKnownDomain = [...IMAP_KNOWN_DOMAINS].some(d => fromLow.includes(d));
         const brandInfo = merchant !== "unknown" ? getBrandInfo(merchant) : null;
+
+        // For non-Apple, non-known-domain senders require at least one hard billing
+        // signal in the text. Marketing emails, newsletters, and nurture sequences
+        // often mention prices and subscription words without being actual receipts.
+        if (!isAppleSender && !isKnownDomain && !brandInfo?.confirmSingle) {
+          const hasHardBillingSignal =
+            text.includes("receipt") ||
+            text.includes("you have been charged") ||
+            text.includes("you've been charged") ||
+            text.includes("your payment of") ||
+            text.includes("payment confirmation") ||
+            text.includes("payment successful") ||
+            text.includes("payment received") ||
+            text.includes("billed to") ||
+            text.includes("invoice number") ||
+            text.includes("order number") ||
+            text.includes("thank you for your payment") ||
+            text.includes("your card ending") ||
+            subjectLow.includes("receipt") ||
+            subjectLow.includes("invoice") ||
+            subjectLow.includes("your subscription") ||
+            subjectLow.includes("subscription renewal") ||
+            subjectLow.includes("subscription confirmed");
+          if (!hasHardBillingSignal) continue;
+        }
 
         let intentScore = 0;
         if (isKnownDomain || brandInfo?.confirmSingle) intentScore += 3;

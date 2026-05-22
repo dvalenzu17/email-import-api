@@ -188,6 +188,9 @@ function isValidAppleName(name) {
     name.length <= 60 &&
     !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
     !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
+    // Reject legal entity suffixes — these are developer/company names, not app names.
+    // e.g. "Reface Lithuania UAB", "SomeApp LLC", "Dev Studio Ltd"
+    !/\b(uab|llc|ltd|limited|inc|incorporated|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i.test(name) &&
     // Reject names that start with a billing/boilerplate word — these are receipt
     // metadata cells accidentally matched by Strategy A, not actual app names.
     !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name)
@@ -271,7 +274,7 @@ export function extractAppleAppNameFromHtml(html) {
       if (!src.includes("mzstatic.com") || raw.length < 2 || raw.length > 60) return;
       if (APPLE_GENERIC_ALT.test(raw)) return;
       const alt = raw.replace(TIER_SUFFIX, "").trim();
-      if (alt.length > 1) found = alt;
+      if (isValidAppleName(alt)) found = alt;
     });
 
     if (found) return found;
@@ -317,7 +320,10 @@ export function extractAppleAppNameFromHtml(html) {
     const rawMatch = html.match(
       />\s*App\s*<\/td>(?:\s*<td[^>]*>(?:\s*(?:&nbsp;|\s)*)<\/td>)*\s*<td[^>]*>\s*([^<]{2,60}?)\s*<\//i
     );
-    if (rawMatch) return rawMatch[1].trim();
+    if (rawMatch) {
+      const d = rawMatch[1].trim();
+      if (isValidAppleName(d)) return d;
+    }
 
     // Fall back to the stripped Strategy A subtitle name if nothing else matched.
     return strategyAFallback ?? null;
