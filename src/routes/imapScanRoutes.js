@@ -202,9 +202,21 @@ export function registerImapScanRoutes(server) {
       }
 
       // Apply lifecycle cancellations detected in scan (mirrors Gmail scan behaviour).
+      // Never cancel a merchant that was also detected as an active charge in this
+      // same scan — a receipt always wins over an old expiry/cancellation notice.
+      // e.g. LinkedIn may have a "Your Subscription is Expiring" notice in the
+      // inbox AND a recent "Your Subscription is Confirmed" receipt; without this
+      // guard the route would upsert LinkedIn as active then immediately cancel it.
       if (cancellations.length) {
+        const activeScanMerchants = new Set([
+          ...confident.map((s) => s.merchant.toLowerCase()),
+          ...appleBypass.map((s) => s.merchant.toLowerCase()),
+        ]);
+        const staleCancellations = cancellations.filter(
+          (m) => !activeScanMerchants.has(m.toLowerCase())
+        );
         await Promise.allSettled(
-          cancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
+          staleCancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
         );
       }
 
