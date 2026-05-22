@@ -175,6 +175,9 @@ function cleanAppleName(raw) {
 const APPLE_NAME_BLOCKLIST = new Set([
   "subscription", "plan", "premium", "plus", "pro", "basic", "standard",
   "monthly", "annual", "yearly", "trial", "free", "app", "purchase",
+  // Multi-word generic phrases that slip through single-word checks
+  "annual subscription", "monthly subscription", "yearly subscription",
+  "annual plan", "monthly plan", "yearly plan", "weekly subscription",
 ]);
 
 function isValidAppleName(name) {
@@ -291,7 +294,12 @@ export function extractAppleAppNameFromHtml(html) {
             .replace(/\s+-\s+.+$/, "")
             .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic|career|elite|essential|standard|lite).*$/i, "")
             .trim();
-          const GENERIC_NAMES = new Set(["premium", "pro", "plus", "basic", "standard", "lite", "free", "subscription", "plan", "elite", "essential"]);
+          const GENERIC_NAMES = new Set([
+            "premium", "pro", "plus", "basic", "standard", "lite", "free",
+            "subscription", "plan", "elite", "essential",
+            "annual subscription", "monthly subscription", "yearly subscription",
+            "annual plan", "monthly plan", "yearly plan", "weekly subscription",
+          ]);
           if (cleaned && cleaned.length > 1 && cleaned.length < 36 && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
             found = cleaned;
             return false;

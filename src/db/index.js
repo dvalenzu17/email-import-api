@@ -81,13 +81,15 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
     const upsertRes = await client.query(
       `INSERT INTO subscriptions
          (user_id, merchant, renewal_amount, currency, renewal_date,
-          confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+          confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
+          icon_url, sender_domain)
        SELECT * FROM unnest(
          $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::timestamptz[],
          $6::numeric[], $7::boolean[], $8::boolean[], $9::text[], $10::text[],
-         $11::timestamptz[]
+         $11::timestamptz[], $12::text[], $13::text[]
        ) AS t(user_id, merchant, renewal_amount, currency, renewal_date,
-              confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+              confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
+              icon_url, sender_domain)
        ON CONFLICT (user_id, merchant) DO UPDATE SET
          renewal_amount   = EXCLUDED.renewal_amount,
          renewal_date     = EXCLUDED.renewal_date,
@@ -95,6 +97,8 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
          is_suggested     = EXCLUDED.is_suggested,
          billing_interval = EXCLUDED.billing_interval,
          last_seen_at     = EXCLUDED.last_seen_at,
+         icon_url         = COALESCE(EXCLUDED.icon_url, subscriptions.icon_url),
+         sender_domain    = COALESCE(EXCLUDED.sender_domain, subscriptions.sender_domain),
          is_active        = CASE
            WHEN subscriptions.user_status = 'cancelled'  THEN false
            WHEN subscriptions.user_status = 'confirmed'  THEN true
@@ -114,6 +118,8 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
         subscriptions.map((s) => s.source),
         subscriptions.map((s) => s.billingInterval ?? null),
         subscriptions.map(() => new Date()),
+        subscriptions.map((s) => s.iconUrl ?? null),
+        subscriptions.map((s) => s.senderDomain ?? null),
       ]
     );
 
@@ -389,17 +395,21 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
     await pool.query(
       `INSERT INTO subscriptions
          (user_id, merchant, renewal_amount, currency, renewal_date,
-          confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+          confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
+          icon_url, sender_domain)
        SELECT * FROM unnest(
          $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::timestamptz[],
          $6::numeric[], $7::boolean[], $8::boolean[], $9::text[], $10::text[],
-         $11::timestamptz[]
+         $11::timestamptz[], $12::text[], $13::text[]
        ) AS t(user_id, merchant, renewal_amount, currency, renewal_date,
-              confidence, is_active, is_suggested, source, billing_interval, last_seen_at)
+              confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
+              icon_url, sender_domain)
        ON CONFLICT (user_id, merchant) DO UPDATE SET
          renewal_amount = EXCLUDED.renewal_amount,
          currency       = EXCLUDED.currency,
          last_seen_at   = EXCLUDED.last_seen_at,
+         icon_url       = COALESCE(EXCLUDED.icon_url, subscriptions.icon_url),
+         sender_domain  = COALESCE(EXCLUDED.sender_domain, subscriptions.sender_domain),
          is_active      = CASE
            WHEN subscriptions.user_status = 'confirmed' THEN true
            ELSE false
@@ -417,6 +427,8 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
         subscriptions.map((s) => s.source),
         subscriptions.map(() => null),
         subscriptions.map(() => new Date()),
+        subscriptions.map((s) => s.iconUrl ?? null),
+        subscriptions.map((s) => s.senderDomain ?? null),
       ]
     );
   } catch (err) {

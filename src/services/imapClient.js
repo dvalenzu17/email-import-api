@@ -216,7 +216,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
             const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
             const rawName = (m1 || m2 || m3)?.[1]?.trim();
             if (rawName && rawName.length > 1 && rawName.length < 50 &&
-                !/^(apple|receipt|invoice|payment|free|trial|subscription)$/i.test(rawName)) {
+                !/^(apple|receipt|invoice|payment|free|trial|subscription|premium|annual|monthly|yearly|weekly|plan|plus|pro|basic|standard|elite|essential|lite)$/i.test(rawName) &&
+                !/^(annual|monthly|yearly|weekly)\s+(subscription|plan)$/i.test(rawName)) {
               appleAppNameC = rawName;
             }
           }
@@ -266,7 +267,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
           const rawName = (m1 || m2 || m3)?.[1]?.trim();
           if (rawName && rawName.length > 1 && rawName.length < 50 &&
-              !/^(apple|receipt|invoice|payment|free|trial)$/i.test(rawName)) {
+              !/^(apple|receipt|invoice|payment|free|trial|subscription|premium|annual|monthly|yearly|weekly|plan|plus|pro|basic|standard|elite|essential|lite)$/i.test(rawName) &&
+              !/^(annual|monthly|yearly|weekly)\s+(subscription|plan)$/i.test(rawName)) {
             appleAppName = rawName;
           }
         }
