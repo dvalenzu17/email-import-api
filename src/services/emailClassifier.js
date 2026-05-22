@@ -74,6 +74,7 @@ export function classifyEmail(subject, body) {
   // ── Failed payment ────────────────────────────────────────────────────────
   if (
     s.includes("payment failed") || s.includes("payment declined") ||
+    s.includes("failed payment") ||
     s.includes("payment unsuccessful") ||
     (s.includes("action required") && (s.includes("payment") || s.includes("subscription"))) ||
     b.includes("payment was declined") ||

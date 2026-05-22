@@ -178,6 +178,8 @@ const APPLE_NAME_BLOCKLIST = new Set([
   // Multi-word generic phrases that slip through single-word checks
   "annual subscription", "monthly subscription", "yearly subscription",
   "annual plan", "monthly plan", "yearly plan", "weekly subscription",
+  // Generic Apple content/media terms that appear in receipt table cells
+  "content", "in-app purchase", "in app purchase",
 ]);
 
 function isValidAppleName(name) {
@@ -299,6 +301,7 @@ export function extractAppleAppNameFromHtml(html) {
             "subscription", "plan", "elite", "essential",
             "annual subscription", "monthly subscription", "yearly subscription",
             "annual plan", "monthly plan", "yearly plan", "weekly subscription",
+            "content", "in-app purchase", "in app purchase",
           ]);
           if (cleaned && cleaned.length > 1 && cleaned.length < 36 && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
             found = cleaned;

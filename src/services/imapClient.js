@@ -191,6 +191,23 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           : (fromParsed?.address ?? (envelopeMap[msg.uid]?.from?.[0]?.address ?? ""));
         const subject = parsed.subject ?? envelopeMap[msg.uid]?.subject ?? "";
 
+        // ── Promotional / newsletter filter ───────────────────────────────────
+        // Reject emails that are clearly promotional discounts or newsletters —
+        // they often mention subscription amounts in a non-billing context and
+        // produce false positives.
+        const subjectLow = subject.toLowerCase();
+        const fromLow2   = fromHeader.toLowerCase();
+        const isPromoEmail =
+          /\b\d+\s*%\s*off\b/i.test(subject) ||          // "40% off"
+          /\$\d+\s*off\b/i.test(subject) ||               // "$40 off"
+          /\bfinal\s+hours?\b/i.test(subject) ||          // "FINAL HOURS"
+          /\blast\s+chance\b/i.test(subject) ||            // "LAST CHANCE"
+          /\blast\s+day\b/i.test(subject) ||               // "LAST DAY"
+          /\bflash\s+sale\b/i.test(subject) ||
+          /\blimited[\s-]time\s+offer\b/i.test(subject) ||
+          /\bnewsletter\b/i.test(fromHeader);              // "Sentry Newsletter <...>"
+        if (isPromoEmail) continue;
+
         const parsedDate = parsed.date ?? (envelopeMap[msg.uid]?.date ? new Date(envelopeMap[msg.uid].date) : null);
 
         // ── Lifecycle classification ──────────────────────────────────────────
@@ -205,7 +222,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           // Extract the app/merchant and amount so we can save it as an inactive
           // subscription — important for Apple "Your Subscription is Expiring" emails
           // where the subscription may not have been seen before (first iCloud scan).
-          const isAppleSenderC = fromHeader.toLowerCase().includes("apple.com");
+          const isAppleSenderC = (fromParsed?.address ?? "").toLowerCase().endsWith("@email.apple.com");
           let appleAppNameC = isAppleSenderC && parsed.html
             ? extractAppleAppNameFromHtml(parsed.html)
             : null;
@@ -250,7 +267,11 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // For Apple IAP emails parse the app name from raw HTML table cells —
         // the cleaned-text strategies are confused by Apple's repeated app name
         // across multiple table rows (icon alt, App row, Subscription row).
-        const isAppleSender = fromHeader.toLowerCase().includes("apple.com");
+        // Apple billing/receipt emails always originate from @email.apple.com.
+        // Marketing emails come from other Apple domains (InsideApple.Apple.com,
+        // store.apple.com, news.apple.com etc.) and must not be treated as receipts.
+        const fromAddr = (fromParsed?.address ?? "").toLowerCase();
+        const isAppleSender = fromAddr.endsWith("@email.apple.com");
         let appleAppName = isAppleSender && parsed.html
           ? extractAppleAppNameFromHtml(parsed.html)
           : null;
