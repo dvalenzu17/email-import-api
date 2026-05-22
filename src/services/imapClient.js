@@ -330,6 +330,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
 
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
+        console.log(`[imap] charge: merchant="${merchant}" amount=${amount} subject="${subject}" from="${fromHeader.substring(0, 80)}" iconUrl=${iconUrl ? "yes" : "null"} interval=${billingInterval ?? "null"}`);
         charges.push({
           merchant,
           amount,
