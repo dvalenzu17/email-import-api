@@ -189,8 +189,8 @@ function isValidAppleName(name) {
     !APPLE_NAME_BLOCKLIST.has(name.toLowerCase()) &&
     !/\d/.test(name) &&  // reject date/number fragments like "starting 19 march 2026"
     // Reject legal entity suffixes — these are developer/company names, not app names.
-    // e.g. "Reface Lithuania UAB", "SomeApp LLC", "Dev Studio Ltd"
-    !/\b(uab|llc|ltd|limited|inc|incorporated|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i.test(name) &&
+    // e.g. "Reface Lithuania UAB", "LinkedIn Corporation", "SomeApp LLC"
+    !/\b(uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i.test(name) &&
     // Reject names that start with a billing/boilerplate word — these are receipt
     // metadata cells accidentally matched by Strategy A, not actual app names.
     !/^(?:starting|renewal|your|the|this|a|an|for|with|from|on|at|annual|monthly|weekly|yearly|quarterly|free)\s/i.test(name)

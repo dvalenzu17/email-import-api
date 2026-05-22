@@ -346,10 +346,17 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const isKnownDomain = [...IMAP_KNOWN_DOMAINS].some(d => fromLow.includes(d));
         const brandInfo = merchant !== "unknown" ? getBrandInfo(merchant) : null;
 
+        // Apple marketing/hardware emails (InsideApple.Apple.com, orders.apple.com, etc.)
+        // match IMAP_KNOWN_DOMAINS via "apple.com" even though they are not billing senders.
+        // Only @email.apple.com is a real Apple billing domain — treat all other Apple
+        // addresses the same as unknown domains for the hard billing signal check.
+        const isBillingKnownDomain = isKnownDomain &&
+          !(fromAddr.includes("apple.com") && !isAppleSender);
+
         // For non-Apple, non-known-domain senders require at least one hard billing
         // signal in the text. Marketing emails, newsletters, and nurture sequences
         // often mention prices and subscription words without being actual receipts.
-        if (!isAppleSender && !isKnownDomain && !brandInfo?.confirmSingle) {
+        if (!isAppleSender && !isBillingKnownDomain && !brandInfo?.confirmSingle) {
           const hasHardBillingSignal =
             text.includes("receipt") ||
             text.includes("you have been charged") ||
