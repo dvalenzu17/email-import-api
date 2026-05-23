@@ -284,7 +284,11 @@ export function extractAppleAppNameFromHtml(html) {
       const raw = ($(el).attr("alt") || "").replace(/[\u00a0\s]+/g, " ").trim();
       if (!src.includes("mzstatic.com") || raw.length < 2 || raw.length > 60) return;
       if (APPLE_GENERIC_ALT.test(raw)) return;
-      const alt = raw.replace(TIER_SUFFIX, "").trim();
+      const alt = raw
+        .replace(/\s*:\s+.+$/, "")
+        .replace(/\s+-\s+.+$/, "")
+        .replace(TIER_SUFFIX, "")
+        .trim();
       if (isValidAppleName(alt)) found = alt;
     });
 

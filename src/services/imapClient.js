@@ -106,54 +106,29 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     const since = new Date();
     since.setDate(since.getDate() - daysBack);
 
-    // Use UID search explicitly
-    const allUids = await client.search({ since }, { uid: true });
-    if (!allUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
+    // Server-side SEARCH: union subject keywords + Apple billing sender.
+    // Replaces the old "fetch all envelopes, slice-1500, filter locally" approach
+    // so the full daysBack window is covered regardless of inbox size.
+    const IMAP_SUBJECT_KEYWORDS = [
+      "subscription", "renewal", "receipt", "invoice",
+      "membership", "billing", "welcome", "confirmed", "confirmation",
+    ];
+    const IMAP_BILLING_SENDERS = ["email.apple.com"];
 
-    const uids = allUids.slice(-1500);
-
-    // Pass 1 — envelopes only, UID mode
-    const relevant = [];
-
-    for await (const msg of client.fetch(
-      uids,
-      { envelope: true, uid: true },
-      { uid: true }
-    )) {
-      scannedCount++;
-      const subject = msg.envelope?.subject?.toLowerCase() ?? "";
-      const senderAddress = msg.envelope?.from?.[0]?.address?.toLowerCase() ?? "";
-      const isKnownSender = [...IMAP_KNOWN_DOMAINS].some(d => senderAddress.includes(d));
-
-      // Always include emails from known subscription domains regardless of subject —
-      // e.g. Disney+ welcome emails ("Welcome to Disney+") don't have billing keywords
-      // in the subject but carry cadence, price, and renewal date in the body.
-      const looksRelevant =
-        isKnownSender ||
-        subject.includes("receipt") ||
-        subject.includes("invoice") ||
-        subject.includes("subscription") ||
-        subject.includes("renewal") ||
-        subject.includes("membership") ||
-        subject.includes("billing") ||
-        subject.includes("auto-renew") ||
-        subject.includes("your plan") ||
-        subject.includes("charged") ||
-        subject.includes("payment") ||
-        subject.includes("welcome");
-        // NOTE: "order confirmation" deliberately excluded — fires on one-time purchases
-
-      if (looksRelevant) {
-        relevant.push({ uid: msg.uid, envelope: msg.envelope });
-      }
+    const uidSet = new Set();
+    for (const kw of IMAP_SUBJECT_KEYWORDS) {
+      const uids = await client.search({ since, subject: kw }, { uid: true });
+      for (const uid of uids) uidSet.add(uid);
+    }
+    for (const sender of IMAP_BILLING_SENDERS) {
+      const uids = await client.search({ since, from: sender }, { uid: true });
+      for (const uid of uids) uidSet.add(uid);
     }
 
-    if (!relevant.length) return { charges, cancellations, cancelledCharges, scannedCount };
+    const relevantUids = [...uidSet].sort((a, b) => a - b);
+    scannedCount = relevantUids.length;
 
-    const relevantUids = relevant.map((r) => r.uid);
-    const envelopeMap = Object.fromEntries(
-      relevant.map((r) => [r.uid, r.envelope])
-    );
+    if (!relevantUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
 
     // Pass 2 — full source, UID mode
     // mailparser decodes MIME structure and base64 parts correctly — cheerio
@@ -182,14 +157,11 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           text.includes("your uber eats order")
         ) continue;
 
-        // mailparser already parsed From + Subject from the MIME headers —
-        // prefer these over the envelope (which comes from IMAP FETCH ENVELOPE
-        // and can be lossy with non-ASCII names).
         const fromParsed = parsed.from?.value?.[0];
         const fromHeader = fromParsed?.name
           ? `${fromParsed.name} <${fromParsed.address ?? ""}>`
-          : (fromParsed?.address ?? (envelopeMap[msg.uid]?.from?.[0]?.address ?? ""));
-        const subject = parsed.subject ?? envelopeMap[msg.uid]?.subject ?? "";
+          : (fromParsed?.address ?? "");
+        const subject = parsed.subject ?? "";
 
         // ── Promotional / newsletter filter ───────────────────────────────────
         // Reject emails that are clearly promotional discounts or newsletters —
@@ -212,7 +184,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           /\bthank you for (your )?(purchase|order)\b/i.test(subject);
         if (isPromoEmail) continue;
 
-        const parsedDate = parsed.date ?? (envelopeMap[msg.uid]?.date ? new Date(envelopeMap[msg.uid].date) : null);
+        const parsedDate = parsed.date ?? null;
 
         // ── Lifecycle classification ──────────────────────────────────────────
         // Detect cancellation/expiry emails so we can mark the subscription as
