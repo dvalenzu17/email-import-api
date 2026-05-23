@@ -181,7 +181,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           // One-time purchase / order confirmations — never subscriptions
           /\bprocessing your order\b/i.test(subject) ||
           /\border\s+(acknowledgment|confirmed|confirmation|received)\b/i.test(subject) ||
-          /\bthank you for (your )?(purchase|order)\b/i.test(subject);
+          /\bthank you for (your )?(purchase|order)\b/i.test(subject) ||
+          subjectLow.startsWith("your invoice from apple");
         if (isPromoEmail) continue;
 
         const parsedDate = parsed.date ?? null;
@@ -275,7 +276,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // Belt-and-suspenders: reject legal entity names that slip through any
         // extraction strategy (e.g. from Strategy C's "Subscription" label row).
         if (appleAppName) {
-          const LEGAL_ENTITY = /\b(uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?$/i;
+          const LEGAL_ENTITY = /(?:\b(?:uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?|z\s+o\.o\.)$/i;
           if (LEGAL_ENTITY.test(appleAppName)) {
             console.log(`[imap] rejected_legal_entity: "${appleAppName}" subject="${subject}"`);
             appleAppName = null;
