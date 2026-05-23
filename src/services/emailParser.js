@@ -180,6 +180,8 @@ const APPLE_NAME_BLOCKLIST = new Set([
   "annual plan", "monthly plan", "yearly plan", "weekly subscription",
   // Generic Apple content/media terms that appear in receipt table cells
   "content", "in-app purchase", "in app purchase",
+  // Apple App Store category names that appear in Subscription rows (e.g. "Games - Monthly")
+  "games",
   // Apple receipt HTML metadata field labels that appear in nested table cells.
   // Strategy A flattens all descendant <td>s including those in nested <table>s,
   // so "App | Date Accepted | Feb 5 2025" can appear as sibling cells where
