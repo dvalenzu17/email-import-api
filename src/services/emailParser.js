@@ -210,7 +210,7 @@ function isValidAppleName(name) {
 
 // mzstatic.com image alt values that are Apple boilerplate, not app names.
 // Shared between extractAppleAppNameFromHtml and extractAppleIconUrl.
-const APPLE_GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free)$/i;
+const APPLE_GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free|games)$/i;
 
 /**
  * Parses the app name directly from Apple IAP receipt HTML using the table
