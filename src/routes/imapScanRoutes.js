@@ -5,6 +5,7 @@ import { requireUser } from "../lib/auth.js";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
 import { batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant, updateRenewalDateByAmountAndInterval, getActiveSubscriptionConfidences } from "../db/index.js";
+import { validateMerchantName } from "../services/emailParser.js";
 import { decryptCredential } from "../services/crypto.js";
 
 const PROVIDERS = ["gmail", "yahoo", "outlook", "icloud"];
@@ -182,6 +183,10 @@ export function registerImapScanRoutes(server) {
         }
         if (appleBypassSeen.has(key)) {
           console.log(`[imap] bypass_skip reason=duplicate_merchant merchant="${c.merchant}"`);
+          continue;
+        }
+        if (!validateMerchantName(c.merchant)) {
+          console.log(`[imap] bypass_skip reason=invalid_merchant merchant="${c.merchant}"`);
           continue;
         }
         appleBypassSeen.add(key);

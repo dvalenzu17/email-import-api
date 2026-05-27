@@ -409,15 +409,28 @@ function cleanAppleName(raw) {
 
 // Validates a candidate app name: must be non-trivial and not a generic word.
 const APPLE_NAME_BLOCKLIST = new Set([
+  // Generic tier / plan words
   "subscription", "plan", "premium", "plus", "pro", "basic", "standard",
   "monthly", "annual", "yearly", "trial", "free", "app", "purchase",
   "annual subscription", "monthly subscription", "yearly subscription",
   "annual plan", "monthly plan", "yearly plan", "weekly subscription",
   "content", "in-app purchase", "in app purchase",
   "games",
+  // Apple receipt table labels
   "date accepted", "billed to", "order id", "apple id",
   "report a problem", "order total", "payment method", "payment type",
   "receipt type", "service provider", "content provider",
+  // Company name — never valid as a subscription merchant; specific products
+  // (iCloud+, Apple TV+, Apple One) are detected by their product names instead.
+  "apple",
+  // Visual section-header phrases that appear inside Apple email bodies and
+  // must never be written as merchant names regardless of extraction path.
+  "subscription expiring",
+  "subscription confirmation",
+  "subscription confirmed",
+  "subscription renewal",
+  "receipt",
+  "invoice",
 ]);
 
 function isValidAppleName(name) {
@@ -456,22 +469,28 @@ function stripAppleSubjectPrefixes(text) {
   return t.trim();
 }
 
-// Generic section-header phrases that Apple uses as visual headings inside
-// email bodies. These must never be written as merchant names.
-const APPLE_SECTION_HEADER_BLOCKLIST = /^(subscription expiring|subscription confirmation|subscription confirmed|subscription renewal|receipt|invoice)$/i;
+/**
+ * Returns true if the merchant name is valid — not in the blocklist and not
+ * a trivially empty/unknown value. Shared across all write paths.
+ */
+export function validateMerchantName(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase().trim();
+  if (!lower || lower === "unknown") return false;
+  return !APPLE_NAME_BLOCKLIST.has(lower);
+}
 
 /**
- * Returns true if the candidate merchant name is safe to use.
- * Rejects names that are the email subject, substrings of the subject
- * (when short), or known Apple section-header phrases.
+ * Returns true if the candidate app name is safe to accept.
+ * Rejects names that are identical to the email subject, short substrings
+ * of the subject, or anything in APPLE_NAME_BLOCKLIST.
  */
 function passesSubjectGuard(candidate, subject) {
-  if (!candidate) return false;
+  if (!validateMerchantName(candidate)) return false;
   if (!subject) return true;
   const c = candidate.toLowerCase().trim();
   const s = subject.toLowerCase().trim();
   if (c === s) return false;
-  if (APPLE_SECTION_HEADER_BLOCKLIST.test(candidate.trim())) return false;
   const wordCount = candidate.trim().split(/\s+/).length;
   if (wordCount < 4 && s.includes(c)) return false;
   return true;
