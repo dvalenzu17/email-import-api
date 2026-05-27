@@ -456,6 +456,43 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
 }
 
 /**
+ * Attempts to update renewal_date on an existing active subscription matched by
+ * amount (±$0.50) and billing_interval. Used when an Apple "Subscription is Expiring"
+ * email cannot identify the app name — the merchant can't be written, but the
+ * renewal date extracted from the email can still be patched onto the matched record.
+ *
+ * Returns { updated: boolean, merchant: string|null }.
+ */
+export async function updateRenewalDateByAmountAndInterval(userId, { amount, billingInterval, renewalDate }) {
+  if (!renewalDate || !amount) return { updated: false, merchant: null };
+  try {
+    const result = await pool.query(
+      `UPDATE subscriptions
+       SET renewal_date = $3,
+           updated_at   = NOW()
+       WHERE id = (
+         SELECT id FROM subscriptions
+         WHERE user_id = $1
+           AND is_active = true
+           AND renewal_amount IS NOT NULL
+           AND ABS(renewal_amount::numeric - $2::numeric) <= 0.50
+           AND ($4::text IS NULL OR billing_interval = $4)
+         ORDER BY last_seen_at DESC
+         LIMIT 1
+       )
+       RETURNING merchant`,
+      [userId, amount, renewalDate, billingInterval ?? null]
+    );
+    return {
+      updated:  result.rows.length > 0,
+      merchant: result.rows[0]?.merchant ?? null,
+    };
+  } catch (err) {
+    throw new Error(`db_update_renewal_date_failed: ${err.message}`);
+  }
+}
+
+/**
  * Marks a subscription as cancelled by merchant name.
  * Only updates rows that haven't been manually set to 'confirmed' by the user.
  * Used when the scan detects a cancellation email for a known merchant.
