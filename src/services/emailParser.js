@@ -456,6 +456,27 @@ function stripAppleSubjectPrefixes(text) {
   return t.trim();
 }
 
+// Generic section-header phrases that Apple uses as visual headings inside
+// email bodies. These must never be written as merchant names.
+const APPLE_SECTION_HEADER_BLOCKLIST = /^(subscription expiring|subscription confirmation|subscription confirmed|subscription renewal|receipt|invoice)$/i;
+
+/**
+ * Returns true if the candidate merchant name is safe to use.
+ * Rejects names that are the email subject, substrings of the subject
+ * (when short), or known Apple section-header phrases.
+ */
+function passesSubjectGuard(candidate, subject) {
+  if (!candidate) return false;
+  if (!subject) return true;
+  const c = candidate.toLowerCase().trim();
+  const s = subject.toLowerCase().trim();
+  if (c === s) return false;
+  if (APPLE_SECTION_HEADER_BLOCKLIST.test(candidate.trim())) return false;
+  const wordCount = candidate.trim().split(/\s+/).length;
+  if (wordCount < 4 && s.includes(c)) return false;
+  return true;
+}
+
 /**
  * TASK 2 — Parses the app name from Apple IAP receipt HTML.
  * Tries 5 strategies in order (A→E), recording which fired.
@@ -479,17 +500,22 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
       return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
     }
 
-    // ── Strategy 0: Product card extraction (generic — all Apple IAP email types) ──
-    // Apple transactional emails (receipts, renewals, expiry notices, confirmations)
-    // consistently render a product card: an app icon image hosted on mzstatic.com
-    // or apple.com/app, followed by a sibling cell whose first non-empty text node
-    // is the app name. No subject-line guard — applies to all Apple IAP emails.
-    $("img[src*='mzstatic.com'], img[src*='apple.com/app']").first().closest("td, div").each((_, iconCell) => {
+    // ── Strategy 0: Product card extraction (all Apple IAP email types) ──────
+    // Apple transactional emails render the app icon in a <td> using a
+    // mzstatic.com URL, with the app name as the first text in the immediately
+    // adjacent sibling <td> of the same <tr>. Iterates all mzstatic images
+    // (not just the first) to find one that is inside a table cell with a valid
+    // sibling. mzstatic.com is Apple's CDN for app assets; apple.com images are
+    // excluded because they include the Apple logo which appears near the subject
+    // line section and produces false positives.
+    $("img[src*='mzstatic.com']").each((_, img) => {
       if (found) return false;
-      const infoCell = $(iconCell).next("td, div");
-      if (!infoCell.length) return;
+      const iconTd = $(img).closest("td");
+      if (!iconTd.length) return;      // image not in a table cell — skip
+      const nameTd = iconTd.next("td");
+      if (!nameTd.length) return;      // no sibling cell in same row — skip
       let firstText = "";
-      infoCell.contents().each((_, node) => {
+      nameTd.contents().each((_, node) => {
         if (firstText) return false;
         if (node.type === "text") {
           const t = (node.data || "").replace(/[\u00a0\s]+/g, " ").trim();
@@ -505,7 +531,9 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
         .replace(/\s+-\s+.+$/, "")
         .trim();
       if (clean.length >= 3 && clean.length <= 60 &&
-          !APPLE_GENERIC_ALT.test(clean) && isValidAppleName(clean)) {
+          !APPLE_GENERIC_ALT.test(clean) &&
+          isValidAppleName(clean) &&
+          passesSubjectGuard(clean, subject)) {
         found = clean;
         foundStrategy = "apple_iap_strategy_0_product_card";
       }
@@ -531,7 +559,7 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
           if (!isValidAppleName(clean)) return false;
           if (hasSubtitle) {
             strategyAFallback = clean;
-          } else {
+          } else if (passesSubjectGuard(clean, subject)) {
             found = clean;
             foundStrategy = "apple_iap_strategy_A";
           }
@@ -555,7 +583,8 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
         .replace(/\s+-\s+.+$/, "")
         .replace(TIER_SUFFIX, "")
         .trim();
-      if (isValidAppleName(alt) && (!strategyAFallback || alt.toLowerCase().startsWith(strategyAFallback.toLowerCase()))) {
+      if (isValidAppleName(alt) && passesSubjectGuard(alt, subject) &&
+          (!strategyAFallback || alt.toLowerCase().startsWith(strategyAFallback.toLowerCase()))) {
         found = alt;
         foundStrategy = "apple_iap_strategy_B";
       }
@@ -592,7 +621,7 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
           ]);
           if (cleaned && cleaned.length > 1 && cleaned.length < 36 &&
               !GENERIC_NAMES.has(cleaned.toLowerCase()) &&
-              isValidAppleName(cleaned)) {
+              isValidAppleName(cleaned) && passesSubjectGuard(cleaned, subject)) {
             found = cleaned;
             foundStrategy = "apple_iap_strategy_C";
             return false;
@@ -610,7 +639,7 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
     if (rawMatch) {
       // TASK 1: strip Apple subject-line prefixes before validating
       const d = stripAppleSubjectPrefixes(rawMatch[1]);
-      if (isValidAppleName(d)) return { name: d, strategy: "apple_iap_strategy_D" };
+      if (isValidAppleName(d) && passesSubjectGuard(d, subject)) return { name: d, strategy: "apple_iap_strategy_D" };
     }
 
     // ── Strategy E (TASK 2): App Store URL slug ────────────────────────────
@@ -629,14 +658,14 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
           .replace(/-/g, " ")
           .trim()
           .replace(/\b\w/g, (c) => c.toUpperCase()); // title-case
-        if (isValidAppleName(name)) {
+        if (isValidAppleName(name) && passesSubjectGuard(name, subject)) {
           return { name, strategy: "apple_iap_strategy_E_url_slug" };
         }
       }
     }
 
     // Fallback to stripped Strategy A subtitle name.
-    if (strategyAFallback) {
+    if (strategyAFallback && passesSubjectGuard(strategyAFallback, subject)) {
       console.log(`[parser] apple_name_fallback: "${strategyAFallback}"`);
       return { name: strategyAFallback, strategy: "apple_iap_strategy_A_subtitle_fallback" };
     }
