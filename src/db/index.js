@@ -217,15 +217,17 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
 }
 
 /**
- * Returns a Map of { merchantKey → confidence } for all active subscriptions
- * belonging to the user. merchantKey is the lowercase merchant name.
+ * Returns a Map of { merchantKey → confidence } for confirmed active subscriptions.
+ * Excludes is_suggested=true rows (unconfirmed bypass candidates) so that pending
+ * review items are still re-surfaced as candidates on the next scan rather than
+ * silently suppressed by the already_confident bypass check.
  * Used by the IMAP bypass loop to check DB state before writing.
  */
 export async function getActiveSubscriptionConfidences(userId) {
   const result = await pool.query(
     `SELECT LOWER(merchant) AS merchant_key, confidence
      FROM subscriptions
-     WHERE user_id = $1 AND is_active = true`,
+     WHERE user_id = $1 AND is_active = true AND (is_suggested = false OR is_suggested IS NULL)`,
     [userId]
   );
   return new Map(result.rows.map((r) => [r.merchant_key, parseFloat(r.confidence)]));
