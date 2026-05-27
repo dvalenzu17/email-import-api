@@ -4,7 +4,7 @@ import { z } from "zod";
 import { requireUser } from "../lib/auth.js";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
-import { batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant, updateRenewalDateByAmountAndInterval } from "../db/index.js";
+import { batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant, updateRenewalDateByAmountAndInterval, getActiveSubscriptionConfidences } from "../db/index.js";
 import { decryptCredential } from "../services/crypto.js";
 
 const PROVIDERS = ["gmail", "yahoo", "outlook", "icloud"];
@@ -144,15 +144,15 @@ export function registerImapScanRoutes(server) {
         return true;
       });
 
-      // Write engine-detected subscriptions first. detectedMerchants is built from the
-      // keys actually committed to the DB — not the in-memory confident list — so a
-      // merchant that fails to write doesn't falsely block the bypass path.
-      const writtenMerchants = await batchUpsertSubscriptions(userId, confident);
-      const detectedMerchants = new Set(writtenMerchants);
+      await batchUpsertSubscriptions(userId, confident);
 
-      // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
-      // engine didn't detect them (insufficient recurrence data), add them manually
-      // with a moderate confidence so they appear in the review candidates page.
+      // Fetch the current DB state for all active subscriptions after writing the
+      // confident batch. The bypass loop uses this as the source of truth for the
+      // already_confident check — never in-memory scan state.
+      const existingConfidences = await getActiveSubscriptionConfidences(userId);
+
+      // Apple IAP bypass: charges the engine missed (insufficient recurrence data).
+      // Added at 0.75–0.80 confidence for user review on the candidates page.
       const appleBypass = [];
       const appleBypassSeen = new Set();
       // Expiry notices where app-name extraction failed and merchant resolved to "Apple".
@@ -175,8 +175,9 @@ export function registerImapScanRoutes(server) {
           continue;
         }
 
-        if (detectedMerchants.has(key)) {
-          console.log(`[imap] bypass_skip reason=already_confident merchant="${c.merchant}"`);
+        const existingConf = existingConfidences.get(key);
+        if (existingConf !== undefined && existingConf >= 0.70) {
+          console.log(`[imap] bypass_skip reason=already_confident merchant="${c.merchant}" db_confidence=${existingConf}`);
           continue;
         }
         if (appleBypassSeen.has(key)) {

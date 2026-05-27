@@ -217,6 +217,21 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
 }
 
 /**
+ * Returns a Map of { merchantKey → confidence } for all active subscriptions
+ * belonging to the user. merchantKey is the lowercase merchant name.
+ * Used by the IMAP bypass loop to check DB state before writing.
+ */
+export async function getActiveSubscriptionConfidences(userId) {
+  const result = await pool.query(
+    `SELECT LOWER(merchant) AS merchant_key, confidence
+     FROM subscriptions
+     WHERE user_id = $1 AND is_active = true`,
+    [userId]
+  );
+  return new Map(result.rows.map((r) => [r.merchant_key, parseFloat(r.confidence)]));
+}
+
+/**
  * Sets user_status on a subscription. Returns the updated row, or null if not found.
  * Only modifies rows belonging to the requesting user.
  */

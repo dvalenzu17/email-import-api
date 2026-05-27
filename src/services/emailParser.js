@@ -479,39 +479,38 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
       return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
     }
 
-    // ── Strategy 0: Expiring-email product card (icon + app name in adjacent cell) ──
-    // Apple "Your Subscription is Expiring" emails use a product card layout:
-    // an <img src="*.mzstatic.com/..."> icon followed by a sibling cell whose
-    // first text node is the app name. Only runs when subject contains "expir".
-    if (/expir/i.test(subject)) {
-      $("img[src*='mzstatic.com']").first().closest("td, div").each((_, iconCell) => {
-        if (found) return false;
-        const infoCell = $(iconCell).next("td, div");
-        if (!infoCell.length) return;
-        let firstText = "";
-        infoCell.contents().each((_, node) => {
-          if (firstText) return false;
-          if (node.type === "text") {
-            const t = (node.data || "").replace(/[\u00a0\s]+/g, " ").trim();
-            if (t.length >= 2) firstText = t;
-          } else if (node.type === "tag" && node.name !== "img" && node.name !== "br") {
-            const t = $(node).text().replace(/[\u00a0\s]+/g, " ").trim();
-            if (t.length >= 2) firstText = t;
-          }
-        });
-        if (!firstText) return;
-        const clean = stripAppleSubjectPrefixes(firstText)
-          .replace(/\s*:\s+.+$/, "")
-          .replace(/\s+-\s+.+$/, "")
-          .trim();
-        if (clean.length >= 2 && clean.length <= 60 &&
-            !APPLE_GENERIC_ALT.test(clean) && isValidAppleName(clean)) {
-          found = clean;
-          foundStrategy = "apple_iap_strategy_0_expiry_card";
+    // ── Strategy 0: Product card extraction (generic — all Apple IAP email types) ──
+    // Apple transactional emails (receipts, renewals, expiry notices, confirmations)
+    // consistently render a product card: an app icon image hosted on mzstatic.com
+    // or apple.com/app, followed by a sibling cell whose first non-empty text node
+    // is the app name. No subject-line guard — applies to all Apple IAP emails.
+    $("img[src*='mzstatic.com'], img[src*='apple.com/app']").first().closest("td, div").each((_, iconCell) => {
+      if (found) return false;
+      const infoCell = $(iconCell).next("td, div");
+      if (!infoCell.length) return;
+      let firstText = "";
+      infoCell.contents().each((_, node) => {
+        if (firstText) return false;
+        if (node.type === "text") {
+          const t = (node.data || "").replace(/[\u00a0\s]+/g, " ").trim();
+          if (t.length >= 3) firstText = t;
+        } else if (node.type === "tag" && node.name !== "img" && node.name !== "br") {
+          const t = $(node).text().replace(/[\u00a0\s]+/g, " ").trim();
+          if (t.length >= 3) firstText = t;
         }
       });
-      if (found) return { name: found, strategy: foundStrategy };
-    }
+      if (!firstText) return;
+      const clean = stripAppleSubjectPrefixes(firstText)
+        .replace(/\s*:\s+.+$/, "")
+        .replace(/\s+-\s+.+$/, "")
+        .trim();
+      if (clean.length >= 3 && clean.length <= 60 &&
+          !APPLE_GENERIC_ALT.test(clean) && isValidAppleName(clean)) {
+        found = clean;
+        foundStrategy = "apple_iap_strategy_0_product_card";
+      }
+    });
+    if (found) return { name: found, strategy: foundStrategy };
 
     // ── Strategy A: "App" label row traversal ──────────────────────────────
     $("tr").each((_, row) => {
