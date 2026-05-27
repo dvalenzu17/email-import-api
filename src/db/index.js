@@ -67,8 +67,9 @@ export async function getOAuthToken(userId) {
  * each subscription so we can diagnose parsing failures in production.
  */
 export async function batchUpsertSubscriptions(userId, subscriptions) {
-  if (!subscriptions.length) return;
+  if (!subscriptions.length) return new Set();
 
+  let writtenMerchants = new Set();
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -205,12 +206,14 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
     );
 
     await client.query("COMMIT");
+    writtenMerchants = new Set(upsertRes.rows.map((r) => r.merchant.toLowerCase()));
   } catch (err) {
     await client.query("ROLLBACK");
     throw new Error(`db_batch_upsert_subscriptions_failed: ${err.message}`);
   } finally {
     client.release();
   }
+  return writtenMerchants;
 }
 
 /**

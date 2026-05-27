@@ -144,12 +144,15 @@ export function registerImapScanRoutes(server) {
         return true;
       });
 
+      // Write engine-detected subscriptions first. detectedMerchants is built from the
+      // keys actually committed to the DB — not the in-memory confident list — so a
+      // merchant that fails to write doesn't falsely block the bypass path.
+      const writtenMerchants = await batchUpsertSubscriptions(userId, confident);
+      const detectedMerchants = new Set(writtenMerchants);
+
       // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
       // engine didn't detect them (insufficient recurrence data), add them manually
       // with a moderate confidence so they appear in the review candidates page.
-      // Use confident (not allSubscriptions) so merchants that scored below the
-      // threshold are still eligible for the bypass rather than silently dropped.
-      const detectedMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
       const appleBypass = [];
       const appleBypassSeen = new Set();
       // Expiry notices where app-name extraction failed and merchant resolved to "Apple".
@@ -200,7 +203,7 @@ export function registerImapScanRoutes(server) {
         });
       }
 
-      await batchUpsertSubscriptions(userId, [...confident, ...appleBypass]);
+      if (appleBypass.length) await batchUpsertSubscriptions(userId, appleBypass);
 
       // Bug 2: for expiry notices where merchant="Apple", try to patch renewal_date onto
       // the existing subscription matched by amount (±$0.50) + billing_interval.
