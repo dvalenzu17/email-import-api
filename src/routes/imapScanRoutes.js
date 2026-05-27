@@ -105,8 +105,16 @@ export function registerImapScanRoutes(server) {
 
       const allSubscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => {
         const raw = chargeDataMap[s.merchant.toLowerCase()];
+        // Task 3: Apple IAP emails are official transactional receipts from Apple — boost
+        // confidence by +0.15 before threshold filtering. A single Apple confirmation is
+        // stronger evidence than multiple charge-pattern inferences from a generic inbox.
+        const isAppleIAP = !!raw?.isAppleIAP;
+        const boostedConfidence = isAppleIAP
+          ? Math.min(1.0, Math.round((s.confidence + 0.15) * 1000) / 1000)
+          : s.confidence;
         return {
           ...s,
+          confidence: boostedConfidence,
           source: provider,
           // Override billingInterval if the engine returned null/unknown and we extracted one from the email.
           billingInterval: s.billingInterval && s.billingInterval !== "unknown"
@@ -118,18 +126,23 @@ export function registerImapScanRoutes(server) {
           extractionLog: raw?.extractionLog ?? null,
         };
       });
-      // iCloud Apple receipts use a lower threshold (0.55) because the Apple receipt
-      // format is highly reliable — format ambiguity is low even when recurrence data
-      // is sparse. Other providers keep the standard 0.60 threshold.
-      const threshold = provider === "icloud" ? 0.55 : CONFIDENCE_THRESHOLD;
-      const confident = allSubscriptions.filter((s) => s.confidence >= threshold);
+      // Task 1: separate thresholds per source reliability.
+      //   Apple IAP (email.apple.com receipts): 0.35 — one official receipt is stronger evidence
+      //     than multiple inferred charge patterns; the structural format is highly reliable.
+      //   Non-Apple iCloud: 0.55 — reliable IMAP but merchant resolution is less certain.
+      //   Gmail / other providers: CONFIDENCE_THRESHOLD (0.50).
+      const APPLE_IAP_THRESHOLD = 0.35;
+      const nonAppleThreshold   = provider === "icloud" ? 0.55 : CONFIDENCE_THRESHOLD;
 
-      // Bug 3 logging: subscriptions the engine scored but fell below the confidence threshold.
-      for (const s of allSubscriptions) {
-        if (s.confidence < threshold) {
-          console.log(`[imap] below_threshold merchant="${s.merchant}" confidence=${s.confidence} threshold=${threshold}`);
+      const confident = allSubscriptions.filter((s) => {
+        const raw = chargeDataMap[s.merchant.toLowerCase()];
+        const thr = raw?.isAppleIAP ? APPLE_IAP_THRESHOLD : nonAppleThreshold;
+        if (s.confidence < thr) {
+          console.log(`[imap] below_threshold merchant="${s.merchant}" confidence=${s.confidence} threshold=${thr} isAppleIAP=${!!raw?.isAppleIAP}`);
+          return false;
         }
-      }
+        return true;
+      });
 
       // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
       // engine didn't detect them (insufficient recurrence data), add them manually
@@ -143,14 +156,16 @@ export function registerImapScanRoutes(server) {
       // We can't write merchant="Apple" as a new record — collect for renewal_date patching instead.
       const expiryRenewalUpdates = [];
 
+      // Task 2: bypass is open to ALL charges that weren't written via the confident path —
+      // not just Apple IAP. The isAppleIAP flag is for merchant name extraction only; it is
+      // not a gate on which merchants may be written.
       for (const c of charges) {
-        if (!c.isAppleIAP) continue;
         const key = c.merchant.toLowerCase();
 
-        // Bug 2: expiry notice where merchant resolved to "Apple" (HTML extraction failed).
-        // Writing merchant="Apple" would shadow all other Apple IAP subscriptions via the
-        // unique index on (user_id, LOWER(merchant)), and dedup burns the slot for every
-        // real subscription that follows. Skip the INSERT; patch renewal_date instead.
+        // Apple expiry notice where app-name extraction failed → merchant="Apple".
+        // Writing merchant="Apple" would shadow all other subscriptions via the unique
+        // index on (user_id, LOWER(merchant)) and burn the dedup slot. Skip INSERT;
+        // patch renewal_date onto the matched existing record instead.
         if (c.isExpiryNotice && key === "apple") {
           console.log(`[imap] bypass_skip reason=expiry_apple_fallback amount=${c.amount} interval=${c.billingInterval} renewalDate=${c.renewalDate ?? "null"}`);
           if (c.renewalDate) expiryRenewalUpdates.push({ amount: c.amount, billingInterval: c.billingInterval ?? null, renewalDate: c.renewalDate });
@@ -166,15 +181,15 @@ export function registerImapScanRoutes(server) {
           continue;
         }
         appleBypassSeen.add(key);
+        console.log(`[imap] bypass_add merchant="${c.merchant}" amount=${c.amount} isAppleIAP=${c.isAppleIAP}`);
         appleBypass.push({
           merchant:        c.merchant,
-          // Bug 1 fix: charge object uses "amount"; batchUpsertSubscriptions reads "renewalAmount".
           renewalAmount:   c.amount,
           currency:        c.currency,
           billingInterval: c.billingInterval ?? "monthly",
           renewalDate:     c.renewalDate ?? null,
-          // "Expiring" emails explicitly state the renewal price and date — high confidence.
-          // Standard Apple IAP bypass uses 0.75 (format is reliable but recurrence unverified).
+          // Expiry notices state the renewal price/date explicitly — higher confidence.
+          // All other bypass entries use 0.75 (structurally observed charge, unverified recurrence).
           confidence:      c.isExpiryNotice ? 0.80 : 0.75,
           isActive:        true,
           isSuggested:     true,
@@ -183,14 +198,6 @@ export function registerImapScanRoutes(server) {
           iconUrl:         c.iconUrl ?? null,
           extractionLog:   c.extractionLog ?? null,
         });
-      }
-
-      // Bug 3 logging: non-Apple charges that didn't make it into confident.
-      for (const c of charges) {
-        if (c.isAppleIAP) continue;
-        if (!detectedMerchants.has(c.merchant.toLowerCase())) {
-          console.log(`[imap] non_apple_not_written merchant="${c.merchant}" amount=${c.amount} — not in confident set`);
-        }
       }
 
       await batchUpsertSubscriptions(userId, [...confident, ...appleBypass]);
