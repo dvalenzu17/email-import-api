@@ -1,5 +1,7 @@
-import jwt from "jsonwebtoken";
+import jwt from "jsonwebtoken"; // kept for rate-limit keyGenerator only
+import { CONFIDENCE_THRESHOLD } from "../config.js";
 import { z } from "zod";
+import { requireUser } from "../lib/auth.js";
 import { scanImapInbox, verifyImapCredentials, getImapConfig } from "../services/imapClient.js";
 import { detectRecurringSubscriptions } from "../services/subscriptionEngine.js";
 import { batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveImapCredentials, getImapCredentials, getFeedbackMerchantMap, cancelSubscriptionByMerchant } from "../db/index.js";
@@ -37,17 +39,8 @@ const IMAP_RATE_LIMIT = {
 export function registerImapScanRoutes(server) {
 
   server.post("/scan/imap/verify", async (req, reply) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.split(" ")[1];
-    if (!token) return reply.code(401).send({ error: "unauthorized" });
-
-    let userId;
-    try {
-      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-      userId = decoded.sub;
-    } catch {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+    const userId = requireUser(req, reply);
+    if (!userId) return;
 
     const parsed = verifyBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -68,17 +61,8 @@ export function registerImapScanRoutes(server) {
   });
 
   server.post("/scan/imap", { config: { rateLimit: IMAP_RATE_LIMIT } }, async (req, reply) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.split(" ")[1];
-    if (!token) return reply.code(401).send({ error: "unauthorized" });
-
-    let userId;
-    try {
-      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-      userId = decoded.sub;
-    } catch {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+    const userId = requireUser(req, reply);
+    if (!userId) return;
 
     const scanParsed = scanBodySchema.safeParse(req.body);
     if (!scanParsed.success) {
@@ -128,11 +112,13 @@ export function registerImapScanRoutes(server) {
           billingInterval: s.billingInterval && s.billingInterval !== "unknown"
             ? s.billingInterval
             : (raw?.billingInterval ?? s.billingInterval),
-          senderDomain: raw?.senderDomain ?? null,
-          iconUrl:      raw?.iconUrl ?? null,
+          senderDomain:  raw?.senderDomain ?? null,
+          iconUrl:       raw?.iconUrl ?? null,
+          // TASK 7: pass extractionLog from the charge to the DB upsert
+          extractionLog: raw?.extractionLog ?? null,
         };
       });
-      const confident = allSubscriptions.filter((s) => s.confidence >= 0.7);
+      const confident = allSubscriptions.filter((s) => s.confidence >= CONFIDENCE_THRESHOLD);
 
       // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
       // engine didn't detect them (insufficient recurrence data), add them manually
@@ -158,6 +144,8 @@ export function registerImapScanRoutes(server) {
           source:          provider,
           senderDomain:    c.senderDomain ?? null,
           iconUrl:         c.iconUrl ?? null,
+          // TASK 7: propagate extractionLog from the charge
+          extractionLog:   c.extractionLog ?? null,
         });
       }
 
@@ -169,9 +157,20 @@ export function registerImapScanRoutes(server) {
       let cancelledForReview = [];
       if (cancelledCharges.length) {
         const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
-        const newlyCancelled = cancelledCharges
-          .filter((c) => !activeMerchants.has(c.merchant.toLowerCase()))
-          .map((c) => ({ ...c, source: provider }));
+        // Deduplicate by merchant — multiple emails for the same merchant (e.g. 3
+        // failed-payment emails for disney+) would cause a Postgres ON CONFLICT error
+        // if all rows hit the same unique key in a single unnest() INSERT.
+        // Keep the entry with the largest amount when there are duplicates.
+        const cancelledByMerchant = {};
+        for (const c of cancelledCharges) {
+          const key = c.merchant.toLowerCase();
+          if (activeMerchants.has(key)) continue;
+          const prev = cancelledByMerchant[key];
+          if (!prev || c.renewalAmount > prev.renewalAmount) {
+            cancelledByMerchant[key] = { ...c, source: provider };
+          }
+        }
+        const newlyCancelled = Object.values(cancelledByMerchant);
         if (newlyCancelled.length) {
           await upsertCancelledSubscriptions(userId, newlyCancelled);
           cancelledForReview = newlyCancelled.map((c) => ({
@@ -191,9 +190,21 @@ export function registerImapScanRoutes(server) {
       }
 
       // Apply lifecycle cancellations detected in scan (mirrors Gmail scan behaviour).
+      // Never cancel a merchant that was also detected as an active charge in this
+      // same scan — a receipt always wins over an old expiry/cancellation notice.
+      // e.g. LinkedIn may have a "Your Subscription is Expiring" notice in the
+      // inbox AND a recent "Your Subscription is Confirmed" receipt; without this
+      // guard the route would upsert LinkedIn as active then immediately cancel it.
       if (cancellations.length) {
+        const activeScanMerchants = new Set([
+          ...confident.map((s) => s.merchant.toLowerCase()),
+          ...appleBypass.map((s) => s.merchant.toLowerCase()),
+        ]);
+        const staleCancellations = cancellations.filter(
+          (m) => !activeScanMerchants.has(m.toLowerCase())
+        );
         await Promise.allSettled(
-          cancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
+          staleCancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
         );
       }
 

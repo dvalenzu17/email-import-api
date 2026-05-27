@@ -1,6 +1,7 @@
 import { ImapFlow } from "imapflow";
 import { simpleParser } from "mailparser";
-import { cleanEmailHtml, extractAmount, extractMerchant, extractCurrencyCode, extractRenewalDate, extractBillingInterval, extractAppleAppNameFromHtml, extractAppleIconUrl } from "./emailParser.js";
+import { cleanEmailHtml, extractAmount, extractAmountWithLog, extractMerchant, extractMerchantWithLog, extractCurrencyCode, extractRenewalDate, extractRenewalDateWithLog, extractBillingInterval, extractBillingIntervalWithLog, extractAppleAppNameFromHtml, extractAppleAppNameFromHtmlWithLog, extractAppleIconUrl } from "./emailParser.js";
+import { normaliseMerchant } from "../lib/normaliseMerchant.js";
 import { getBrandInfo, getKnownDomains } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
@@ -106,54 +107,29 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
     const since = new Date();
     since.setDate(since.getDate() - daysBack);
 
-    // Use UID search explicitly
-    const allUids = await client.search({ since }, { uid: true });
-    if (!allUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
+    // Server-side SEARCH: union subject keywords + Apple billing sender.
+    // Replaces the old "fetch all envelopes, slice-1500, filter locally" approach
+    // so the full daysBack window is covered regardless of inbox size.
+    const IMAP_SUBJECT_KEYWORDS = [
+      "subscription", "renewal", "receipt", "invoice",
+      "membership", "billing", "welcome", "confirmed", "confirmation",
+    ];
+    const IMAP_BILLING_SENDERS = ["email.apple.com"];
 
-    const uids = allUids.slice(-1500);
-
-    // Pass 1 — envelopes only, UID mode
-    const relevant = [];
-
-    for await (const msg of client.fetch(
-      uids,
-      { envelope: true, uid: true },
-      { uid: true }
-    )) {
-      scannedCount++;
-      const subject = msg.envelope?.subject?.toLowerCase() ?? "";
-      const senderAddress = msg.envelope?.from?.[0]?.address?.toLowerCase() ?? "";
-      const isKnownSender = [...IMAP_KNOWN_DOMAINS].some(d => senderAddress.includes(d));
-
-      // Always include emails from known subscription domains regardless of subject —
-      // e.g. Disney+ welcome emails ("Welcome to Disney+") don't have billing keywords
-      // in the subject but carry cadence, price, and renewal date in the body.
-      const looksRelevant =
-        isKnownSender ||
-        subject.includes("receipt") ||
-        subject.includes("invoice") ||
-        subject.includes("subscription") ||
-        subject.includes("renewal") ||
-        subject.includes("membership") ||
-        subject.includes("billing") ||
-        subject.includes("auto-renew") ||
-        subject.includes("your plan") ||
-        subject.includes("charged") ||
-        subject.includes("payment") ||
-        subject.includes("welcome");
-        // NOTE: "order confirmation" deliberately excluded — fires on one-time purchases
-
-      if (looksRelevant) {
-        relevant.push({ uid: msg.uid, envelope: msg.envelope });
-      }
+    const uidSet = new Set();
+    for (const kw of IMAP_SUBJECT_KEYWORDS) {
+      const uids = await client.search({ since, subject: kw }, { uid: true });
+      for (const uid of uids) uidSet.add(uid);
+    }
+    for (const sender of IMAP_BILLING_SENDERS) {
+      const uids = await client.search({ since, from: sender }, { uid: true });
+      for (const uid of uids) uidSet.add(uid);
     }
 
-    if (!relevant.length) return { charges, cancellations, cancelledCharges, scannedCount };
+    const relevantUids = [...uidSet].sort((a, b) => a - b);
+    scannedCount = relevantUids.length;
 
-    const relevantUids = relevant.map((r) => r.uid);
-    const envelopeMap = Object.fromEntries(
-      relevant.map((r) => [r.uid, r.envelope])
-    );
+    if (!relevantUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
 
     // Pass 2 — full source, UID mode
     // mailparser decodes MIME structure and base64 parts correctly — cheerio
@@ -182,16 +158,35 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           text.includes("your uber eats order")
         ) continue;
 
-        // mailparser already parsed From + Subject from the MIME headers —
-        // prefer these over the envelope (which comes from IMAP FETCH ENVELOPE
-        // and can be lossy with non-ASCII names).
         const fromParsed = parsed.from?.value?.[0];
         const fromHeader = fromParsed?.name
           ? `${fromParsed.name} <${fromParsed.address ?? ""}>`
-          : (fromParsed?.address ?? (envelopeMap[msg.uid]?.from?.[0]?.address ?? ""));
-        const subject = parsed.subject ?? envelopeMap[msg.uid]?.subject ?? "";
+          : (fromParsed?.address ?? "");
+        const subject = parsed.subject ?? "";
 
-        const parsedDate = parsed.date ?? (envelopeMap[msg.uid]?.date ? new Date(envelopeMap[msg.uid].date) : null);
+        // ── Promotional / newsletter filter ───────────────────────────────────
+        // Reject emails that are clearly promotional discounts or newsletters —
+        // they often mention subscription amounts in a non-billing context and
+        // produce false positives.
+        const subjectLow = subject.toLowerCase();
+        const fromLow2   = fromHeader.toLowerCase();
+        const isPromoEmail =
+          /\b\d+\s*%\s*off\b/i.test(subject) ||          // "40% off"
+          /\$\d+\s*off\b/i.test(subject) ||               // "$40 off"
+          /\bfinal\s+hours?\b/i.test(subject) ||          // "FINAL HOURS"
+          /\blast\s+chance\b/i.test(subject) ||            // "LAST CHANCE"
+          /\blast\s+day\b/i.test(subject) ||               // "LAST DAY"
+          /\bflash\s+sale\b/i.test(subject) ||
+          /\blimited[\s-]time\s+offer\b/i.test(subject) ||
+          /\bnewsletter\b/i.test(fromHeader) ||            // "Sentry Newsletter <...>"
+          // One-time purchase / order confirmations — never subscriptions
+          /\bprocessing your order\b/i.test(subject) ||
+          /\border\s+(acknowledgment|confirmed|confirmation|received)\b/i.test(subject) ||
+          /\bthank you for (your )?(purchase|order)\b/i.test(subject) ||
+          subjectLow.startsWith("your invoice from apple");
+        if (isPromoEmail) continue;
+
+        const parsedDate = parsed.date ?? null;
 
         // ── Lifecycle classification ──────────────────────────────────────────
         // Detect cancellation/expiry emails so we can mark the subscription as
@@ -199,13 +194,33 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // Gmail scan's lifecycle handling.
         const emailType = classifyEmail(subject, text);
         if (emailType === EMAIL_TYPES.FAILED_PAYMENT) {
-          continue; // payment failed — not a successful charge
+          // A failed payment means the subscription existed — save it as inactive
+          // so it appears in the app (e.g. Disney+ which only sends payment-failed
+          // emails and no separate receipt emails).
+          const failedAmount = extractAmount(text);
+          if (failedAmount) {
+            const failedMerchant = extractMerchant(fromHeader, text, subject);
+            if (failedMerchant && failedMerchant !== "unknown") {
+              const failedDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
+              cancelledCharges.push({
+                merchant:        failedMerchant,
+                renewalAmount:   failedAmount,
+                currency:        extractCurrencyCode(text),
+                renewalDate:     extractRenewalDate(text),
+                billingInterval: extractBillingInterval(text),
+                senderDomain:    extractSenderDomain(fromHeader),
+                iconUrl:         null,
+                date:            failedDate,
+              });
+            }
+          }
+          continue; // not a successful charge
         }
         if (emailType === EMAIL_TYPES.CANCELLATION) {
           // Extract the app/merchant and amount so we can save it as an inactive
           // subscription — important for Apple "Your Subscription is Expiring" emails
           // where the subscription may not have been seen before (first iCloud scan).
-          const isAppleSenderC = fromHeader.toLowerCase().includes("apple.com");
+          const isAppleSenderC = (fromParsed?.address ?? "").toLowerCase().endsWith("@email.apple.com");
           let appleAppNameC = isAppleSenderC && parsed.html
             ? extractAppleAppNameFromHtml(parsed.html)
             : null;
@@ -215,14 +230,17 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
             const m2 = sub.match(/^Your\s+(.+?)\s+subscription\b/i);
             const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
             const rawName = (m1 || m2 || m3)?.[1]?.trim();
-            if (rawName && rawName.length > 1 && rawName.length < 50 &&
-                !/^(apple|receipt|invoice|payment|free|trial|subscription)$/i.test(rawName)) {
+            // TASK 2: use the same blocklist as extractAppleAppNameFromHtmlWithLog
+            if (rawName && rawName.length > 2 && rawName.length < 50 &&
+                !/^(apple|receipt|invoice|payment|free|trial|subscription|premium|annual|monthly|yearly|weekly|plan|plus|pro|basic|standard|elite|essential|lite|games|app|apps|service|account|membership)$/i.test(rawName) &&
+                !/^(annual|monthly|yearly|weekly)\s+(subscription|plan)$/i.test(rawName) &&
+                !/\d/.test(rawName)) {
               appleAppNameC = rawName;
             }
           }
           const cancelMerchant = appleAppNameC
-            ? appleAppNameC.toLowerCase().trim()
-            : extractMerchant(fromHeader, text, subject);
+            ? normaliseMerchant(appleAppNameC)
+            : normaliseMerchant(extractMerchant(fromHeader, text, subject));
           if (cancelMerchant && cancelMerchant !== "unknown") {
             cancellations.push(cancelMerchant);
             const cancelAmount = extractAmount(text);
@@ -243,16 +261,41 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           continue; // not a successful charge
         }
 
-        const amount = extractAmount(text);
-        if (!amount) continue;
+        // TASK 3: use extractAmountWithLog to capture why extraction failed
+        const { value: amount, strategy: amountStrategy } = extractAmountWithLog(text);
+        if (!amount) {
+          console.log(`[imap] amount_null: subject="${subject}" from="${fromAddr}" text_preview="${text.slice(0, 120)}"`);
+          continue;
+        }
 
         // For Apple IAP emails parse the app name from raw HTML table cells —
         // the cleaned-text strategies are confused by Apple's repeated app name
         // across multiple table rows (icon alt, App row, Subscription row).
-        const isAppleSender = fromHeader.toLowerCase().includes("apple.com");
-        let appleAppName = isAppleSender && parsed.html
-          ? extractAppleAppNameFromHtml(parsed.html)
-          : null;
+        // Apple billing/receipt emails always originate from @email.apple.com.
+        // Marketing emails come from other Apple domains (InsideApple.Apple.com,
+        // store.apple.com, news.apple.com etc.) and must not be treated as receipts.
+        const fromAddr = (fromParsed?.address ?? "").toLowerCase();
+        const isAppleSender = fromAddr.endsWith("@email.apple.com");
+        // TASK 7: use WithLog version to capture extraction strategy for extractionLog
+        let appleAppName = null;
+        let appleAppNameStrategy = null;
+        if (isAppleSender && parsed.html) {
+          const { name: _appleAppName, strategy: _appleStrategy } = extractAppleAppNameFromHtmlWithLog(parsed.html, subject);
+          appleAppName = _appleAppName;
+          appleAppNameStrategy = _appleStrategy;
+        }
+
+        // Belt-and-suspenders: reject legal entity names that slip through any
+        // extraction strategy (e.g. from Strategy C's "Subscription" label row).
+        if (appleAppName) {
+          const LEGAL_ENTITY = /(?:\b(?:uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?|z\s+o\.o\.)$/i;
+          if (LEGAL_ENTITY.test(appleAppName)) {
+            console.log(`[imap] rejected_legal_entity: "${appleAppName}" subject="${subject}"`);
+            appleAppName = null;
+          } else {
+            console.log(`[imap] apple_app_name: "${appleAppName}" subject="${subject}"`);
+          }
+        }
 
         // Subject-based fallback for Apple emails where HTML extraction fails.
         // Apple subjects often embed the app name:
@@ -265,8 +308,11 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           const m2 = sub.match(/^Your\s+(.+?)\s+subscription\b/i);
           const m3 = sub.match(/subscription\s+to\s+(.+?)\s+(?:has\s+been|renewal|confirmation)/i);
           const rawName = (m1 || m2 || m3)?.[1]?.trim();
-          if (rawName && rawName.length > 1 && rawName.length < 50 &&
-              !/^(apple|receipt|invoice|payment|free|trial)$/i.test(rawName)) {
+          // TASK 2: use the same blocklist as extractAppleAppNameFromHtmlWithLog
+          if (rawName && rawName.length > 2 && rawName.length < 50 &&
+              !/^(apple|receipt|invoice|payment|free|trial|subscription|premium|annual|monthly|yearly|weekly|plan|plus|pro|basic|standard|elite|essential|lite|games|app|apps|service|account|membership)$/i.test(rawName) &&
+              !/^(annual|monthly|yearly|weekly)\s+(subscription|plan)$/i.test(rawName) &&
+              !/\d/.test(rawName)) {
             appleAppName = rawName;
           }
         }
@@ -285,10 +331,17 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           if (!hasSubSignal) continue;
         }
 
-        const merchant = appleAppName
-          ? appleAppName.toLowerCase().trim()
-          : extractMerchant(fromHeader, text, subject);
-        if (merchant === "unknown") continue;
+        // TASK 6: normalise to title case; TASK 7: capture strategy for extractionLog
+        let merchant, merchantStrategy;
+        if (appleAppName) {
+          merchant = normaliseMerchant(appleAppName);
+          merchantStrategy = appleAppNameStrategy ?? "apple_iap_subject_fallback";
+        } else {
+          const { merchant: rawMerchant, strategy: _merchantStrategy } = extractMerchantWithLog(fromHeader, text, subject);
+          merchant = normaliseMerchant(rawMerchant);
+          merchantStrategy = _merchantStrategy;
+        }
+        if (!merchant || merchant.toLowerCase() === "unknown") continue;
 
         const date = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
 
@@ -298,6 +351,43 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         const fromLow = fromHeader.toLowerCase();
         const isKnownDomain = [...IMAP_KNOWN_DOMAINS].some(d => fromLow.includes(d));
         const brandInfo = merchant !== "unknown" ? getBrandInfo(merchant) : null;
+
+        // Apple marketing/hardware emails (InsideApple.Apple.com, orders.apple.com, etc.)
+        // match IMAP_KNOWN_DOMAINS via "apple.com" even though they are not billing senders.
+        // Only @email.apple.com is a real Apple billing domain — treat all other Apple
+        // addresses the same as unknown domains for the hard billing signal check.
+        const isBillingKnownDomain = isKnownDomain &&
+          !(fromAddr.includes("apple.com") && !isAppleSender);
+
+        // For non-Apple, non-known-domain senders require at least one hard billing
+        // signal in the text. Marketing emails, newsletters, and nurture sequences
+        // often mention prices and subscription words without being actual receipts.
+        // NOTE: brandInfo.confirmSingle is intentionally NOT exempted here — it is a
+        // subscription-engine hint (1 charge = enough to confirm a subscription) and
+        // has nothing to do with whether an email is a billing email. Exempting it
+        // caused Apple marketing emails (whose merchant resolved to "apple" via the
+        // display name) to bypass this filter entirely.
+        if (!isAppleSender && !isBillingKnownDomain) {
+          const hasHardBillingSignal =
+            text.includes("receipt") ||
+            text.includes("you have been charged") ||
+            text.includes("you've been charged") ||
+            text.includes("your payment of") ||
+            text.includes("payment confirmation") ||
+            text.includes("payment successful") ||
+            text.includes("payment received") ||
+            text.includes("billed to") ||
+            text.includes("invoice number") ||
+            text.includes("order number") ||
+            text.includes("thank you for your payment") ||
+            text.includes("your card ending") ||
+            subjectLow.includes("receipt") ||
+            subjectLow.includes("invoice") ||
+            subjectLow.includes("your subscription") ||
+            subjectLow.includes("subscription renewal") ||
+            subjectLow.includes("subscription confirmed");
+          if (!hasHardBillingSignal) continue;
+        }
 
         let intentScore = 0;
         if (isKnownDomain || brandInfo?.confirmSingle) intentScore += 3;
@@ -315,8 +405,9 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         if (text.includes("receipt"))                    intentScore += 1;
         if (text.includes("billing"))                    intentScore += 1;
 
-        const renewalDate = extractRenewalDate(text);
-        const billingInterval = extractBillingInterval(text);
+        // TASK 3/7: use WithLog versions to capture extraction strategies
+        const { value: renewalDate, strategy: renewalDateStrategy } = extractRenewalDateWithLog(text);
+        const { value: billingInterval, strategy: intervalStrategy } = extractBillingIntervalWithLog(text);
         // For Apple IAP emails the sender domain is always apple.com, which would
         // cause BrandAvatar to show the Apple logo for every app. Leave it null so
         // the brand resolver falls back to the merchant name instead.
@@ -326,8 +417,37 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         // don't need any external brand lookup for Apple IAP apps.
         const iconUrl = isAppleSender && parsed.html ? extractAppleIconUrl(parsed.html) : null;
 
+        // TASK 7: build extractionLog mirroring the Gmail scan path
+        const extractionLog = {
+          merchant: {
+            strategy:   merchantStrategy,
+            value:      merchant,
+            failed:     !merchant || merchant.toLowerCase() === "unknown",
+            failReason: null,
+          },
+          amount: {
+            strategy:   amountStrategy,
+            value:      amount,
+            failed:     amount === null,
+            failReason: amount === null ? "no_amount_pattern_matched" : null,
+          },
+          renewalDate: {
+            strategy:   renewalDateStrategy,
+            value:      renewalDate?.toISOString() ?? null,
+            failed:     renewalDate === null,
+            failReason: renewalDate === null ? "no_date_pattern_matched" : null,
+          },
+          billingInterval: {
+            strategy:   intervalStrategy,
+            value:      billingInterval,
+            failed:     billingInterval === null,
+            failReason: billingInterval === null ? "no_interval_pattern_matched" : null,
+          },
+        };
+
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
+        console.log(`[imap] charge: merchant="${merchant}" amount=${amount} amountStrategy=${amountStrategy} subject="${subject}" from="${fromHeader.substring(0, 80)}" iconUrl=${iconUrl ? "yes" : "null"} interval=${billingInterval ?? "null"}(${intervalStrategy ?? "null"})`);
         charges.push({
           merchant,
           amount,
@@ -339,6 +459,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           iconUrl,
           isAppleIAP: isAppleSender,
           subscriptionIntent: intentScore >= 2,
+          extractionLog,
         });
       } catch {
         continue;
