@@ -1,6 +1,7 @@
 import pkg from "pg";
 import { encryptCredential } from "../services/crypto.js";
 import { detectAmountAnomaly } from "../services/anomalyDetector.js";
+import { normaliseMerchant } from "../lib/normaliseMerchant.js";
 const { Pool } = pkg;
 
 export const pool = new Pool({
@@ -60,6 +61,10 @@ export async function getOAuthToken(userId) {
  *   - Logs a detection event for each subscription (type = 'detected' or 'resumed')
  *   - Marks subscriptions not seen in 2× their billing period as inactive
  *     (respects user_status overrides — manual confirmations/cancellations are never touched)
+ *
+ * TASK 1: Now also upserts extraction_log (jsonb) — the per-field extraction
+ * strategy telemetry recorded by emailParser.parseEmailWithLog(). Stored for
+ * each subscription so we can diagnose parsing failures in production.
  */
 export async function batchUpsertSubscriptions(userId, subscriptions) {
   if (!subscriptions.length) return;
@@ -78,19 +83,21 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
     // Upsert subscriptions. Always refresh last_seen_at and reset is_active to true
     // (the staleness sweep below re-marks stale ones after this scan).
     // user_status is intentionally not touched here — manual overrides persist.
+    // TASK 1: extraction_log column included — JSON.stringify to jsonb cast.
     const upsertRes = await client.query(
       `INSERT INTO subscriptions
          (user_id, merchant, renewal_amount, currency, renewal_date,
           confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
-          icon_url, sender_domain)
+          icon_url, sender_domain, extraction_log)
        SELECT * FROM unnest(
          $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::timestamptz[],
          $6::numeric[], $7::boolean[], $8::boolean[], $9::text[], $10::text[],
-         $11::timestamptz[], $12::text[], $13::text[]
+         $11::timestamptz[], $12::text[], $13::text[], $14::jsonb[]
        ) AS t(user_id, merchant, renewal_amount, currency, renewal_date,
               confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
-              icon_url, sender_domain)
-       ON CONFLICT (user_id, merchant) DO UPDATE SET
+              icon_url, sender_domain, extraction_log)
+       ON CONFLICT (user_id, LOWER(merchant)) DO UPDATE SET
+         merchant         = EXCLUDED.merchant,
          renewal_amount   = EXCLUDED.renewal_amount,
          renewal_date     = EXCLUDED.renewal_date,
          confidence       = EXCLUDED.confidence,
@@ -99,6 +106,7 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
          last_seen_at     = EXCLUDED.last_seen_at,
          icon_url         = COALESCE(EXCLUDED.icon_url, subscriptions.icon_url),
          sender_domain    = COALESCE(EXCLUDED.sender_domain, subscriptions.sender_domain),
+         extraction_log   = COALESCE(EXCLUDED.extraction_log, subscriptions.extraction_log),
          is_active        = CASE
            WHEN subscriptions.user_status = 'cancelled'  THEN false
            WHEN subscriptions.user_status = 'confirmed'  THEN true
@@ -108,7 +116,8 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
        RETURNING id, merchant`,
       [
         subscriptions.map(() => userId),
-        subscriptions.map((s) => s.merchant),
+        // TASK 5/6: normalise merchant to title case for consistent deduplication
+        subscriptions.map((s) => normaliseMerchant(s.merchant)),
         subscriptions.map((s) => s.renewalAmount),
         subscriptions.map((s) => s.currency),
         subscriptions.map((s) => s.renewalDate),
@@ -120,6 +129,8 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
         subscriptions.map(() => new Date()),
         subscriptions.map((s) => s.iconUrl ?? null),
         subscriptions.map((s) => s.senderDomain ?? null),
+        // TASK 1: Serialize extractionLog as JSON string; Postgres casts to jsonb.
+        subscriptions.map((s) => s.extractionLog ? JSON.stringify(s.extractionLog) : null),
       ]
     );
 
@@ -404,7 +415,8 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
        ) AS t(user_id, merchant, renewal_amount, currency, renewal_date,
               confidence, is_active, is_suggested, source, billing_interval, last_seen_at,
               icon_url, sender_domain)
-       ON CONFLICT (user_id, merchant) DO UPDATE SET
+       ON CONFLICT (user_id, LOWER(merchant)) DO UPDATE SET
+         merchant       = EXCLUDED.merchant,
          renewal_amount = EXCLUDED.renewal_amount,
          currency       = EXCLUDED.currency,
          last_seen_at   = EXCLUDED.last_seen_at,
@@ -417,7 +429,8 @@ export async function upsertCancelledSubscriptions(userId, subscriptions) {
          updated_at     = NOW()`,
       [
         subscriptions.map(() => userId),
-        subscriptions.map((s) => s.merchant),
+        // TASK 5/6: normalise merchant to title case for consistent deduplication
+        subscriptions.map((s) => normaliseMerchant(s.merchant)),
         subscriptions.map((s) => s.renewalAmount),
         subscriptions.map((s) => s.currency),
         subscriptions.map((s) => s.renewalDate ?? null),
@@ -455,6 +468,57 @@ export async function cancelSubscriptionByMerchant(userId, merchant) {
     );
   } catch (err) {
     throw new Error(`db_cancel_subscription_failed: ${err.message}`);
+  }
+}
+
+// -------------------------
+// TASK 4: MERCHANT CONFIRMATIONS
+// -------------------------
+
+/**
+ * TASK 4 — Saves a user's explicit confirmation or rejection of a detected
+ * subscription to the merchant_confirmations table. Accumulates signal used
+ * by POST /admin/merchant-aliases/rebuild to auto-promote high-confidence
+ * domain→canonical_name mappings into merchant_aliases.
+ *
+ * @param {string} userId
+ * @param {{ merchantDomain: string, canonicalName: string, confirmed: boolean, amount?: number, interval?: string }} opts
+ */
+export async function saveMerchantConfirmation(userId, { merchantDomain, canonicalName, confirmed, amount, interval }) {
+  try {
+    await pool.query(
+      `INSERT INTO merchant_confirmations (user_id, merchant_domain, canonical_name, confirmed, amount, interval)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, merchantDomain, canonicalName, confirmed, amount ?? null, interval ?? null]
+    );
+  } catch (err) {
+    throw new Error(`db_save_merchant_confirmation_failed: ${err.message}`);
+  }
+}
+
+/**
+ * TASK 4 — Returns aggregate confirmation counts per merchant_domain.
+ * Used by /admin/merchant-aliases/rebuild to decide which domains to promote
+ * to merchant_aliases and by how much to boost confidence.
+ *
+ * Returns rows: [{ merchant_domain, canonical_name, confirmed_count, total_count }]
+ * canonical_name is the most frequently confirmed name for that domain.
+ */
+export async function aggregateMerchantConfirmations() {
+  try {
+    const res = await pool.query(`
+      SELECT
+        merchant_domain,
+        canonical_name,
+        COUNT(*) FILTER (WHERE confirmed = true)  AS confirmed_count,
+        COUNT(*)                                   AS total_count
+      FROM merchant_confirmations
+      GROUP BY merchant_domain, canonical_name
+      ORDER BY confirmed_count DESC, merchant_domain
+    `);
+    return res.rows;
+  } catch (err) {
+    throw new Error(`db_aggregate_merchant_confirmations_failed: ${err.message}`);
   }
 }
 
