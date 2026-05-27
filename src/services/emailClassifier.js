@@ -58,7 +58,6 @@ export function classifyEmail(subject, body) {
     b.includes("will not renew") ||
     b.includes("turned off auto-renew") ||
     b.includes("auto-renewal has been turned off") ||
-    b.includes("subscription will expire") ||
     b.includes("access will end on") ||
     b.includes("access ends on") ||
     b.includes("subscription has ended") ||
@@ -125,6 +124,9 @@ export function classifyEmail(subject, body) {
     // Apple "Your Subscription is Expiring" — subscription is expiring but price is still actionable
     /subscription.{0,15}expir/i.test(s) ||
     s.includes("subscription is expiring") ||
+    // Apple "Your Subscription is Expiring" body text — trial converting to paid.
+    // Moved here from CANCELLATION: the subscription is NOT cancelled, it's about to charge.
+    b.includes("subscription will expire") ||
     b.includes("will be charged") ||
     b.includes("will automatically renew") ||
     b.includes("will renew on") ||

@@ -84,6 +84,12 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
     // (the staleness sweep below re-marks stale ones after this scan).
     // user_status is intentionally not touched here — manual overrides persist.
     // TASK 1: extraction_log column included — JSON.stringify to jsonb cast.
+    //
+    // Merge rules on conflict:
+    //   renewal_amount, renewal_date, billing_interval — fill-null-only:
+    //     keep the existing DB value if it is non-null; only write the new value
+    //     when the DB field is currently null. This preserves manually corrected data.
+    //   confidence — take the higher of the two values (never downgrade a subscription).
     const upsertRes = await client.query(
       `INSERT INTO subscriptions
          (user_id, merchant, renewal_amount, currency, renewal_date,
@@ -98,15 +104,15 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
               icon_url, sender_domain, extraction_log)
        ON CONFLICT (user_id, LOWER(merchant)) DO UPDATE SET
          merchant         = EXCLUDED.merchant,
-         renewal_amount   = EXCLUDED.renewal_amount,
-         renewal_date     = EXCLUDED.renewal_date,
-         confidence       = EXCLUDED.confidence,
+         renewal_amount   = COALESCE(subscriptions.renewal_amount,   EXCLUDED.renewal_amount),
+         renewal_date     = COALESCE(subscriptions.renewal_date,     EXCLUDED.renewal_date),
+         billing_interval = COALESCE(subscriptions.billing_interval, EXCLUDED.billing_interval),
+         confidence       = GREATEST(subscriptions.confidence,       EXCLUDED.confidence),
          is_suggested     = EXCLUDED.is_suggested,
-         billing_interval = EXCLUDED.billing_interval,
          last_seen_at     = EXCLUDED.last_seen_at,
-         icon_url         = COALESCE(EXCLUDED.icon_url, subscriptions.icon_url),
-         sender_domain    = COALESCE(EXCLUDED.sender_domain, subscriptions.sender_domain),
-         extraction_log   = COALESCE(EXCLUDED.extraction_log, subscriptions.extraction_log),
+         icon_url         = COALESCE(subscriptions.icon_url,      EXCLUDED.icon_url),
+         sender_domain    = COALESCE(subscriptions.sender_domain, EXCLUDED.sender_domain),
+         extraction_log   = COALESCE(subscriptions.extraction_log, EXCLUDED.extraction_log),
          is_active        = CASE
            WHEN subscriptions.user_status = 'cancelled'  THEN false
            WHEN subscriptions.user_status = 'confirmed'  THEN true

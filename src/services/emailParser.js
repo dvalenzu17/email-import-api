@@ -132,7 +132,9 @@ export function extractAmountWithLog(text) {
   }
 
   const AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
-  const CUR = '(?:usd|\\$|gbp|£|eur|€|cad|aud)';
+  // us\$ must come before \$ so "us$35.99" is consumed whole, not just the "$".
+  // usd\s? covers "usd35.99" and "usd 35.99". \$ remains for bare dollar signs.
+  const CUR = '(?:us\\$|usd\\s?|\\$|gbp|£|eur|€|cad|aud)';
 
   const totalMatch = s.match(new RegExp(`total\\s*[:\\-]?\\s*${CUR}\\s?${AMT}`));
   if (totalMatch) return { value: toNum(totalMatch[1]), strategy: "total_keyword" };
