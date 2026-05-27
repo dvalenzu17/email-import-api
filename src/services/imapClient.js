@@ -199,7 +199,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           // emails and no separate receipt emails).
           const failedAmount = extractAmount(text);
           if (failedAmount) {
-            const failedMerchant = extractMerchant(fromHeader, text, subject);
+            const failedMerchant = normaliseMerchant(extractMerchant(fromHeader, text, subject));
             if (failedMerchant && failedMerchant !== "unknown") {
               const failedDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
               cancelledCharges.push({
