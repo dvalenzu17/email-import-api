@@ -520,41 +520,60 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
     }
 
     // ── Strategy 0: Product card extraction (all Apple IAP email types) ──────
-    // Apple transactional emails render the app icon in a <td> using a
-    // mzstatic.com URL, with the app name as the first text in the immediately
-    // adjacent sibling <td> of the same <tr>. Iterates all mzstatic images
-    // (not just the first) to find one that is inside a table cell with a valid
-    // sibling. mzstatic.com is Apple's CDN for app assets; apple.com images are
-    // excluded because they include the Apple logo which appears near the subject
-    // line section and produces false positives.
+    // Apple transactional emails render the app icon in a <td> (mzstatic.com
+    // CDN) with the app name, tier label, and price as distinct text lines in
+    // the adjacent sibling <td>. Walk every text line in that cell by splitting
+    // the raw HTML on block/inline-break boundaries, then apply content-based
+    // rejection rules to each line. The first line that passes all rules is the
+    // app name. This correctly skips tier labels ("Monthly", "Premium Monthly")
+    // and price lines ("$9.99/month") regardless of nesting depth or email
+    // template variant — no hardcoded name or tier lists required.
+    const CARD_CURRENCY_RE = /(?:US\$|USD|[\$£€¥₹])\s*[\d,.]|[\d,.]\s*(?:US\$|USD|[\$£€¥₹])/i;
+    const CARD_FREQ_RE     = /\b(monthly|annual|annually|yearly|weekly|per\s+month|per\s+year|\/month|\/year)\b/i;
+    const CARD_TRIAL_RE    = /\b(free\s+trial|no\s+trial|trial)\b/i;
+
     $("img[src*='mzstatic.com']").each((_, img) => {
       if (found) return false;
       const iconTd = $(img).closest("td");
-      if (!iconTd.length) return;      // image not in a table cell — skip
+      if (!iconTd.length) return;
       const nameTd = iconTd.next("td");
-      if (!nameTd.length) return;      // no sibling cell in same row — skip
-      let firstText = "";
-      nameTd.contents().each((_, node) => {
-        if (firstText) return false;
-        if (node.type === "text") {
-          const t = (node.data || "").replace(/[\u00a0\s]+/g, " ").trim();
-          if (t.length >= 3) firstText = t;
-        } else if (node.type === "tag" && node.name !== "img" && node.name !== "br") {
-          const t = $(node).text().replace(/[\u00a0\s]+/g, " ").trim();
-          if (t.length >= 3) firstText = t;
-        }
-      });
-      if (!firstText) return;
-      const clean = stripAppleSubjectPrefixes(firstText)
-        .replace(/\s*:\s+.+$/, "")
-        .replace(/\s+-\s+.+$/, "")
-        .trim();
-      if (clean.length >= 3 && clean.length <= 60 &&
-          !APPLE_GENERIC_ALT.test(clean) &&
-          isValidAppleName(clean) &&
-          passesSubjectGuard(clean, subject)) {
+      if (!nameTd.length) return;
+
+      // Decompose the cell's HTML into individual text lines by normalising
+      // all block-level and inline-break boundaries before stripping tags.
+      // This handles any nesting depth: bare text nodes, nested <span>/<div>,
+      // <p> blocks, <br>-separated runs — all collapse to a flat line array.
+      const rawLines = ($(nameTd).html() || "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(?:p|div|li|td|tr|h[1-6]|span)>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/[\u00a0]/g, " ")
+        .split("\n")
+        .map((l) => l.replace(/\s+/g, " ").trim())
+        .filter((l) => l.length >= 3);
+
+      for (const raw of rawLines) {
+        // Clean before rejection checks so "AppName: Annual Plan" → "AppName"
+        // and "AppName - Monthly" → "AppName" before CARD_FREQ_RE is tested.
+        const clean = cleanAppleName(
+          stripAppleSubjectPrefixes(raw)
+            .replace(/\s*:\s+.+$/, "")
+            .replace(/\s+-\s+.+$/, "")
+        ).trim();
+
+        if (clean.length < 3 || clean.length > 60) continue;   // rule 5
+        if (CARD_CURRENCY_RE.test(clean)) continue;             // rule 1: price line
+        if (CARD_FREQ_RE.test(clean)) continue;                 // rule 2: tier/freq label
+        if (CARD_TRIAL_RE.test(clean)) continue;                // rule 3: trial language
+        // Rule 4 (near-duplicate): stopping at first accepted line is sufficient.
+
+        if (APPLE_GENERIC_ALT.test(clean)) continue;
+        if (!isValidAppleName(clean)) continue;
+        if (!passesSubjectGuard(clean, subject)) continue;
+
         found = clean;
         foundStrategy = "apple_iap_strategy_0_product_card";
+        return false; // stop .each()
       }
     });
     if (found) return { name: found, strategy: foundStrategy };
