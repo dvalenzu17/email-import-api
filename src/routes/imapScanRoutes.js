@@ -69,7 +69,7 @@ export function registerImapScanRoutes(server) {
       return reply.code(400).send({ error: "invalid_request" });
     }
 
-    let { provider, user, pass, daysBack = 365 } = scanParsed.data;
+    let { provider, user, pass, daysBack = 730 } = scanParsed.data;
 
     // Fall back to stored credentials if not supplied in request
     if (!user || !pass) {
@@ -118,12 +118,18 @@ export function registerImapScanRoutes(server) {
           extractionLog: raw?.extractionLog ?? null,
         };
       });
-      const confident = allSubscriptions.filter((s) => s.confidence >= CONFIDENCE_THRESHOLD);
+      // iCloud Apple receipts use a lower threshold (0.55) because the Apple receipt
+      // format is highly reliable — format ambiguity is low even when recurrence data
+      // is sparse. Other providers keep the standard 0.60 threshold.
+      const threshold = provider === "icloud" ? 0.55 : CONFIDENCE_THRESHOLD;
+      const confident = allSubscriptions.filter((s) => s.confidence >= threshold);
 
       // Apple IAP bypass: Apple IAP emails are almost always subscriptions. If the
       // engine didn't detect them (insufficient recurrence data), add them manually
       // with a moderate confidence so they appear in the review candidates page.
-      const detectedMerchants = new Set(allSubscriptions.map((s) => s.merchant.toLowerCase()));
+      // Use confident (not allSubscriptions) so merchants that scored below the
+      // threshold are still eligible for the bypass rather than silently dropped.
+      const detectedMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
       const appleBypass = [];
       const appleBypassSeen = new Set();
       for (const c of charges) {
@@ -138,7 +144,9 @@ export function registerImapScanRoutes(server) {
           currency:        c.currency,
           billingInterval: c.billingInterval ?? "monthly",
           renewalDate:     c.renewalDate ?? null,
-          confidence:      0.75,
+          // "Expiring" emails explicitly state the renewal price and date — high confidence.
+          // Standard Apple IAP bypass uses 0.75 (format is reliable but recurrence unverified).
+          confidence:      c.isExpiryNotice ? 0.80 : 0.75,
           isActive:        true,
           isSuggested:     true,
           source:          provider,
@@ -221,9 +229,11 @@ export function registerImapScanRoutes(server) {
         subscriptions: [...confident, ...cancelledForReview, ...appleBypass],
         detectedSubscriptions: confident.length + appleBypass.length,
         meta: {
-          scannedMessages: scannedCount,
-          detectedCharges: charges.length,
-          executionTimeMs: Date.now() - started,
+          scannedMessages:         scannedCount,       // emails fetched (UIDs matched by server-side search)
+          parsedCharges:           charges.length,      // emails with extractable amount + merchant
+          passedConfidenceThreshold: confident.length,  // engine detections above threshold (${threshold})
+          appleBypassCount:        appleBypass.length,  // Apple IAP added via bypass (engine missed)
+          executionTimeMs:         Date.now() - started,
         },
       };
     } catch (err) {

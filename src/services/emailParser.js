@@ -114,7 +114,11 @@ function lookupAlias(domain, subject) {
  * Handles comma-formatted thousands ($1,299.00) and European decimal (€9,99).
  */
 export function extractAmountWithLog(text) {
-  const s = String(text).toLowerCase();
+  // TASK 1: Normalise "US$" / "US $" → "$" before any pattern matching.
+  // Apple receipts always use "US$79.99" or "US$ 79.99" which after lowercasing becomes
+  // "us$79.99" or "us$ 79.99". Stripping the "us" prefix lets all downstream patterns
+  // work uniformly with the bare "$" prefix they already handle.
+  const s = String(text).toLowerCase().replace(/\bus\s*\$/g, '$');
 
   function toNum(raw) {
     return parseFloat(raw.replace(/,/g, ''));
@@ -128,7 +132,9 @@ export function extractAmountWithLog(text) {
   }
 
   const AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
-  const CUR = '(?:usd|us\\$|\\$|gbp|£|eur|€|cad|aud)';
+  // us\$ must come before \$ so "us$35.99" is consumed whole, not just the "$".
+  // usd\s? covers "usd35.99" and "usd 35.99". \$ remains for bare dollar signs.
+  const CUR = '(?:us\\$|usd\\s?|\\$|gbp|£|eur|€|cad|aud)';
 
   const totalMatch = s.match(new RegExp(`total\\s*[:\\-]?\\s*${CUR}\\s?${AMT}`));
   if (totalMatch) return { value: toNum(totalMatch[1]), strategy: "total_keyword" };
@@ -204,7 +210,33 @@ export function extractBillingInterval(text) {
  */
 export function extractRenewalDateWithLog(text) {
   const DATE_PAT = String.raw`(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w+\s+\d{4})`;
+
+  // ── TASK 3: Apple trial + interval calculation fallback ──────────────────
+  // "free for X week(s)/month(s)/day(s), starting {date}" → renewal = start + duration
+  const trialRe = new RegExp(
+    String.raw`free\s+(?:trial\s+)?for\s+(\d+)\s+(day|days|week|weeks|month|months)[^.]{0,30}starting\s+` + DATE_PAT,
+    "i"
+  );
+  const trialMatch = text.match(trialRe);
+  if (trialMatch) {
+    const qty  = parseInt(trialMatch[1], 10);
+    const unit = trialMatch[2].toLowerCase();
+    const start = parseFlexDate(trialMatch[3]);
+    if (start) {
+      const renewal = new Date(start);
+      if (unit.startsWith("month")) renewal.setMonth(renewal.getMonth() + qty);
+      else if (unit.startsWith("week")) renewal.setDate(renewal.getDate() + qty * 7);
+      else renewal.setDate(renewal.getDate() + qty); // days
+      return { value: renewal, strategy: "apple_trial_calculation" };
+    }
+  }
+
   const patterns = [
+    // ── Apple-specific patterns (tried before generic patterns) ──────────────
+    { name: "apple_starting",          re: new RegExp(String.raw`\bstarting\s+` + DATE_PAT, "i") },
+    { name: "apple_expires_on",        re: new RegExp(String.raw`expires?\s+on\s+` + DATE_PAT, "i") },
+    { name: "apple_renews_starting",   re: new RegExp(String.raw`renews[^.]{0,40}starting\s+` + DATE_PAT, "i") },
+    // ── Existing generic patterns ────────────────────────────────────────────
     { name: "starting_from",           re: new RegExp(String.raw`starting from\s+` + DATE_PAT, "i") },
     { name: "renews_on",               re: new RegExp(String.raw`renews on\s+` + DATE_PAT, "i") },
     { name: "renews",                  re: new RegExp(String.raw`renews\s+` + DATE_PAT, "i") },
@@ -235,11 +267,22 @@ export function extractRenewalDateWithLog(text) {
  * @param {string} text — cleaned plain text
  * @returns {Date|null}
  */
-// Parse a date string that may or may not have a comma: "June 15 2026" or "June 15, 2026".
+// Parse a date string. Handles:
+//   "June 15 2026" / "June 15, 2026"   — US month-first
+//   "11 July 2025" / "11 July, 2025"   — UK/Apple day-first
 function parseFlexDate(raw) {
   if (!raw) return null;
-  // Normalise: ensure a comma between day and year for JS Date parsing
-  const normalised = raw.trim().replace(/(\w+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
+  const s = raw.trim();
+
+  // UK/Apple day-first: "11 July 2025" or "11 July, 2025"
+  const ukMatch = s.match(/^(\d{1,2})\s+(\w+),?\s+(\d{4})$/);
+  if (ukMatch) {
+    const d = new Date(`${ukMatch[2]} ${ukMatch[1]}, ${ukMatch[3]}`);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // US month-first: "June 15 2026" or "June 15, 2026"
+  const normalised = s.replace(/(\w+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
   const d = new Date(normalised);
   return isNaN(d.getTime()) ? null : d;
 }

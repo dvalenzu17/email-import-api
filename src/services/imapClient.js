@@ -83,7 +83,7 @@ export async function scanImapInbox(params) {
   });
 }
 
-async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
+async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
   const { host, port, secure } = getImapConfig(provider);
 
   const client = new ImapFlow({
@@ -199,7 +199,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           // emails and no separate receipt emails).
           const failedAmount = extractAmount(text);
           if (failedAmount) {
-            const failedMerchant = extractMerchant(fromHeader, text, subject);
+            const failedMerchant = normaliseMerchant(extractMerchant(fromHeader, text, subject));
             if (failedMerchant && failedMerchant !== "unknown") {
               const failedDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
               cancelledCharges.push({
@@ -218,8 +218,9 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
         }
         if (emailType === EMAIL_TYPES.CANCELLATION) {
           // Extract the app/merchant and amount so we can save it as an inactive
-          // subscription — important for Apple "Your Subscription is Expiring" emails
-          // where the subscription may not have been seen before (first iCloud scan).
+          // subscription. Apple "Your Subscription is Expiring" emails are now
+          // classified as RENEWAL_NOTICE (not CANCELLATION) so they flow through
+          // to the charge path below with isExpiryNotice=true.
           const isAppleSenderC = (fromParsed?.address ?? "").toLowerCase().endsWith("@email.apple.com");
           let appleAppNameC = isAppleSenderC && parsed.html
             ? extractAppleAppNameFromHtml(parsed.html)
@@ -458,6 +459,9 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 365 }) {
           senderDomain,
           iconUrl,
           isAppleIAP: isAppleSender,
+          // True for Apple "Your Subscription is Expiring" emails — trial converting to paid.
+          // These explicitly state the renewal price/date so deserve higher bypass confidence.
+          isExpiryNotice: emailType === EMAIL_TYPES.RENEWAL_NOTICE && isAppleSender,
           subscriptionIntent: intentScore >= 2,
           extractionLog,
         });
