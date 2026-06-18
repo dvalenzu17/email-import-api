@@ -32,6 +32,9 @@ export { getPushTokensForUser } from "./pushTokens.js";
 // Background scan scheduling (cron)
 export { getUsersDueForScan } from "./scanScheduling.js";
 
+// Time-based alerts (big-renewal heads-up, trial-ending) — cron-driven
+export { getDueRenewalAlerts, getDueTrialAlerts, reserveAlert } from "./timeBasedAlerts.js";
+
 // ML feedback + merchant confirmations
 export { getFeedbackMerchantMap, saveFeedback, saveMerchantConfirmation } from "./feedback.js";
 

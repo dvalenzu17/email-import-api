@@ -29,6 +29,7 @@ import {
 } from "../db/index.js";
 import { runGmailScan } from "./gmailScanService.js";
 import { runImapScan } from "./imapScanService.js";
+import { runTimeBasedAlertCycle } from "./timeBasedAlerts.js";
 import { decryptCredential } from "./crypto.js";
 
 function num(envVal, fallback) {
@@ -104,8 +105,10 @@ export async function runBackgroundScanCycle(logger = console) {
     });
 
     if (!due.length) {
-      logger?.info?.("bg_scan_cycle_no_users");
-      return { users: 0, scanned: 0, failed: 0 };
+      // No accounts to re-scan, but renewals/trials may still be coming due.
+      logger?.info?.("bg_scan_cycle_no_scan_users");
+      const alertResult = await runTimeBasedAlertCycle(logger);
+      return { users: 0, scanned: 0, failed: 0, ...alertResult };
     }
 
     logger?.info?.({ users: due.length, daysBack }, "bg_scan_cycle_start");
@@ -142,9 +145,13 @@ export async function runBackgroundScanCycle(logger = console) {
       )
     );
 
+    // Time-based alerts (big-renewal heads-up, trial-ending) run every cycle,
+    // independent of scan recency, so they fire close to the due date.
+    const alertResult = await runTimeBasedAlertCycle(logger);
+
     const elapsedMs = Date.now() - startedAt;
-    logger?.info?.({ users: due.length, scanned, failed, elapsedMs }, "bg_scan_cycle_done");
-    return { users: due.length, scanned, failed, elapsedMs };
+    logger?.info?.({ users: due.length, scanned, failed, ...alertResult, elapsedMs }, "bg_scan_cycle_done");
+    return { users: due.length, scanned, failed, ...alertResult, elapsedMs };
   } catch (err) {
     logger?.error?.({ err: err?.message }, "bg_scan_cycle_error");
     return { error: err?.message };
