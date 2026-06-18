@@ -5,6 +5,7 @@
 
 import { pool, getAdminUsersData, aggregateMerchantConfirmations } from "../db/index.js"; // TASK 4: alias rebuild uses confirmation aggregates + pool for alias upserts
 import { createClient } from "@supabase/supabase-js";
+import { runBackgroundScanCycle } from "../services/backgroundScanner.js";
 
 function verifyAdminSecret(req, reply) {
   const secret = req.headers["x-admin-secret"];
@@ -125,6 +126,31 @@ export function registerAdminRoutes(server) {
       topServices: top.map((r) => r.merchant),
       generatedAt: new Date().toISOString(),
     };
+  });
+
+  // ── POST /admin/run-background-scan ──────────────────────────────────────
+  // Drives one background scan + time-based alert cycle. Lets an external
+  // scheduler (Render Cron Job, GitHub Actions, cron-job.org, etc.) run the
+  // cron on hosts where the in-process timer can't (e.g. free tiers that sleep
+  // when idle). Requires x-admin-secret.
+  //
+  // Fire-and-forget by default (responds 202 so the caller doesn't time out on
+  // a long scan). Pass ?wait=true to await and return the cycle result.
+  server.post("/admin/run-background-scan", async (req, reply) => {
+    if (!verifyAdminSecret(req, reply)) return;
+
+    const wait = req.query.wait === "true" || req.query.wait === "1";
+
+    if (wait) {
+      const result = await runBackgroundScanCycle(req.log);
+      return { ok: true, ...result };
+    }
+
+    // The cycle has its own overlap guard, so a double-trigger is safe.
+    runBackgroundScanCycle(req.log).catch((err) =>
+      req.log.error({ err }, "admin_background_scan_error")
+    );
+    return reply.code(202).send({ ok: true, started: true });
   });
 
   // ── TASK 4: POST /admin/merchant-aliases/rebuild ─────────────────────────
