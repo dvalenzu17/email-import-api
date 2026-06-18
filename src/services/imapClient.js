@@ -5,6 +5,7 @@ import { normaliseMerchant } from "../lib/normaliseMerchant.js";
 import { getBrandInfo, getKnownDomains } from "./knownBrands.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { withRetry } from "./retryUtil.js";
+import logger from "../lib/logger.js";
 
 const IMAP_CONFIGS = {
   gmail:   { host: "imap.gmail.com",           port: 993, secure: true },
@@ -83,7 +84,7 @@ export async function scanImapInbox(params) {
   });
 }
 
-async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
+async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate }) {
   const { host, port, secure } = getImapConfig(provider);
 
   const client = new ImapFlow({
@@ -100,12 +101,17 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
   const cancellations = [];
   const cancelledCharges = []; // subscriptions detected from cancellation/expiry emails
   let scannedCount = 0;
+  // Track the newest message date for incremental scan checkpoints.
+  let newestMessageDate = null;
 
   try {
     const mailbox = await client.mailboxOpen("INBOX");
 
-    const since = new Date();
-    since.setDate(since.getDate() - daysBack);
+    // Incremental scan: if sinceDate is provided (from a checkpoint), use it
+    // directly instead of computing from daysBack. IMAP SEARCH SINCE is
+    // server-side filtering — only matching messages are returned.
+    const since = sinceDate ? new Date(sinceDate) : new Date();
+    if (!sinceDate) since.setDate(since.getDate() - daysBack);
 
     // Server-side SEARCH: union subject keywords + Apple billing sender.
     // Replaces the old "fetch all envelopes, slice-1500, filter locally" approach
@@ -188,6 +194,14 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
 
         const parsedDate = parsed.date ?? null;
 
+        // Track newest message date for checkpoint — before any filtering so
+        // the checkpoint reflects the full set of fetched messages.
+        if (parsedDate && !isNaN(parsedDate.getTime())) {
+          if (!newestMessageDate || parsedDate > newestMessageDate) {
+            newestMessageDate = parsedDate;
+          }
+        }
+
         // ── Lifecycle classification ──────────────────────────────────────────
         // Detect cancellation/expiry emails so we can mark the subscription as
         // inactive even if we also have a charge email for it. This mirrors the
@@ -265,7 +279,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
         // TASK 3: use extractAmountWithLog to capture why extraction failed
         const { value: amount, strategy: amountStrategy } = extractAmountWithLog(text);
         if (!amount) {
-          console.log(`[imap] amount_null: subject="${subject}" from="${fromAddr}" text_preview="${text.slice(0, 120)}"`);
+          logger.info({ subject, from: fromAddr, textPreview: text.slice(0, 120) }, "amount_null");
           continue;
         }
 
@@ -291,10 +305,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
         if (appleAppName) {
           const LEGAL_ENTITY = /(?:\b(?:uab|llc|ltd|limited|inc|incorporated|corporation|corp|corporate|gmbh|bv|srl|sarl|sa|ag|nv|ou|oü|as|aps|ab|oy|sas|spa|kft|sprl|pvt)\b\.?|z\s+o\.o\.)$/i;
           if (LEGAL_ENTITY.test(appleAppName)) {
-            console.log(`[imap] rejected_legal_entity: "${appleAppName}" subject="${subject}"`);
+            logger.info({ appleAppName, subject }, "rejected_legal_entity");
             appleAppName = null;
           } else {
-            console.log(`[imap] apple_app_name: "${appleAppName}" subject="${subject}"`);
+            logger.info({ appleAppName, subject }, "apple_app_name");
           }
         }
 
@@ -448,7 +462,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
 
         // Threshold lowered from 3 → 2: a single billing keyword + known domain,
         // or any two subscription signals, is enough intent evidence for IMAP.
-        console.log(`[imap] charge: merchant="${merchant}" amount=${amount} amountStrategy=${amountStrategy} subject="${subject}" from="${fromHeader.substring(0, 80)}" iconUrl=${iconUrl ? "yes" : "null"} interval=${billingInterval ?? "null"}(${intervalStrategy ?? "null"})`);
+        logger.info({ merchant, amount, amountStrategy, subject, from: fromHeader.substring(0, 80), iconUrl: iconUrl ? "yes" : null, interval: billingInterval ?? null, intervalStrategy: intervalStrategy ?? null }, "charge_extracted");
         charges.push({
           merchant,
           amount,
@@ -469,17 +483,26 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730 }) {
         continue;
       }
     }
-    console.log(`[imap] scan_complete: provider=${provider} scanned=${scannedCount} charges=${charges.length} cancellations=${cancellations.length}`);
+    logger.info({ provider, scanned: scannedCount, charges: charges.length, cancellations: cancellations.length }, "imap_scan_complete");
     if (charges.length > 0) {
       const byMerchant = {};
       for (const c of charges) byMerchant[c.merchant] = (byMerchant[c.merchant] ?? 0) + 1;
-      console.log(`[imap] charges_by_merchant:`, JSON.stringify(byMerchant));
+      logger.info({ byMerchant }, "charges_by_merchant");
     }
   } finally {
     try { await client.logout(); } catch { /* connection may already be closed */ }
   }
 
-  return { charges, cancellations, cancelledCharges, scannedCount };
+  return {
+    charges,
+    cancellations,
+    cancelledCharges,
+    scannedCount,
+    // Checkpoint data for incremental scanning — saved by the route handler.
+    checkpoint: newestMessageDate
+      ? { lastMessageDate: newestMessageDate, lastMessageId: null }
+      : null,
+  };
 }
 
 function normaliseImapError(err) {

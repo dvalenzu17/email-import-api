@@ -9,6 +9,7 @@
 
 import { Queue, Worker, QueueEvents } from "bullmq";
 import { runGmailScan } from "./gmailScanService.js";
+import { getScanCheckpoint, saveScanCheckpoint } from "../db/index.js";
 
 const QUEUE_NAME = "gmail-scan";
 
@@ -62,14 +63,31 @@ export function startWorker(logger) {
     async (job) => {
       const { userId, daysBack, force } = job.data;
 
-      return runGmailScan({
+      // Incremental scan: fetch checkpoint for this user unless force.
+      let afterDate;
+      if (!force) {
+        const checkpoint = await getScanCheckpoint(userId, "google");
+        if (checkpoint?.last_message_date) {
+          afterDate = new Date(checkpoint.last_message_date);
+        }
+      }
+
+      const result = await runGmailScan({
         userId,
         daysBack,
+        afterDate,
         force: force === true,
         onProgress: async (pct, message) => {
           await job.updateProgress({ pct, message });
         },
       });
+
+      // Save checkpoint after successful scan.
+      if (result.checkpoint) {
+        await saveScanCheckpoint(userId, "google", result.checkpoint);
+      }
+
+      return result;
     },
     {
       connection: getConnection(),

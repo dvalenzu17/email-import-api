@@ -1,5 +1,6 @@
 import crypto from "crypto";
-import jwt from "jsonwebtoken";
+import jwt from "jsonwebtoken"; // kept for web OAuth state verification only
+import { requireUser } from "../lib/auth.js";
 
 import {
   buildGoogleAuthUrl,
@@ -124,19 +125,8 @@ export function registerOAuthRoutes(server) {
   // iOS clients use PKCE and do NOT require a client secret.
   server.post("/oauth/google/exchange", async (req, reply) => {
     try {
-      // Verify Supabase JWT from Authorization header
-      const authHeader = req.headers.authorization;
-      const token = authHeader?.split(" ")[1];
-      if (!token) return reply.code(401).send({ error: "unauthorized" });
-
-      let userId;
-      try {
-        const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-        userId = decoded.sub;
-      } catch {
-        return reply.code(401).send({ error: "unauthorized" });
-      }
-      if (!userId) return reply.code(401).send({ error: "unauthorized" });
+      const userId = requireUser(req, reply);
+      if (!userId) return;
 
       const { code, codeVerifier, redirectUri, clientId } = req.body || {};
 

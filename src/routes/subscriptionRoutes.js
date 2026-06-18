@@ -1,11 +1,12 @@
-import jwt from "jsonwebtoken";
 import { z } from "zod";
+import { requireUser } from "../lib/auth.js";
 import {
   getSubscriptions,
   getLatestScanMetadata,
   updateSubscriptionStatus,
   getSubscriptionById,
   saveFeedback,
+  saveMerchantConfirmation, // TASK 4: write per-confirmation signal for alias rebuild
 } from "../db/index.js";
 import { extractFeatures } from "../services/modelFeatures.js";
 
@@ -34,24 +35,10 @@ function formatSubscription(s) {
   };
 }
 
-function verifyUserId(req, reply) {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) { reply.code(401).send({ error: "unauthorized" }); return null; }
-  try {
-    const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-    const userId = decoded.sub;
-    if (!userId) { reply.code(401).send({ error: "unauthorized" }); return null; }
-    return userId;
-  } catch {
-    reply.code(401).send({ error: "unauthorized" });
-    return null;
-  }
-}
-
 export function registerSubscriptionRoutes(server) {
   // ── GET /subscriptions ───────────────────────────────────────────────────
   server.get("/subscriptions", async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
 
     try {
@@ -82,7 +69,7 @@ export function registerSubscriptionRoutes(server) {
   //   cancelled → locks isActive = false (won't flip back on next scan)
   //   ignored   → hidden from view, but staleness logic still applies
   server.patch("/subscriptions/:id", async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
 
     const { id } = req.params;
@@ -110,7 +97,7 @@ export function registerSubscriptionRoutes(server) {
   // This builds the labeled training dataset used by scripts/trainModel.js.
   // Distinct from PATCH /:id (user_status) which controls UI visibility.
   server.post("/subscriptions/:id/feedback", async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
 
     const { id } = req.params;
@@ -143,6 +130,22 @@ export function registerSubscriptionRoutes(server) {
         known_brand:    features[4],
         confidence:     Number(sub.confidence),
       });
+
+      // TASK 4: Record the confirmation/rejection as a merchant signal.
+      // Non-fatal — a failure here must never break the feedback response.
+      // This data accumulates and is used by /admin/merchant-aliases/rebuild
+      // to auto-promote high-confidence domain→canonical_name mappings.
+      try {
+        await saveMerchantConfirmation(userId, {
+          merchantDomain: sub.sender_domain ?? sub.merchant,
+          canonicalName:  sub.merchant,
+          confirmed:      parsed.data.label === "confirmed",
+          amount:         Number(sub.renewal_amount) || null,
+          interval:       sub.billing_interval ?? null,
+        });
+      } catch (confirmErr) {
+        req.log.warn({ err: confirmErr }, "merchant_confirmation_write_failed");
+      }
 
       return { ok: true };
     } catch (err) {

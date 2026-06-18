@@ -73,10 +73,13 @@ const KNOWN_BRANDS = {
 
 /**
  * Returns a Set of all known billing domains, derived from KNOWN_BRANDS.
- * Use this instead of a separate hardcoded domain list.
+ * Memoized — the Set is created once at first call and reused.
  */
+let _knownDomainsCache = null;
 export function getKnownDomains() {
-  return new Set(Object.values(KNOWN_BRANDS).map((b) => b.domain).filter(Boolean));
+  return _knownDomainsCache ??= new Set(
+    Object.values(KNOWN_BRANDS).map((b) => b.domain).filter(Boolean)
+  );
 }
 
 /**

@@ -13,11 +13,12 @@
  */
 
 // Legal / corporate suffixes to strip (order matters — longer first).
-const SUFFIXES = [
+// Pre-compiled to avoid creating 20 RegExp objects per normalizeMerchant() call.
+const SUFFIX_PATTERNS = [
   "incorporated", "corporation", "limited liability company",
   "inc.", "corp.", "ltd.", "llc.", "llp.", "plc.",
   "inc", "corp", "ltd", "llc", "llp", "plc", "ab", "gmbh", "sas", "bv",
-];
+].map((s) => new RegExp(`\\s+${s.replace(".", "\\.")}\\s*$`));
 
 // TLDs that sometimes appear in merchant names extracted from email headers.
 const TLDS = [".com", ".net", ".org", ".io", ".co", ".app", ".tv"];
@@ -43,9 +44,7 @@ export function normalizeMerchant(raw) {
   // Strip trailing legal suffixes (may be comma-separated: "Netflix, Inc.").
   name = name.replace(/[,;]+$/, "").trim();
 
-  for (const suffix of SUFFIXES) {
-    // Match suffix at word boundary at the end of the string.
-    const pattern = new RegExp(`\\s+${suffix.replace(".", "\\.")}\\s*$`);
+  for (const pattern of SUFFIX_PATTERNS) {
     name = name.replace(pattern, "").trim();
   }
 

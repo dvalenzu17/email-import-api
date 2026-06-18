@@ -5,12 +5,13 @@
  * Falls back to a no-op (process everything) when Redis is unavailable.
  *
  * Key schema: processed_msgs:{userId}  →  Redis Set of message IDs
- * TTL: 30 days (aligned with max daysBack window)
+ * TTL: 90 days — covers the default daysBack (180) with margin.
+ * Force scans (which clear the cache) handle the full 730-day range.
  */
 
 import Redis from "ioredis";
 
-const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
 
 let _redis = null;
 

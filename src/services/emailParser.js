@@ -1,6 +1,7 @@
 import * as cheerio from "cheerio";
 import he from "he";
 import { isProcessor, extractProcessorMerchant } from "./billingProcessor.js";
+import logger from "../lib/logger.js";
 
 /**
  * Strips HTML from an email body and returns clean, lowercased plain text.
@@ -60,7 +61,7 @@ export async function loadMerchantAliasCache(pool) {
   } catch (err) {
     // Non-fatal: DB may be unavailable or table may not exist yet (before migration).
     // Fail silently and use whatever is already in cache (possibly empty).
-    console.warn("[parser] merchant_alias_cache_load_failed:", err.message);
+    logger.warn({ err: err.message }, "merchant_alias_cache_load_failed");
   }
 }
 
@@ -85,11 +86,12 @@ function lookupAlias(domain, subject) {
   const subjectLower = (subject || "").toLowerCase();
 
   // Try pattern-specific entries first (more specific wins).
+  // Cache compiled regex on the entry object to avoid recompiling per call.
   for (const entry of entries) {
     if (entry.subjectPattern) {
       try {
-        const re = new RegExp(entry.subjectPattern, "i");
-        if (re.test(subjectLower)) return entry;
+        entry._compiledRe ??= new RegExp(entry.subjectPattern, "i");
+        if (entry._compiledRe.test(subjectLower)) return entry;
       } catch {
         if (subjectLower.includes(entry.subjectPattern.toLowerCase())) return entry;
       }
@@ -113,39 +115,38 @@ function lookupAlias(domain, subject) {
  * Priority: "total" > "charged" > plan price > first in-range match.
  * Handles comma-formatted thousands ($1,299.00) and European decimal (€9,99).
  */
+// ── Pre-compiled amount extraction regexes (called per-message) ─────────────
+const EURO_DECIMAL_RE = /(?:€|eur)\s?([0-9]{1,4}),([0-9]{1,2})(?!\d)/;
+const _AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
+const _CUR = '(?:us\\$|usd\\s?|\\$|gbp|£|eur|€|cad|aud)';
+const TOTAL_RE   = new RegExp(`total\\s*[:\\-]?\\s*${_CUR}\\s?${_AMT}`);
+const CHARGED_RE = new RegExp(`charged\\s*${_CUR}\\s?${_AMT}`);
+const PLAN_RE    = new RegExp(`${_CUR}\\s?${_AMT}\\s*(?:\\/|\\s*per\\s*)(?:month|year|mo|yr)`);
+const FIRST_RE   = new RegExp(`${_CUR}\\s?${_AMT}`);
+
 export function extractAmountWithLog(text) {
-  // TASK 1: Normalise "US$" / "US $" → "$" before any pattern matching.
-  // Apple receipts always use "US$79.99" or "US$ 79.99" which after lowercasing becomes
-  // "us$79.99" or "us$ 79.99". Stripping the "us" prefix lets all downstream patterns
-  // work uniformly with the bare "$" prefix they already handle.
   const s = String(text).toLowerCase().replace(/\bus\s*\$/g, '$');
 
   function toNum(raw) {
     return parseFloat(raw.replace(/,/g, ''));
   }
 
-  // European decimal format: €9,99 — comma is the decimal separator.
-  const euroDecimal = s.match(/(?:€|eur)\s?([0-9]{1,4}),([0-9]{1,2})(?!\d)/);
+  const euroDecimal = s.match(EURO_DECIMAL_RE);
   if (euroDecimal) {
     const v = parseFloat(`${euroDecimal[1]}.${euroDecimal[2]}`);
     if (v > 0 && v < 10_000) return { value: v, strategy: "euro_decimal" };
   }
 
-  const AMT = '([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{1,2})?|[0-9]+(?:\\.[0-9]{1,2})?)';
-  // us\$ must come before \$ so "us$35.99" is consumed whole, not just the "$".
-  // usd\s? covers "usd35.99" and "usd 35.99". \$ remains for bare dollar signs.
-  const CUR = '(?:us\\$|usd\\s?|\\$|gbp|£|eur|€|cad|aud)';
-
-  const totalMatch = s.match(new RegExp(`total\\s*[:\\-]?\\s*${CUR}\\s?${AMT}`));
+  const totalMatch = s.match(TOTAL_RE);
   if (totalMatch) return { value: toNum(totalMatch[1]), strategy: "total_keyword" };
 
-  const chargedMatch = s.match(new RegExp(`charged\\s*${CUR}\\s?${AMT}`));
+  const chargedMatch = s.match(CHARGED_RE);
   if (chargedMatch) return { value: toNum(chargedMatch[1]), strategy: "charged_keyword" };
 
-  const planMatch = s.match(new RegExp(`${CUR}\\s?${AMT}\\s*(?:\\/|\\s*per\\s*)(?:month|year|mo|yr)`));
+  const planMatch = s.match(PLAN_RE);
   if (planMatch) return { value: toNum(planMatch[1]), strategy: "month_pattern" };
 
-  const fallback = s.match(new RegExp(`${CUR}\\s?${AMT}`));
+  const fallback = s.match(FIRST_RE);
   if (fallback) {
     const v = toNum(fallback[1]);
     if (v > 0 && v < 2_000) return { value: v, strategy: "first_in_range" };
@@ -172,20 +173,21 @@ export function extractAmount(text) {
  *   yearly  — "every year", "1 year", "1-year" already covered; "annually" added explicitly
  *   monthly — "every month", "1 month", "1-month", "once a month"
  */
+// ── Pre-compiled billing interval regexes (called per-message) ──────────────
+const INTERVAL_PATTERNS = [
+  { re: /\b(annual|annually|yearly|per year|\/year|each year|every year|\bone[- ]?year\b|\b1[- ]?year\b|\b12[- ]?month)\b/, value: "yearly",     strategy: "annual_keyword" },
+  { re: /\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/,                                                                value: "semiannual", strategy: "semiannual_keyword" },
+  { re: /\b(quarter|quarterly|every 3 months)\b/,                                                                             value: "quarterly",  strategy: "quarterly_keyword" },
+  { re: /\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/,                                                        value: "biweekly",   strategy: "biweekly_keyword" },
+  { re: /\b(weekly|per week|every week)\b/,                                                                                    value: "weekly",     strategy: "weekly_keyword" },
+  { re: /\b(monthly|per month|\/month|month[- ]to[- ]month|every month|once a month|\b1[- ]?month)\b/,                        value: "monthly",    strategy: "monthly_keyword" },
+];
+
 export function extractBillingIntervalWithLog(text) {
   const t = String(text || "").toLowerCase();
-  if (/\b(annual|annually|yearly|per year|\/year|each year|every year|\bone[- ]?year\b|\b1[- ]?year\b|\b12[- ]?month)\b/.test(t))
-    return { value: "yearly",     strategy: "annual_keyword" };
-  if (/\b(semi[- ]?annual|every 6 months|half[- ]?year)\b/.test(t))
-    return { value: "semiannual", strategy: "semiannual_keyword" };
-  if (/\b(quarter|quarterly|every 3 months)\b/.test(t))
-    return { value: "quarterly",  strategy: "quarterly_keyword" };
-  if (/\b(biweekly|bi[- ]?weekly|every 2 weeks|every two weeks)\b/.test(t))
-    return { value: "biweekly",   strategy: "biweekly_keyword" };
-  if (/\b(weekly|per week|every week)\b/.test(t))
-    return { value: "weekly",     strategy: "weekly_keyword" };
-  if (/\b(monthly|per month|\/month|month[- ]to[- ]month|every month|once a month|\b1[- ]?month)\b/.test(t))
-    return { value: "monthly",    strategy: "monthly_keyword" };
+  for (const p of INTERVAL_PATTERNS) {
+    if (p.re.test(t)) return { value: p.value, strategy: p.strategy };
+  }
   return { value: null, strategy: null };
 }
 
@@ -208,16 +210,30 @@ export function extractBillingInterval(text) {
  * TASK 1 — Extracts renewal date and records which of the 11 patterns matched.
  * Returns { value, strategy }.
  */
-export function extractRenewalDateWithLog(text) {
-  const DATE_PAT = String.raw`(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w+\s+\d{4})`;
+// ── Pre-compiled renewal date patterns (called per-message) ─────────────────
+const _DATE_PAT = String.raw`(\w+\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+\w+\s+\d{4})`;
+const TRIAL_DATE_RE = new RegExp(
+  String.raw`free\s+(?:trial\s+)?for\s+(\d+)\s+(day|days|week|weeks|month|months)[^.]{0,30}starting\s+` + _DATE_PAT, "i"
+);
+const RENEWAL_DATE_PATTERNS = [
+  { name: "apple_starting",          re: new RegExp(String.raw`\bstarting\s+` + _DATE_PAT, "i") },
+  { name: "apple_expires_on",        re: new RegExp(String.raw`expires?\s+on\s+` + _DATE_PAT, "i") },
+  { name: "apple_renews_starting",   re: new RegExp(String.raw`renews[^.]{0,40}starting\s+` + _DATE_PAT, "i") },
+  { name: "starting_from",           re: new RegExp(String.raw`starting from\s+` + _DATE_PAT, "i") },
+  { name: "renews_on",               re: new RegExp(String.raw`renews on\s+` + _DATE_PAT, "i") },
+  { name: "renews",                  re: new RegExp(String.raw`renews\s+` + _DATE_PAT, "i") },
+  { name: "next_billing_date",       re: new RegExp(String.raw`next billing date[:\s]+(?:is\s+)?` + _DATE_PAT, "i") },
+  { name: "renewal_date",            re: new RegExp(String.raw`renewal date[:\s]+(?:is\s+)?` + _DATE_PAT, "i") },
+  { name: "will_renew_on",           re: new RegExp(String.raw`will renew on\s+` + _DATE_PAT, "i") },
+  { name: "automatically_renews",    re: new RegExp(String.raw`automatically renews\s+(?:on\s+)?` + _DATE_PAT, "i") },
+  { name: "subscription_renews",     re: new RegExp(String.raw`subscription renews\s+(?:on\s+)?` + _DATE_PAT, "i") },
+  { name: "your_next_billing",       re: new RegExp(String.raw`your next\s+(?:billing|payment|charge)[^.]{0,30}(?:on|date)\s+(?:is\s+)?` + _DATE_PAT, "i") },
+  { name: "next_renewal_billing",    re: new RegExp(String.raw`next (?:renewal|billing)[^.]{0,20}(?:is|on|:)\s+` + _DATE_PAT, "i") },
+  { name: "iso_date_near_renew",     re: /(?:renew|next billing|renewal)[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i },
+];
 
-  // ── TASK 3: Apple trial + interval calculation fallback ──────────────────
-  // "free for X week(s)/month(s)/day(s), starting {date}" → renewal = start + duration
-  const trialRe = new RegExp(
-    String.raw`free\s+(?:trial\s+)?for\s+(\d+)\s+(day|days|week|weeks|month|months)[^.]{0,30}starting\s+` + DATE_PAT,
-    "i"
-  );
-  const trialMatch = text.match(trialRe);
+export function extractRenewalDateWithLog(text) {
+  const trialMatch = text.match(TRIAL_DATE_RE);
   if (trialMatch) {
     const qty  = parseInt(trialMatch[1], 10);
     const unit = trialMatch[2].toLowerCase();
@@ -226,31 +242,12 @@ export function extractRenewalDateWithLog(text) {
       const renewal = new Date(start);
       if (unit.startsWith("month")) renewal.setMonth(renewal.getMonth() + qty);
       else if (unit.startsWith("week")) renewal.setDate(renewal.getDate() + qty * 7);
-      else renewal.setDate(renewal.getDate() + qty); // days
+      else renewal.setDate(renewal.getDate() + qty);
       return { value: renewal, strategy: "apple_trial_calculation" };
     }
   }
 
-  const patterns = [
-    // ── Apple-specific patterns (tried before generic patterns) ──────────────
-    { name: "apple_starting",          re: new RegExp(String.raw`\bstarting\s+` + DATE_PAT, "i") },
-    { name: "apple_expires_on",        re: new RegExp(String.raw`expires?\s+on\s+` + DATE_PAT, "i") },
-    { name: "apple_renews_starting",   re: new RegExp(String.raw`renews[^.]{0,40}starting\s+` + DATE_PAT, "i") },
-    // ── Existing generic patterns ────────────────────────────────────────────
-    { name: "starting_from",           re: new RegExp(String.raw`starting from\s+` + DATE_PAT, "i") },
-    { name: "renews_on",               re: new RegExp(String.raw`renews on\s+` + DATE_PAT, "i") },
-    { name: "renews",                  re: new RegExp(String.raw`renews\s+` + DATE_PAT, "i") },
-    { name: "next_billing_date",       re: new RegExp(String.raw`next billing date[:\s]+(?:is\s+)?` + DATE_PAT, "i") },
-    { name: "renewal_date",            re: new RegExp(String.raw`renewal date[:\s]+(?:is\s+)?` + DATE_PAT, "i") },
-    { name: "will_renew_on",           re: new RegExp(String.raw`will renew on\s+` + DATE_PAT, "i") },
-    { name: "automatically_renews",    re: new RegExp(String.raw`automatically renews\s+(?:on\s+)?` + DATE_PAT, "i") },
-    { name: "subscription_renews",     re: new RegExp(String.raw`subscription renews\s+(?:on\s+)?` + DATE_PAT, "i") },
-    { name: "your_next_billing",       re: new RegExp(String.raw`your next\s+(?:billing|payment|charge)[^.]{0,30}(?:on|date)\s+(?:is\s+)?` + DATE_PAT, "i") },
-    { name: "next_renewal_billing",    re: new RegExp(String.raw`next (?:renewal|billing)[^.]{0,20}(?:is|on|:)\s+` + DATE_PAT, "i") },
-    { name: "iso_date_near_renew",     re: /(?:renew|next billing|renewal)[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i },
-  ];
-
-  for (const { name, re } of patterns) {
+  for (const { name, re } of RENEWAL_DATE_PATTERNS) {
     const m = text.match(re);
     if (m) {
       const d = parseFlexDate(m[1]);
@@ -290,6 +287,40 @@ function parseFlexDate(raw) {
 export function extractRenewalDate(text) {
   return extractRenewalDateWithLog(text).value;
 }
+
+// ── Pre-allocated merchant extraction constants (called per-message) ─────────
+const BLOCKED_ESP = new Set([
+  "klaviyo", "mailchimp", "sendgrid", "constantcontact", "brevo",
+  "hubspot", "salesforce", "marketo", "iterable", "customerio",
+  "activecampaign", "omnisend", "drip", "convertkit", "getresponse",
+  "aweber", "moosend", "mailjet", "campaignmonitor", "sparkpost",
+  "postmarkapp", "mandrillapp",
+  "braze", "segment", "intercom",
+  "interactivebrokers", "hoyoverse", "gelato",
+]);
+
+const KNOWN_MERCHANT_MAP = {
+  openai: "openai", chatgpt: "openai", anthropic: "anthropic",
+  netflix: "netflix", netflixcommunication: "netflix",
+  hulu: "hulu", disney: "disney+", disneyplus: "disney+",
+  hbo: "hbo", max: "max", peacock: "peacock", paramount: "paramount",
+  crunchyroll: "crunchyroll", twitch: "twitch",
+  spotify: "spotify", audible: "audible",
+  apple: "apple", google: "google", youtube: "google",
+  microsoft: "microsoft", adobe: "adobe", dropbox: "dropbox",
+  slack: "slack", notion: "notion", figma: "figma",
+  github: "github", linkedin: "linkedin", zoom: "zoom",
+  canva: "canva", grammarly: "grammarly",
+  amazon: "amazon", shopify: "shopify",
+  squarespace: "squarespace", wix: "wix", webflow: "webflow",
+  uber: "uber one",
+  duolingo: "duolingo", headspace: "headspace", calm: "calm",
+  peloton: "peloton",
+  substack: "substack", patreon: "patreon", medium: "medium",
+  vercel: "vercel", netlify: "netlify", airtable: "airtable",
+  hubspot: "hubspot", intercom: "intercom", zendesk: "zendesk",
+  datadog: "datadog", sentry: "sentry",
+};
 
 /**
  * Extracts a normalised merchant name from a "From" header string.
@@ -338,17 +369,7 @@ export function extractMerchantWithLog(fromHeader, bodyText = "", subject = "") 
     return { merchant: "uber one", strategy: "uber_hardcode", confidenceBoost: 0 };
   }
 
-  const blocked = new Set([
-    "klaviyo", "mailchimp", "sendgrid", "constantcontact", "brevo",
-    "hubspot", "salesforce", "marketo", "iterable", "customerio",
-    "activecampaign", "omnisend", "drip", "convertkit", "getresponse",
-    "aweber", "moosend", "mailjet", "campaignmonitor", "sparkpost",
-    "postmarkapp", "mandrillapp",
-    "braze", "segment", "intercom",
-    "interactivebrokers", "hoyoverse", "gelato",
-  ]);
-
-  if (blocked.has(root)) return { merchant: "unknown", strategy: "blocked_esp", confidenceBoost: 0 };
+  if (BLOCKED_ESP.has(root)) return { merchant: "unknown", strategy: "blocked_esp", confidenceBoost: 0 };
 
   const isApple = parts.some((p) => p === "apple");
   if (isApple && bodyText) {
@@ -358,35 +379,12 @@ export function extractMerchantWithLog(fromHeader, bodyText = "", subject = "") 
     return { merchant: "apple", strategy: "apple_domain_fallback", confidenceBoost: 0 };
   }
 
-  const knownMap = {
-    openai: "openai", chatgpt: "openai", anthropic: "anthropic",
-    netflix: "netflix", netflixcommunication: "netflix",
-    hulu: "hulu", disney: "disney+", disneyplus: "disney+",
-    hbo: "hbo", max: "max", peacock: "peacock", paramount: "paramount",
-    crunchyroll: "crunchyroll", twitch: "twitch",
-    spotify: "spotify", audible: "audible",
-    apple: "apple", google: "google", youtube: "google",
-    microsoft: "microsoft", adobe: "adobe", dropbox: "dropbox",
-    slack: "slack", notion: "notion", figma: "figma",
-    github: "github", linkedin: "linkedin", zoom: "zoom",
-    canva: "canva", grammarly: "grammarly",
-    amazon: "amazon", shopify: "shopify",
-    squarespace: "squarespace", wix: "wix", webflow: "webflow",
-    uber: "uber one",
-    duolingo: "duolingo", headspace: "headspace", calm: "calm",
-    peloton: "peloton",
-    substack: "substack", patreon: "patreon", medium: "medium",
-    vercel: "vercel", netlify: "netlify", airtable: "airtable",
-    hubspot: "hubspot", intercom: "intercom", zendesk: "zendesk",
-    datadog: "datadog", sentry: "sentry",
-  };
-
   for (const part of parts) {
-    if (knownMap[part]) return { merchant: knownMap[part], strategy: "known_brands_map", confidenceBoost: 0 };
-    if (blocked.has(part)) return { merchant: "unknown", strategy: "blocked_esp", confidenceBoost: 0 };
+    if (KNOWN_MERCHANT_MAP[part]) return { merchant: KNOWN_MERCHANT_MAP[part], strategy: "known_brands_map", confidenceBoost: 0 };
+    if (BLOCKED_ESP.has(part)) return { merchant: "unknown", strategy: "blocked_esp", confidenceBoost: 0 };
   }
 
-  if (knownMap[root]) return { merchant: knownMap[root], strategy: "known_brands_map", confidenceBoost: 0 };
+  if (KNOWN_MERCHANT_MAP[root]) return { merchant: KNOWN_MERCHANT_MAP[root], strategy: "known_brands_map", confidenceBoost: 0 };
   return { merchant: root, strategy: "domain_fallback", confidenceBoost: 0 };
 }
 
@@ -409,15 +407,28 @@ function cleanAppleName(raw) {
 
 // Validates a candidate app name: must be non-trivial and not a generic word.
 const APPLE_NAME_BLOCKLIST = new Set([
+  // Generic tier / plan words
   "subscription", "plan", "premium", "plus", "pro", "basic", "standard",
   "monthly", "annual", "yearly", "trial", "free", "app", "purchase",
   "annual subscription", "monthly subscription", "yearly subscription",
   "annual plan", "monthly plan", "yearly plan", "weekly subscription",
   "content", "in-app purchase", "in app purchase",
   "games",
+  // Apple receipt table labels
   "date accepted", "billed to", "order id", "apple id",
   "report a problem", "order total", "payment method", "payment type",
   "receipt type", "service provider", "content provider",
+  // Company name — never valid as a subscription merchant; specific products
+  // (iCloud+, Apple TV+, Apple One) are detected by their product names instead.
+  "apple",
+  // Visual section-header phrases that appear inside Apple email bodies and
+  // must never be written as merchant names regardless of extraction path.
+  "subscription expiring",
+  "subscription confirmation",
+  "subscription confirmed",
+  "subscription renewal",
+  "receipt",
+  "invoice",
 ]);
 
 function isValidAppleName(name) {
@@ -434,6 +445,11 @@ function isValidAppleName(name) {
 }
 
 const APPLE_GENERIC_ALT = /^(apple|app store|apple logo|apple pay|apple one|annual subscription|monthly subscription|subscription|plan|annual|monthly|premium|pro|plus|basic|standard|lite|elite|essential|free|games)$/i;
+
+// Pre-compiled product card rejection regexes (used in Apple IAP Strategy 0).
+const CARD_CURRENCY_RE = /(?:US\$|USD|[\$£€¥₹])\s*[\d,.]|[\d,.]\s*(?:US\$|USD|[\$£€¥₹])/i;
+const CARD_FREQ_RE     = /\b(monthly|annual|annually|yearly|weekly|per\s+month|per\s+year|\/month|\/year)\b/i;
+const CARD_TRIAL_RE    = /\b(free\s+trial|no\s+trial|trial)\b/i;
 
 // ── TASK 1: Apple subject prefix stripping ────────────────────────────────────
 // Apple billing emails reuse subject-line phrases inside HTML table cells
@@ -454,6 +470,33 @@ function stripAppleSubjectPrefixes(text) {
     t = t.replace(re, '');
   }
   return t.trim();
+}
+
+/**
+ * Returns true if the merchant name is valid — not in the blocklist and not
+ * a trivially empty/unknown value. Shared across all write paths.
+ */
+export function validateMerchantName(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase().trim();
+  if (!lower || lower === "unknown") return false;
+  return !APPLE_NAME_BLOCKLIST.has(lower);
+}
+
+/**
+ * Returns true if the candidate app name is safe to accept.
+ * Rejects names that are identical to the email subject, short substrings
+ * of the subject, or anything in APPLE_NAME_BLOCKLIST.
+ */
+function passesSubjectGuard(candidate, subject) {
+  if (!validateMerchantName(candidate)) return false;
+  if (!subject) return true;
+  const c = candidate.toLowerCase().trim();
+  const s = subject.toLowerCase().trim();
+  if (c === s) return false;
+  const wordCount = candidate.trim().split(/\s+/).length;
+  if (wordCount < 4 && s.includes(c)) return false;
+  return true;
 }
 
 /**
@@ -479,6 +522,53 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
       return $(el).text().replace(/[\u00a0\s]+/g, " ").trim();
     }
 
+    // ── Strategy 0: Product card extraction (all Apple IAP email types) ──────
+    $("img[src*='mzstatic.com']").each((_, img) => {
+      if (found) return false;
+      const iconTd = $(img).closest("td");
+      if (!iconTd.length) return;
+      const nameTd = iconTd.next("td");
+      if (!nameTd.length) return;
+
+      // Decompose the cell's HTML into individual text lines by normalising
+      // all block-level and inline-break boundaries before stripping tags.
+      // This handles any nesting depth: bare text nodes, nested <span>/<div>,
+      // <p> blocks, <br>-separated runs — all collapse to a flat line array.
+      const rawLines = ($(nameTd).html() || "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(?:p|div|li|td|tr|h[1-6]|span)>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/[\u00a0]/g, " ")
+        .split("\n")
+        .map((l) => l.replace(/\s+/g, " ").trim())
+        .filter((l) => l.length >= 3);
+
+      for (const raw of rawLines) {
+        // Clean before rejection checks so "AppName: Annual Plan" → "AppName"
+        // and "AppName - Monthly" → "AppName" before CARD_FREQ_RE is tested.
+        const clean = cleanAppleName(
+          stripAppleSubjectPrefixes(raw)
+            .replace(/\s*:\s+.+$/, "")
+            .replace(/\s+-\s+.+$/, "")
+        ).trim();
+
+        if (clean.length < 3 || clean.length > 60) continue;   // rule 5
+        if (CARD_CURRENCY_RE.test(clean)) continue;             // rule 1: price line
+        if (CARD_FREQ_RE.test(clean)) continue;                 // rule 2: tier/freq label
+        if (CARD_TRIAL_RE.test(clean)) continue;                // rule 3: trial language
+        // Rule 4 (near-duplicate): stopping at first accepted line is sufficient.
+
+        if (APPLE_GENERIC_ALT.test(clean)) continue;
+        if (!isValidAppleName(clean)) continue;
+        if (!passesSubjectGuard(clean, subject)) continue;
+
+        found = clean;
+        foundStrategy = "apple_iap_strategy_0_product_card";
+        return false; // stop .each()
+      }
+    });
+    if (found) return { name: found, strategy: foundStrategy };
+
     // ── Strategy A: "App" label row traversal ──────────────────────────────
     $("tr").each((_, row) => {
       if (found) return false;
@@ -498,7 +588,7 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
           if (!isValidAppleName(clean)) return false;
           if (hasSubtitle) {
             strategyAFallback = clean;
-          } else {
+          } else if (passesSubjectGuard(clean, subject)) {
             found = clean;
             foundStrategy = "apple_iap_strategy_A";
           }
@@ -522,7 +612,8 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
         .replace(/\s+-\s+.+$/, "")
         .replace(TIER_SUFFIX, "")
         .trim();
-      if (isValidAppleName(alt) && (!strategyAFallback || alt.toLowerCase().startsWith(strategyAFallback.toLowerCase()))) {
+      if (isValidAppleName(alt) && passesSubjectGuard(alt, subject) &&
+          (!strategyAFallback || alt.toLowerCase().startsWith(strategyAFallback.toLowerCase()))) {
         found = alt;
         foundStrategy = "apple_iap_strategy_B";
       }
@@ -550,16 +641,9 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
             .replace(/\s+-\s+.+$/, "")
             .replace(/\s+(monthly|annual|yearly|premium|plus|pro|basic|career|elite|essential|standard|lite).*$/i, "")
             .trim();
-          const GENERIC_NAMES = new Set([
-            "premium", "pro", "plus", "basic", "standard", "lite", "free",
-            "subscription", "plan", "elite", "essential",
-            "annual subscription", "monthly subscription", "yearly subscription",
-            "annual plan", "monthly plan", "yearly plan", "weekly subscription",
-            "content", "in-app purchase", "in app purchase",
-          ]);
           if (cleaned && cleaned.length > 1 && cleaned.length < 36 &&
-              !GENERIC_NAMES.has(cleaned.toLowerCase()) &&
-              isValidAppleName(cleaned)) {
+              !APPLE_NAME_BLOCKLIST.has(cleaned.toLowerCase()) &&
+              isValidAppleName(cleaned) && passesSubjectGuard(cleaned, subject)) {
             found = cleaned;
             foundStrategy = "apple_iap_strategy_C";
             return false;
@@ -577,7 +661,7 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
     if (rawMatch) {
       // TASK 1: strip Apple subject-line prefixes before validating
       const d = stripAppleSubjectPrefixes(rawMatch[1]);
-      if (isValidAppleName(d)) return { name: d, strategy: "apple_iap_strategy_D" };
+      if (isValidAppleName(d) && passesSubjectGuard(d, subject)) return { name: d, strategy: "apple_iap_strategy_D" };
     }
 
     // ── Strategy E (TASK 2): App Store URL slug ────────────────────────────
@@ -596,15 +680,15 @@ export function extractAppleAppNameFromHtmlWithLog(html, subject = "") {
           .replace(/-/g, " ")
           .trim()
           .replace(/\b\w/g, (c) => c.toUpperCase()); // title-case
-        if (isValidAppleName(name)) {
+        if (isValidAppleName(name) && passesSubjectGuard(name, subject)) {
           return { name, strategy: "apple_iap_strategy_E_url_slug" };
         }
       }
     }
 
     // Fallback to stripped Strategy A subtitle name.
-    if (strategyAFallback) {
-      console.log(`[parser] apple_name_fallback: "${strategyAFallback}"`);
+    if (strategyAFallback && passesSubjectGuard(strategyAFallback, subject)) {
+      logger.info({ name: strategyAFallback }, "apple_name_fallback");
       return { name: strategyAFallback, strategy: "apple_iap_strategy_A_subtitle_fallback" };
     }
 
@@ -719,26 +803,30 @@ function extractAppleAppName(text) {
  * @param {string} text — cleaned plain text
  * @returns {string} — e.g. "USD", "GBP", "EUR", "CAD", "AUD"
  */
+// Pre-compiled currency detection — single combined regex replaces 14 individual tests.
+const CURRENCY_PATTERNS = [
+  { re: /\bgbp\b/,    code: "GBP" },
+  { re: /\beur\b/,    code: "EUR" },
+  { re: /\bcad\b/,    code: "CAD" },
+  { re: /\baud\b/,    code: "AUD" },
+  { re: /\bnzd\b/,    code: "NZD" },
+  { re: /\bchf\b/,    code: "CHF" },
+  { re: /\bjpy\b/,    code: "JPY" },
+  { re: /\bbrl\b/,    code: "BRL" },
+  { re: /\bmxn\b/,    code: "MXN" },
+  { re: /\bsek\b/,    code: "SEK" },
+  { re: /£/,          code: "GBP" },
+  { re: /€/,          code: "EUR" },
+  { re: /a\$|au\$/,   code: "AUD" },
+  { re: /c\$|ca\$/,   code: "CAD" },
+];
+
 export function extractCurrencyCode(text) {
   if (!text) return "USD";
   const s = text.toLowerCase();
-
-  if (/\bgbp\b/.test(s)) return "GBP";
-  if (/\beur\b/.test(s)) return "EUR";
-  if (/\bcad\b/.test(s)) return "CAD";
-  if (/\baud\b/.test(s)) return "AUD";
-  if (/\bnzd\b/.test(s)) return "NZD";
-  if (/\bchf\b/.test(s)) return "CHF";
-  if (/\bjpy\b/.test(s)) return "JPY";
-  if (/\bbrl\b/.test(s)) return "BRL";
-  if (/\bmxn\b/.test(s)) return "MXN";
-  if (/\bsek\b/.test(s)) return "SEK";
-
-  if (/£/.test(text)) return "GBP";
-  if (/€/.test(text)) return "EUR";
-  if (/a\$|au\$/.test(s)) return "AUD";
-  if (/c\$|ca\$/.test(s)) return "CAD";
-
+  for (const { re, code } of CURRENCY_PATTERNS) {
+    if (re.test(s)) return code;
+  }
   return "USD";
 }
 
