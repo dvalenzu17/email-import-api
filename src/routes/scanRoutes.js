@@ -1,50 +1,20 @@
-import jwt from "jsonwebtoken";
+import { requireUser } from "../lib/auth.js";
+import { SCAN_RATE_LIMIT, enforceScanLimit, releaseScanSlot } from "../lib/scanMiddleware.js";
 import { runGmailScan } from "../services/gmailScanService.js";
 import { getQueue, getJobStatus, getQueueEvents } from "../services/scanQueue.js";
+import { getScanCheckpoint, saveScanCheckpoint } from "../db/index.js";
 
 const QUEUE_ENABLED = process.env.QUEUE_ENABLED === "true";
 
-const SCAN_RATE_LIMIT = {
-  max: 3,
-  timeWindow: "15 minutes",
-  statusCode: 429,
-  keyGenerator: (req) => {
-    try {
-      const token = req.headers.authorization?.split(" ")[1];
-      const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-      return decoded?.sub ?? req.ip;
-    } catch {
-      return req.ip;
-    }
-  },
-  errorResponseBuilder: (req, context) => ({
-    statusCode: 429,
-    error: "rate_limited",
-    message: "Too many scans. Please wait 15 minutes before scanning again.",
-  }),
-};
-
-function verifyUserId(req, reply) {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) { reply.code(401).send({ error: "unauthorized" }); return null; }
-  try {
-    const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-    const userId = decoded.sub;
-    if (!userId) { reply.code(401).send({ error: "unauthorized" }); return null; }
-    return userId;
-  } catch {
-    reply.code(401).send({ error: "unauthorized" });
-    return null;
-  }
-}
-
 export function registerScanRoutes(server) {
   // ── POST /scan ────────────────────────────────────────────────────────────
-  // QUEUE_ENABLED=true  → enqueues job, returns { jobId } immediately
-  // QUEUE_ENABLED=false → runs synchronously, returns result directly
   server.post("/scan", { config: { rateLimit: SCAN_RATE_LIMIT } }, async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
+    req.userId = userId;
+
+    const allowed = await enforceScanLimit(req, reply);
+    if (!allowed) return;
 
     const rawDaysBack = req.body?.daysBack;
     if (rawDaysBack !== undefined) {
@@ -62,39 +32,68 @@ export function registerScanRoutes(server) {
       try {
         const force = req.body?.force === true;
         const job = await getQueue().add("scan", { userId, daysBack, force });
+        // Release slot immediately — the worker runs out-of-band and
+        // is not subject to the per-request free-tier check.
+        releaseScanSlot(userId);
         return reply.code(202).send({ jobId: job.id, status: "queued" });
       } catch (err) {
+        releaseScanSlot(userId);
         req.log.error({ err }, "scan_enqueue_error");
         return reply.code(500).send({ error: "scan_failed" });
       }
     }
 
-    // Synchronous path (default, no Redis required)
+    // Synchronous path
     try {
       const force = req.body?.force === true;
-      const result = await runGmailScan({ userId, daysBack, force });
+
+      let afterDate;
+      if (!force) {
+        const checkpoint = await getScanCheckpoint(userId, "google");
+        if (checkpoint?.last_message_date) {
+          afterDate = new Date(checkpoint.last_message_date);
+          req.log.info({ afterDate, provider: "google" }, "incremental_scan_checkpoint");
+        }
+      }
+
+      const SCAN_TIMEOUT_MS = 90_000;
+      let timeoutId;
+      const result = await Promise.race([
+        runGmailScan({ userId, daysBack, afterDate, force }),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("scan_timeout")), SCAN_TIMEOUT_MS);
+        }),
+      ]);
+      clearTimeout(timeoutId);
+
+      if (result.checkpoint) {
+        await saveScanCheckpoint(userId, "google", result.checkpoint);
+      }
+
       return { success: true, ...result };
     } catch (err) {
+      if (err.message === "scan_timeout") {
+        return reply.code(504).send({ error: "scan_timeout", message: "Scan took too long. Try a shorter date range." });
+      }
       if (err.message === "gmail_not_connected") {
         return reply.code(400).send({ error: "gmail_not_connected" });
       }
       if (err.message === "circuit_open") {
         return reply.code(503).send({ error: "scan_paused", message: "Gmail API is rate limited. Try again shortly." });
       }
-      // Token refresh failed — stored refresh token is invalid/revoked.
-      // Return a specific error so the frontend can prompt the user to reconnect.
       if (err.message?.includes("TOKEN_REFRESH_FAILED")) {
         return reply.code(401).send({ error: "gmail_auth_expired" });
       }
       req.log.error({ err }, "scan_error");
       return reply.code(500).send({ error: "scan_failed" });
+    } finally {
+      releaseScanSlot(userId);
     }
   });
 
   // ── GET /scan/:jobId/status ───────────────────────────────────────────────
-  // Polls a queued scan job. Returns status + result when complete.
   server.get("/scan/:jobId/status", async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
 
     if (!QUEUE_ENABLED) {
@@ -112,10 +111,8 @@ export function registerScanRoutes(server) {
   });
 
   // ── GET /scan/:jobId/events ───────────────────────────────────────────────
-  // SSE stream of real-time scan progress for a queued job.
-  // Client receives { pct, message } progress updates and a final { done } event.
   server.get("/scan/:jobId/events", async (req, reply) => {
-    const userId = verifyUserId(req, reply);
+    const userId = requireUser(req, reply);
     if (!userId) return;
 
     if (!QUEUE_ENABLED) {
@@ -126,7 +123,6 @@ export function registerScanRoutes(server) {
 
     reply.sse(
       (async function* () {
-        // First, check if the job is already done.
         const initial = await getJobStatus(jobId);
         if (!initial) {
           yield { event: "error", data: JSON.stringify({ error: "job_not_found" }) };
@@ -144,10 +140,7 @@ export function registerScanRoutes(server) {
           return;
         }
 
-        // Job is still running — subscribe to QueueEvents for live updates.
-        const queueEvents = getQueueEvents();
-
-        const MAX_WAIT_MS = 5 * 60 * 1000; // 5 minutes
+        const MAX_WAIT_MS = 5 * 60 * 1000;
         const startedAt = Date.now();
 
         while (Date.now() - startedAt < MAX_WAIT_MS) {
@@ -169,7 +162,7 @@ export function registerScanRoutes(server) {
             return;
           }
 
-          await new Promise((res) => setTimeout(res, 2000)); // poll every 2s
+          await new Promise((res) => setTimeout(res, 2000));
         }
 
         yield { event: "error", data: JSON.stringify({ error: "timeout" }) };

@@ -5,25 +5,120 @@
 // hand-tuned heuristic thresholds. Retrain with: node scripts/trainModel.js
 //
 // Feature vector (all normalised to [0, 1]):
-//   [0] occ_norm       — clamp((occurrences - 1) / 5, 0, 1)
-//   [1] interval_score — clamp(1 - intervalVariance / 30, 0, 1)
-//   [2] amount_score   — clamp(1 - amountCV / 0.5, 0, 1)
-//   [3] intent_score   — clamp(intentCount / 2, 0, 1)
-//   [4] known_brand    — 1 if known brand with confirmSingle, else 0
+//   [0] occ_norm                — clamp((occurrences - 1) / 5, 0, 1)
+//   [1] interval_score          — clamp(1 - intervalVariance / 30, 0, 1)
+//   [2] amount_score            — clamp(1 - amountCV / 0.5, 0, 1)
+//   [3] intent_score            — clamp(intentCount / 2, 0, 1)
+//   [4] known_brand             — 1 if known brand with confirmSingle, else 0
+//   [5] subject_intent_score    — TASK 6: 0.0/0.5/0.9 from subject line keyword scoring
+//   [6] known_price_tier_score  — TASK 7: 1.0/0.5/0.0 from KNOWN_PRICE_TIERS proximity
 //
 // Recency decay is applied as a post-sigmoid multiplier so stale detections
 // naturally decay without changing the stored model score.
 //
-// Thresholds downstream:
-//   Gmail:  ≥ 0.50 → confirmed,  < 0.85 → isSuggested = true
-//   IMAP:   ≥ 0.70 → confirmed,  < 0.85 → isSuggested = true
+// TASK 5: All threshold constants imported from src/config/detectionConstants.js
+// (single source of truth — previously scattered as 0.50 in Gmail, 0.70 in IMAP).
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { DETECTION } from "../config/detectionConstants.js";
 import { predictConfidence } from "./subscriptionModel.js";
 import { extractFeatures } from "./modelFeatures.js";
 
-function calculateConfidence({ occurrences, intervalVariance, amountCV, intentCount, recencyDecay, knownBrand }) {
-  const features = extractFeatures({ occurrences, intervalVariance, amountCV, intentCount, knownBrand });
+const { CONFIDENCE_THRESHOLD, RECENCY_DECAY } = DETECTION;
+
+// ─── TASK 6: Subject line intent scoring ─────────────────────────────────────
+//
+// Scores the email subject line for subscription-intent signals before the
+// main detection loop. High-intent subjects (e.g. "your receipt", "invoice")
+// get a 0.9 score that flows into the feature vector with weight 0.4.
+// Cancellation subjects return 0.0 AND trigger the early-exit guard (Task 8).
+
+// HIGH intent keywords → score 0.9
+const HIGH_INTENT = [
+  "your receipt", "invoice", "payment confirmation", "thank you for subscribing",
+  "subscription confirmation", "your subscription", "billing confirmation",
+  "payment received", "order confirmation", "purchase confirmation",
+  "payment successful",
+];
+
+// MEDIUM intent keywords → score 0.5
+const MEDIUM_INTENT = [
+  "your plan", "membership", "renewal", "your account", "billing update",
+  "subscription renewal", "plan renewal", "auto-renewal",
+];
+
+// CANCELLATION signals — score 0.0 and also used by Task 8 early-exit guard.
+// Exported so emailParser.js and other modules can reuse the same list.
+export const CANCELLATION_SIGNALS = [
+  "cancellation confirmed", "subscription cancelled", "subscription canceled",
+  "you have been unsubscribed", "your cancellation",
+  "we've cancelled", "we've canceled", "cancel confirmation",
+  "unsubscribe confirmed",
+];
+
+/**
+ * TASK 6 — Scores an email subject line for subscription purchase intent.
+ * Returns { score, matched, isCancellation } where:
+ *   score          — 0.0 (cancellation/low), 0.5 (medium), 0.9 (high)
+ *   matched        — the keyword that fired, or null
+ *   isCancellation — true if a cancellation signal matched (triggers Task 8 skip)
+ */
+function scoreSubjectIntent(subject) {
+  if (!subject) return { score: 0.0, matched: null, isCancellation: false };
+  const lower = subject.toLowerCase();
+  for (const kw of CANCELLATION_SIGNALS) {
+    if (lower.includes(kw)) return { score: 0.0, matched: kw, isCancellation: true };
+  }
+  for (const kw of HIGH_INTENT) {
+    if (lower.includes(kw)) return { score: 0.9, matched: kw, isCancellation: false };
+  }
+  for (const kw of MEDIUM_INTENT) {
+    if (lower.includes(kw)) return { score: 0.5, matched: kw, isCancellation: false };
+  }
+  return { score: 0.1, matched: null, isCancellation: false };
+}
+
+// ─── TASK 7: Amount (price tier) stability scoring ────────────────────────────
+//
+// Subscription services almost always charge at standard "nice" price tiers
+// (e.g. $9.99, $14.99, $19.99). An extracted amount that exactly matches (or is
+// within $1.00 of) a known tier is a strong signal it's a real subscription
+// rather than a one-time or irregular charge.
+
+const KNOWN_PRICE_TIERS = [
+  0.99, 1.99, 2.99, 3.99, 4.99, 5.99, 6.99, 7.99, 8.99, 9.99,
+  10.99, 11.99, 12.99, 13.99, 14.99, 15.99, 17.99, 19.99, 24.99, 29.99,
+  34.99, 39.99, 49.99, 59.99, 69.99, 79.99, 99.99, 119.99, 129.99, 149.99,
+  199.99, 299.99,
+];
+
+/**
+ * TASK 7 — Returns a score (0–1) based on how close an amount is to a known
+ * subscription price tier:
+ *   1.0 — exact match (±$0.01)
+ *   0.5 — close match (within $1.00)
+ *   0.0 — not near any known tier
+ */
+function scorePriceTier(amount) {
+  if (!amount || amount <= 0) return 0.0;
+  const n = Number(amount);
+  for (const tier of KNOWN_PRICE_TIERS) {
+    if (Math.abs(n - tier) <= 0.01) return 1.0;
+    if (Math.abs(n - tier) <= 1.00) return 0.5;
+  }
+  return 0.0;
+}
+
+function calculateConfidence({
+  occurrences, intervalVariance, amountCV, intentCount, recencyDecay, knownBrand,
+  subjectIntentScore = 0,   // TASK 6
+  knownPriceTierScore = 0,  // TASK 7
+}) {
+  const features = extractFeatures({
+    occurrences, intervalVariance, amountCV, intentCount, knownBrand,
+    subjectIntentScore,
+    knownPriceTierScore,
+  });
   const raw = predictConfidence(features);
   return Math.min(raw * recencyDecay, 1.0);
 }
@@ -31,17 +126,15 @@ function calculateConfidence({ occurrences, intervalVariance, amountCV, intentCo
 // Billing interval bands — widened vs original to handle real-world billing
 // drift (e.g. a 28-day or 31-day "monthly" cycle, holiday delays).
 function detectBillingInterval(avgDays) {
-  if (avgDays >= 5 && avgDays <= 10)   return "weekly";
-  if (avgDays >= 22 && avgDays <= 38)  return "monthly";
-  if (avgDays >= 75 && avgDays <= 105) return "quarterly";
+  if (avgDays >= 5 && avgDays <= 10)    return "weekly";
+  if (avgDays >= 22 && avgDays <= 38)   return "monthly";
+  if (avgDays >= 75 && avgDays <= 105)  return "quarterly";
   if (avgDays >= 165 && avgDays <= 200) return "semi-annual";
   if (avgDays >= 345 && avgDays <= 385) return "yearly";
   return "unknown";
 }
 
-// Returns the spread of intervals after trimming the single worst outlier
-// (e.g. a skipped month or a billing retry). Falls back to full range when
-// there aren't enough data points to trim.
+// Returns the spread of intervals after trimming the single worst outlier.
 function calcIntervalVariance(intervals) {
   if (intervals.length === 0) return 0;
   if (intervals.length < 3) return Math.max(...intervals) - Math.min(...intervals);
@@ -50,8 +143,6 @@ function calcIntervalVariance(intervals) {
 }
 
 // Coefficient of variation: stddev / mean.
-// More robust than range/mean — a $1 spread on a $5 plan (CV=0.20) is
-// correctly penalised more than a $1 spread on a $200 plan (CV=0.005).
 function calcAmountCV(amounts) {
   if (amounts.length < 2) return 0;
   const mean = amounts.reduce((a, b) => a + b, 0) / amounts.length;
@@ -60,15 +151,16 @@ function calcAmountCV(amounts) {
   return Math.sqrt(variance) / mean;
 }
 
-// Multiplier applied to raw confidence based on how recently the subscription
-// was last seen. Ensures stale subscriptions naturally decay rather than staying
-// "confirmed" forever after a cancellation.
+/**
+ * TASK 5 — Recency decay multiplier using DETECTION.RECENCY_DECAY constants
+ * instead of hardcoded literals. Previously these were scattered inline.
+ */
 function calcRecencyDecay(daysSinceLastCharge) {
-  if (daysSinceLastCharge < 45)  return 1.00;
-  if (daysSinceLastCharge < 90)  return 0.90;
-  if (daysSinceLastCharge < 180) return 0.75;
-  if (daysSinceLastCharge < 365) return 0.55;
-  return 0.35;
+  if (daysSinceLastCharge < 45)  return RECENCY_DECAY.DAYS_45;   // 1.00
+  if (daysSinceLastCharge < 90)  return RECENCY_DECAY.DAYS_90;   // 0.90
+  if (daysSinceLastCharge < 180) return RECENCY_DECAY.DAYS_180;  // 0.75
+  if (daysSinceLastCharge < 365) return RECENCY_DECAY.DAYS_365;  // 0.55
+  return RECENCY_DECAY.BEYOND;                                     // 0.35
 }
 
 import { getBrandInfo, getBrandDisplayName } from "./knownBrands.js";
@@ -76,17 +168,11 @@ import { normalizeMerchant } from "./merchantNormalizer.js";
 
 /**
  * Adjusts a raw confidence score based on the user's explicit feedback.
- *
- * confirmed → boost by +0.15 (capped at 1.0) — user said "yes this is real"
- * rejected  → suppress to 0  — user said "this is wrong"; exclude entirely
- *
- * This is the core of the free intelligence graph: user feedback is the
- * training signal that personalises detection over time without retraining.
  */
 function applyFeedback(confidence, merchantKey, feedbackMap) {
   const label = feedbackMap[merchantKey.toLowerCase()];
   if (label === "confirmed") return Math.min(confidence + 0.15, 1.0);
-  if (label === "rejected")  return 0; // exclude entirely
+  if (label === "rejected")  return 0;
   return confidence;
 }
 
@@ -94,16 +180,30 @@ function applyFeedback(confidence, merchantKey, feedbackMap) {
  * @param {Array}  charges     — extracted charge objects from scan
  * @param {object} opts
  * @param {object} opts.feedbackMap — { [merchantKey: string]: 'confirmed'|'rejected' }
- *   Per-user feedback labels from prior scans. Confirmed merchants get a confidence
- *   boost; rejected merchants are suppressed. This is the free-tier "intelligence
- *   graph" — it personalises detection to each user's actual spending history.
  */
 export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {}) {
   const grouped = {};
 
   for (const c of charges) {
-    // Normalize merchant key so "Netflix Inc." and "NETFLIX.COM" map to the
-    // same group. The original merchant name is preserved on the charge itself.
+    // ── TASK 8: Cancellation signal early-exit ─────────────────────────────
+    // Before any confidence calculation or merchant lookup, check both the subject
+    // and body for cancellation signals. If found, skip this charge entirely so
+    // it never enters the detection candidates pool.
+    // This runs PER CHARGE (not per email) because multiple charges can come from
+    // the same email and the charge object carries subject/cleanText context.
+    const subjectLower = (c.subject || "").toLowerCase();
+    const bodyLower    = (c.cleanText || "").toLowerCase();
+    const isCancellation = CANCELLATION_SIGNALS.some(
+      (sig) => subjectLower.includes(sig) || bodyLower.includes(sig)
+    );
+    if (isCancellation) {
+      // Record in extractionLog if present on the charge
+      if (c.extractionLog) {
+        c.extractionLog.cancellation_signal_detected = true;
+      }
+      continue; // skip — do not add to candidates
+    }
+
     const key = normalizeMerchant(c.merchant) || c.merchant;
     if (!grouped[key]) grouped[key] = [];
     grouped[key].push(c);
@@ -121,11 +221,12 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
       const single = list[0];
       const daysSince = (now - single.date.getTime()) / (1000 * 60 * 60 * 24);
 
-      // Known brands with confirmSingle skip the generic intent/amount checks —
-      // a charge from netflix.com is a subscription by definition.
+      // TASK 6: Score the subject for this single charge.
+      const subjectIntent = scoreSubjectIntent(single.subject ?? "");
+      // TASK 7: Score the price tier for this single charge.
+      const priceTierScore = scorePriceTier(single.amount);
+
       if (brand?.confirmSingle) {
-        // Amount sanity check: skip if the amount is implausible for this brand
-        // (likely a parsing error from a non-billing email).
         if (single.amount < brand.minAmount * 0.5 || single.amount > brand.maxAmount * 2) continue;
 
         let confidence = Math.round(0.8 * calcRecencyDecay(daysSince) * 1000) / 1000;
@@ -133,20 +234,23 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
         if (confidence <= 0) continue;
 
         results.push({
-          merchant:      getBrandDisplayName(merchant),
-          renewalAmount: single.amount,
-          currency:      single.currency ?? "USD",
-          renewalDate:   single.renewalDate ?? null,
+          merchant:        getBrandDisplayName(merchant),
+          renewalAmount:   single.amount,
+          currency:        single.currency ?? "USD",
+          renewalDate:     single.renewalDate ?? null,
           billingInterval: brand.interval,
-          confidence:    Math.round(confidence * 1000) / 1000,
-          isActive:    true,
-          isSuggested: confidence < 0.85,
-          source:      "gmail",
+          confidence:      Math.round(confidence * 1000) / 1000,
+          isActive:        true,
+          isSuggested:     confidence < 0.85,
+          extractionLog:   {
+            ...(single.extractionLog ?? {}),
+            subject_intent: { score: subjectIntent.score, matched: subjectIntent.matched },
+            known_price_tier_score: priceTierScore,
+          },
         });
         continue;
       }
 
-      // Generic single-charge path: require explicit intent + subscription-like amount.
       if (!single.subscriptionIntent) continue;
 
       const amount = single.amount;
@@ -162,15 +266,19 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
       if (confidence <= 0) continue;
 
       results.push({
-        merchant:      getBrandDisplayName(merchant),
-        renewalAmount: amount,
-        currency:      single.currency ?? "USD",
-        renewalDate:   single.renewalDate ?? null,
+        merchant:        getBrandDisplayName(merchant),
+        renewalAmount:   amount,
+        currency:        single.currency ?? "USD",
+        renewalDate:     single.renewalDate ?? null,
         billingInterval: brand?.interval ?? "unknown",
-        confidence:    Math.round(confidence * 1000) / 1000,
-        isActive:    true,
-        isSuggested: true,
-        source:      "gmail",
+        confidence:      Math.round(confidence * 1000) / 1000,
+        isActive:        true,
+        isSuggested:     true,
+        extractionLog:   {
+          ...(single.extractionLog ?? {}),
+          subject_intent: { score: subjectIntent.score, matched: subjectIntent.matched },
+          known_price_tier_score: priceTierScore,
+        },
       });
 
       continue;
@@ -181,7 +289,6 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
 
     const last = list[list.length - 1];
 
-    // Amount sanity check for known brands — skip if amounts are implausible.
     if (brand && (last.amount < brand.minAmount * 0.5 || last.amount > brand.maxAmount * 2)) continue;
 
     const intervals = [];
@@ -193,7 +300,6 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
     const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
     const intervalVariance = calcIntervalVariance(intervals);
 
-    // Use detected interval; fall back to brand knowledge if detection returns "unknown".
     const detectedInterval = detectBillingInterval(avgInterval);
     const billingInterval = detectedInterval !== "unknown"
       ? detectedInterval
@@ -212,30 +318,45 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
 
     const intentCount = list.filter((c) => c.subscriptionIntent).length;
 
+    // TASK 6: Average subject intent score across all charges for this merchant.
+    const avgSubjectIntentScore = list.reduce((sum, c) => {
+      return sum + scoreSubjectIntent(c.subject ?? "").score;
+    }, 0) / list.length;
+    const lastSubjectIntent = scoreSubjectIntent(last.subject ?? "");
+
+    // TASK 7: Score based on the most recent charge amount.
+    const priceTierScore = scorePriceTier(last.amount);
+
     let confidence = calculateConfidence({
       occurrences: list.length,
       intervalVariance,
       amountCV,
       intentCount,
       recencyDecay,
-      knownBrand: !!brand?.confirmSingle,
+      knownBrand:          !!brand?.confirmSingle,
+      subjectIntentScore:  avgSubjectIntentScore,   // TASK 6
+      knownPriceTierScore: priceTierScore,           // TASK 7
     });
 
-    if (confidence < 0.5) continue;
+    if (confidence < CONFIDENCE_THRESHOLD) continue;
 
     confidence = applyFeedback(confidence, merchant, feedbackMap);
     if (confidence <= 0) continue;
 
     results.push({
-      merchant:      getBrandDisplayName(merchant),
-      renewalAmount: last.amount,
-      currency:      last.currency ?? "USD",
-      renewalDate:   nextDate,
+      merchant:        getBrandDisplayName(merchant),
+      renewalAmount:   last.amount,
+      currency:        last.currency ?? "USD",
+      renewalDate:     nextDate,
       billingInterval,
-      confidence:  Math.round(confidence * 1000) / 1000,
-      isActive:    true,
-      isSuggested: confidence < 0.85,
-      source:      "gmail",
+      confidence:      Math.round(confidence * 1000) / 1000,
+      isActive:        true,
+      isSuggested:     confidence < 0.85,
+      extractionLog:   {
+        ...(last.extractionLog ?? {}),
+        subject_intent: { score: avgSubjectIntentScore, matched: lastSubjectIntent.matched },
+        known_price_tier_score: priceTierScore,
+      },
     });
   }
 

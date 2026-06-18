@@ -26,19 +26,53 @@ export async function withRetry(fn, { maxAttempts = 3, baseDelayMs = 500, retryO
 }
 
 /**
- * Per-scan circuit breaker. Tracks consecutive API failures within a scan run.
- * If failures reach the threshold, throws to abort the scan rather than
- * hammering a rate-limited or degraded API.
+ * Per-scan circuit breaker with half-open recovery.
+ *
+ * States:
+ *   CLOSED   – normal operation, requests pass through
+ *   OPEN     – threshold reached, all requests rejected
+ *   HALF_OPEN – cooldown elapsed, one test request allowed through
+ *
+ * After cooldown (default 60s), the breaker enters half-open state.
+ * If the next call succeeds → CLOSED. If it fails → OPEN (timer resets).
  */
 export class CircuitBreaker {
-  constructor({ threshold = 3 } = {}) {
-    this.failures = 0;
+  constructor({ threshold = 3, cooldownMs = 60_000 } = {}) {
     this.threshold = threshold;
+    this.cooldownMs = cooldownMs;
+    this.failures = 0;
+    this._openedAt = null;
+  }
+
+  get isOpen() {
+    if (this.failures < this.threshold) return false;
+    // Check if cooldown has elapsed → transition to half-open
+    if (this._openedAt && Date.now() - this._openedAt >= this.cooldownMs) {
+      return false; // half-open: allow one test request
+    }
+    return true;
+  }
+
+  get isHalfOpen() {
+    return (
+      this.failures >= this.threshold &&
+      this._openedAt != null &&
+      Date.now() - this._openedAt >= this.cooldownMs
+    );
+  }
+
+  /** Call before making a request. Throws `circuit_open` if breaker is open. */
+  check() {
+    if (this.isOpen) {
+      const err = new Error("circuit_open");
+      throw err;
+    }
   }
 
   /** Call after a successful API response. */
   success() {
     this.failures = 0;
+    this._openedAt = null;
   }
 
   /**
@@ -48,6 +82,7 @@ export class CircuitBreaker {
   failure(err) {
     this.failures++;
     if (this.failures >= this.threshold) {
+      this._openedAt = Date.now();
       const open = new Error("circuit_open");
       open.cause = err;
       throw open;

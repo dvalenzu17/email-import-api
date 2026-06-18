@@ -16,6 +16,9 @@
  *
  * Accuracy is intentionally conservative: when in doubt, return "receipt"
  * so the detection pipeline can still score the email normally.
+ *
+ * Performance: All patterns are pre-compiled at module load. classifyEmail()
+ * does at most 12 regex tests instead of 60+ string.includes() calls per email.
  */
 
 export const EMAIL_TYPES = {
@@ -28,6 +31,28 @@ export const EMAIL_TYPES = {
   UPGRADE:        "upgrade",
 };
 
+// ── Pre-compiled combined patterns ──────────────────────────────────────────
+// Each type has a subject regex and a body regex. A single .test() per text
+// replaces 5-30 individual .includes() calls.
+
+const CANCEL_SUBJECT_RE = /cancell|canceled/;
+const CANCEL_BODY_RE = /subscription has been cancell?ed|successfully cancell?ed your|you have cancell?ed|you've cancell?ed|we've cancell?ed your|your account has been cancell?ed|subscription cancell?ed|membership has been cancell?ed|will not be renewed|will not renew|turned off auto-renew|auto-renewal has been turned off|access will end on|access ends on|subscription has ended|subscription ended on|your account is now inactive|account has been terminated|your membership has expired|account is deactivated|your subscription is now cancell?ed/;
+
+const FAILED_SUBJECT_RE = /payment (?:failed|declined|unsuccessful)|failed payment|action required.*(?:payment|subscription)/;
+const FAILED_BODY_RE = /payment was declined|unable to process your payment|couldn't charge your|we were unable to charge|payment method failed|your card was declined|your payment did not go through|renewal failed|billing attempt failed/;
+
+const TRIAL_ENDING_SUBJECT_RE = /trial.*(?:end|expir|over|finish)/;
+const TRIAL_ENDING_BODY_RE = /trial (?:ends in|period ends|is ending|expires|will end)|free trial is over/;
+
+const TRIAL_START_SUBJECT_RE = /free trial.*(?:start|begin|activat)/;
+const TRIAL_START_BODY_RE = /your free trial has started|your trial has begun|trial has been activated|free trial is now active/;
+
+const UPGRADE_SUBJECT_RE = /plan (?:upgrade|change)|upgrade(?!.*receipt)/;
+const UPGRADE_BODY_RE = /you've been upgraded|your plan has been upgraded|successfully upgraded to|you've switched to the|your subscription has been upgraded/;
+
+const RENEWAL_SUBJECT_RE = /renewal(?!.*(?:receipt|invoice|renew))|subscription.{0,15}expir|subscription is expiring/;
+const RENEWAL_BODY_RE = /subscription will expire|will be charged|will automatically renew|will renew on|upcoming renewal|your subscription renews on|scheduled to renew/;
+
 /**
  * @param {string} subject
  * @param {string} body   — plain text (post-HTML stripping)
@@ -37,103 +62,23 @@ export function classifyEmail(subject, body) {
   const s = subject.toLowerCase();
   const b = body.toLowerCase();
 
-  // ── Cancellation ─────────────────────────────────────────────────────────
-  if (
-    s.includes("cancell") || s.includes("canceled") ||
-    b.includes("subscription has been cancelled") ||
-    b.includes("subscription has been canceled") ||
-    b.includes("successfully cancelled your") ||
-    b.includes("successfully canceled your") ||
-    b.includes("you have cancelled") ||
-    b.includes("you've cancelled") ||
-    b.includes("you've canceled") ||
-    b.includes("we've cancelled your") ||
-    b.includes("your account has been cancelled") ||
-    b.includes("subscription cancelled") ||
-    b.includes("subscription canceled") ||
-    b.includes("membership has been cancelled") ||
-    b.includes("membership has been canceled") ||
-    // Apple App Store — sent when user turns off auto-renew
-    b.includes("will not be renewed") ||
-    b.includes("will not renew") ||
-    b.includes("turned off auto-renew") ||
-    b.includes("auto-renewal has been turned off") ||
-    b.includes("access will end on") ||
-    b.includes("access ends on") ||
-    b.includes("subscription has ended") ||
-    b.includes("subscription ended on") ||
-    b.includes("your account is now inactive") ||
-    b.includes("account has been terminated") ||
-    b.includes("your membership has expired") ||
-    b.includes("account is deactivated") ||
-    b.includes("your subscription is now cancelled") ||
-    b.includes("your subscription is now canceled")
-  ) return EMAIL_TYPES.CANCELLATION;
+  if (CANCEL_SUBJECT_RE.test(s) || CANCEL_BODY_RE.test(b))
+    return EMAIL_TYPES.CANCELLATION;
 
-  // ── Failed payment ────────────────────────────────────────────────────────
-  if (
-    s.includes("payment failed") || s.includes("payment declined") ||
-    s.includes("failed payment") ||
-    s.includes("payment unsuccessful") ||
-    (s.includes("action required") && (s.includes("payment") || s.includes("subscription"))) ||
-    b.includes("payment was declined") ||
-    b.includes("unable to process your payment") ||
-    b.includes("couldn't charge your") ||
-    b.includes("we were unable to charge") ||
-    b.includes("payment method failed") ||
-    b.includes("your card was declined") ||
-    b.includes("your payment did not go through") ||
-    b.includes("renewal failed") ||
-    b.includes("billing attempt failed")
-  ) return EMAIL_TYPES.FAILED_PAYMENT;
+  if (FAILED_SUBJECT_RE.test(s) || FAILED_BODY_RE.test(b))
+    return EMAIL_TYPES.FAILED_PAYMENT;
 
-  // ── Trial ending ──────────────────────────────────────────────────────────
-  if (
-    (s.includes("trial") && (s.includes("end") || s.includes("expir") || s.includes("over") || s.includes("finish"))) ||
-    b.includes("trial ends in") ||
-    b.includes("trial period ends") ||
-    b.includes("trial is ending") ||
-    b.includes("trial expires") ||
-    b.includes("trial will end") ||
-    b.includes("free trial is over")
-  ) return EMAIL_TYPES.TRIAL_ENDING;
+  if (TRIAL_ENDING_SUBJECT_RE.test(s) || TRIAL_ENDING_BODY_RE.test(b))
+    return EMAIL_TYPES.TRIAL_ENDING;
 
-  // ── Trial started ─────────────────────────────────────────────────────────
-  if (
-    (s.includes("free trial") && (s.includes("start") || s.includes("begin") || s.includes("activat"))) ||
-    b.includes("your free trial has started") ||
-    b.includes("your trial has begun") ||
-    b.includes("trial has been activated") ||
-    b.includes("free trial is now active")
-  ) return EMAIL_TYPES.TRIAL_START;
+  if (TRIAL_START_SUBJECT_RE.test(s) || TRIAL_START_BODY_RE.test(b))
+    return EMAIL_TYPES.TRIAL_START;
 
-  // ── Upgrade / plan change ─────────────────────────────────────────────────
-  if (
-    s.includes("plan upgrade") || s.includes("plan change") ||
-    (s.includes("upgrade") && !s.includes("receipt")) ||
-    b.includes("you've been upgraded") ||
-    b.includes("your plan has been upgraded") ||
-    b.includes("successfully upgraded to") ||
-    b.includes("you've switched to the") ||
-    b.includes("your subscription has been upgraded")
-  ) return EMAIL_TYPES.UPGRADE;
+  if (UPGRADE_SUBJECT_RE.test(s) || UPGRADE_BODY_RE.test(b))
+    return EMAIL_TYPES.UPGRADE;
 
-  // ── Renewal notice (upcoming, not yet charged) ────────────────────────────
-  if (
-    (s.includes("renewal") && !s.includes("receipt") && !s.includes("invoice") && !s.includes("renew")) ||
-    // Apple "Your Subscription is Expiring" — subscription is expiring but price is still actionable
-    /subscription.{0,15}expir/i.test(s) ||
-    s.includes("subscription is expiring") ||
-    // Apple "Your Subscription is Expiring" body text — trial converting to paid.
-    // Moved here from CANCELLATION: the subscription is NOT cancelled, it's about to charge.
-    b.includes("subscription will expire") ||
-    b.includes("will be charged") ||
-    b.includes("will automatically renew") ||
-    b.includes("will renew on") ||
-    b.includes("upcoming renewal") ||
-    b.includes("your subscription renews on") ||
-    b.includes("scheduled to renew")
-  ) return EMAIL_TYPES.RENEWAL_NOTICE;
+  if (RENEWAL_SUBJECT_RE.test(s) || RENEWAL_BODY_RE.test(b))
+    return EMAIL_TYPES.RENEWAL_NOTICE;
 
   return EMAIL_TYPES.RECEIPT;
 }

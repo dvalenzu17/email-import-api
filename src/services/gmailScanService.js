@@ -6,13 +6,14 @@
  * @param {{
  *   userId: string,
  *   daysBack?: number,
- *   onProgress?: (pct: number, message: string) => void
+ *   afterDate?: Date,
+ *   onProgress?: (pct: number, message: string) => void,
+ *   force?: boolean
  * }} opts
  * @returns {Promise<{ detectedSubscriptions: number, scannedMessages: number, detectedCharges: number, executionTimeMs: number }>}
  */
 
 import {
-  fetchMessage,
   extractText,
   extractAmount,
   extractRenewalDate,
@@ -21,13 +22,33 @@ import {
 } from "../gmailClient.js";
 import { extractCurrencyCode, extractBillingInterval, extractAppleAppNameFromHtml } from "./emailParser.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
-import { getOAuthToken, batchUpsertSubscriptions, upsertCancelledSubscriptions, saveScanMetadata, saveOAuthTokens, cancelSubscriptionByMerchant, getFeedbackMerchantMap } from "../db/index.js";
+import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens, getActiveSubscriptionConfidences, getFeedbackMerchantMap } from "../db/index.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { decryptCredential } from "./crypto.js";
 import { refreshAccessToken } from "../googleOAuth.js";
 import { withRetry, CircuitBreaker } from "./retryUtil.js";
 import { filterUnprocessedIds, markProcessedIds, clearUserCache } from "./messageCache.js";
+import {
+  buildChargeDataMap,
+  enrichSubscriptions,
+  buildBypassEntries,
+  processCancellations,
+  applyLifecycleCancellations,
+  applyExpiryRenewalUpdates,
+} from "./postDetection.js";
+import { CONFIDENCE_THRESHOLD } from "../config.js";
+import { notifyNewSubscriptions } from "./newSubscriptionNotifier.js";
 import pLimit from "p-limit";
+import logger from "../lib/logger.js";
+
+// Module-level circuit breaker shared across all concurrent scans.
+// Protects the Gmail API from cascading failures — a single breaker ensures
+// that if Gmail is rate-limiting, we stop hammering it after 5 failures total
+// (not 5 per scan). Automatically recovers after 60s cooldown (half-open).
+const gmailBreaker = new CircuitBreaker({ threshold: 5 });
+
+// Per-request fetch timeout. Node 20+ supports AbortSignal.timeout().
+const FETCH_TIMEOUT_MS = 15_000;
 
 // Hard negatives — always filter regardless of domain.
 // These are unambiguous non-subscription signals.
@@ -78,7 +99,7 @@ function maybeDecrypt(val) {
   return val;
 }
 
-export async function runGmailScan({ userId, daysBack = 180, onProgress, force = false }) {
+export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgress, force = false }) {
   const progress = onProgress ?? (() => {});
   const started = Date.now();
 
@@ -98,7 +119,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
         clientSecret: process.env.GOOGLE_CLIENT_SECRET,
         refreshToken: rawRefreshToken,
       }),
-      { maxAttempts: 2, baseDelayMs: 1000 }
+      { maxAttempts: 2, baseDelayMs: 1000, retryOn: (e) => !e.message?.includes("TOKEN_REFRESH_FAILED") }
     );
     accessToken = refreshed.accessToken;
     await saveOAuthTokens(userId, {
@@ -111,8 +132,23 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // ── Step 2: List messages ─────────────────────────────────────────────────
   progress(10, "Fetching message list");
 
+  // Incremental scan: when afterDate is provided (from a checkpoint), use
+  // Gmail's `after:YYYY/MM/DD` operator for server-side date filtering.
+  // This is the key optimisation — Gmail filters server-side, so we fetch
+  // far fewer messages on subsequent scans.
+  let dateFilter;
+  if (afterDate && !force) {
+    const d = new Date(afterDate);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    dateFilter = `after:${yyyy}/${mm}/${dd}`;
+  } else {
+    dateFilter = `newer_than:${daysBack}d`;
+  }
+
   const query = [
-    `newer_than:${daysBack}d`,
+    dateFilter,
     '(subject:receipt OR subject:invoice OR subject:subscription OR subject:renewal',
     'OR subject:payment OR subject:billing OR subject:membership OR subject:plan',
     'OR subject:charged OR subject:billed OR subject:"your subscription"',
@@ -128,45 +164,58 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
 
   const listRes = await withRetry(
     async () => {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      gmailBreaker.check();
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (res.status === 429 || res.status >= 500) {
+        const err = new Error(`gmail_list_failed: ${res.status}`);
+        gmailBreaker.failure(err);
+        throw err;
+      }
       if (!res.ok) throw new Error(`gmail_list_failed: ${res.status}`);
+      gmailBreaker.success();
       return res.json();
     },
     { maxAttempts: 3, baseDelayMs: 800, retryOn: (e) => CircuitBreaker.isTransient(e) }
   );
 
   const allIds = (listRes.messages ?? []).map((m) => m.id);
-  console.log(`[scan] gmail_query_results: ${allIds.length} messages found for userId=${userId} force=${force}`);
+  logger.info({ messages: allIds.length, userId, force }, "gmail_query_results");
 
   // ── Step 3: Deduplicate (skip already-processed messages) ─────────────────
   progress(15, "Deduplicating message list");
   if (force) await clearUserCache(userId);
   const newIds = force ? allIds : await filterUnprocessedIds(userId, allIds);
-  console.log(`[scan] after_dedup: ${newIds.length} new messages (${allIds.length - newIds.length} already cached)`);
+  logger.info({ newMessages: newIds.length, cached: allIds.length - newIds.length }, "after_dedup");
 
   progress(20, `Fetching ${newIds.length} new messages`);
 
   // ── Step 4: Fetch messages with retry + circuit breaker ───────────────────
-  const breaker = new CircuitBreaker({ threshold: 5 });
   const limit = pLimit(25);
 
   const fullMessages = await Promise.all(
     newIds.map((id) =>
       limit(async () => {
         try {
+          gmailBreaker.check();
           const msg = await withRetry(
             async () => {
               const res = await fetch(
                 `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
-                { headers: { Authorization: `Bearer ${accessToken}` } }
+                {
+                  headers: { Authorization: `Bearer ${accessToken}` },
+                  signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+                }
               );
               if (res.status === 429 || res.status >= 500) {
                 const err = new Error(`gmail_fetch_failed: ${res.status}`);
-                breaker.failure(err); // throws circuit_open at threshold
+                gmailBreaker.failure(err); // throws circuit_open at threshold
                 throw err;
               }
               if (!res.ok) return null; // skip non-retryable errors (404 etc.)
-              breaker.success();
+              gmailBreaker.success();
               return res.json();
             },
             { maxAttempts: 3, baseDelayMs: 600, retryOn: (e) => CircuitBreaker.isTransient(e) }
@@ -192,8 +241,22 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
       filtered_not_transactional = 0, filtered_no_amount = 0, filtered_no_merchant = 0,
       filtered_lifecycle = 0;
 
+  // Track the newest message date and ID for incremental scan checkpoints.
+  let newestMessageDate = null;
+  let newestMessageId = null;
+
   for (const full of fullMessages) {
     if (!full?.payload) { filtered_no_payload++; continue; }
+
+    // Track newest message for checkpoint — do this before any filtering so
+    // the checkpoint reflects the full set of fetched messages, not just charges.
+    if (full.internalDate) {
+      const msgDate = new Date(Number(full.internalDate));
+      if (!newestMessageDate || msgDate > newestMessageDate) {
+        newestMessageDate = msgDate;
+        newestMessageId = full.id;
+      }
+    }
 
     const headers = full.payload.headers;
     const rawHtml = extractText(full.payload);
@@ -256,9 +319,8 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     // trial_start, trial_ending, upgrade, renewal_notice, receipt → continue
     // to charge extraction (they may carry an amount we want to track).
 
-    const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) =>
-      fromHeader.toLowerCase().includes(d)
-    );
+    const fromLower = fromHeader.toLowerCase();
+    const isKnownDomain = SUBSCRIPTION_POSITIVE_DOMAINS.some((d) => fromLower.includes(d));
 
     // Hard negatives apply to all emails. Soft negatives only apply to emails
     // not from a known billing domain (to avoid filtering valid receipts that
@@ -317,109 +379,76 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
     charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), isAppleIAP, _msgId: full.id });
   }
 
-  console.log(`[scan] charges_extracted: ${charges.length} | filters: noPayload=${filtered_no_payload} noText=${filtered_no_text} negative=${filtered_negative} notTransactional=${filtered_not_transactional} noAmount=${filtered_no_amount} noMerchant=${filtered_no_merchant} lifecycle=${filtered_lifecycle} cancellations=${cancellations.length}`);
+  logger.info({ charges: charges.length, filtered_no_payload, filtered_no_text, filtered_negative, filtered_not_transactional, filtered_no_amount, filtered_no_merchant, filtered_lifecycle, cancellations: cancellations.length }, "charges_extracted");
   if (charges.length > 0) {
     const byMerchant = {};
     for (const c of charges) byMerchant[c.merchant] = (byMerchant[c.merchant] ?? 0) + 1;
-    console.log(`[scan] charges_by_merchant:`, JSON.stringify(byMerchant));
+    logger.info({ byMerchant }, "charges_by_merchant");
   }
 
   progress(80, "Detecting subscriptions");
 
   // ── Step 6: Detect + persist ──────────────────────────────────────────────
-  // Fetch per-user feedback labels to personalise confidence scores.
+  // Uses shared postDetection.js helpers (same as IMAP path) to ensure
+  // consistent source tagging, merchant validation, and lifecycle handling.
   const feedbackMap = await getFeedbackMerchantMap(userId);
+  const chargeDataMap = buildChargeDataMap(charges);
 
-  // Build a lookup of raw charge data keyed by merchant for post-detection enrichment.
-  // When multiple charges exist for the same merchant, prefer yearly over monthly (more specific).
-  const chargeDataMap = {};
-  for (const c of charges) {
-    const key = c.merchant.toLowerCase();
-    const prev = chargeDataMap[key];
-    if (!prev || (c.billingInterval === "yearly" && prev.billingInterval !== "yearly")) {
-      chargeDataMap[key] = c;
-    }
-  }
+  const allSubscriptions = enrichSubscriptions(
+    detectRecurringSubscriptions(charges, { feedbackMap }),
+    chargeDataMap,
+    { source: "gmail", boostAppleIAP: true }
+  );
+  logger.info({ count: allSubscriptions.length, details: allSubscriptions.map(s => ({ merchant: s.merchant, confidence: s.confidence })) }, "subscriptions_detected");
 
-  const subscriptions = detectRecurringSubscriptions(charges, { feedbackMap }).map((s) => {
-    const raw = chargeDataMap[s.merchant.toLowerCase()];
-    return {
-      ...s,
-      // Override billingInterval if the engine returned null/unknown and the email text had one.
-      billingInterval: s.billingInterval && s.billingInterval !== "unknown"
-        ? s.billingInterval
-        : (raw?.billingInterval ?? s.billingInterval),
-    };
+  const confident = allSubscriptions.filter((s) => s.confidence >= CONFIDENCE_THRESHOLD);
+  logger.info({ count: confident.length }, "subscriptions_above_threshold");
+
+  const { inserted: insertedConfident } = await batchUpsertSubscriptions(userId, confident);
+
+  // Bypass loop: charges that passed extraction but failed ML detection.
+  const existingConfidences = await getActiveSubscriptionConfidences(userId);
+  const detectedMerchants = new Set(allSubscriptions.map((s) => s.merchant.toLowerCase()));
+
+  const { bypass: appleBypass, expiryUpdates } = await buildBypassEntries({
+    charges,
+    detectedMerchants,
+    existingConfidences,
+    source: "gmail",
+    shouldBypass: (c) => !!c.isAppleIAP,
+    logger,
   });
-  console.log(`[scan] subscriptions_detected: ${subscriptions.length}`, subscriptions.map(s => `${s.merchant}(${s.confidence})`));
-  const confident = subscriptions.filter((s) => s.confidence >= 0.7);
-  console.log(`[scan] subscriptions_above_threshold: ${confident.length}`);
 
-  // Apple IAP bypass: Apple IAP Gmail receipts are almost always real subscriptions.
-  // If the engine didn't detect them (insufficient recurrence data — e.g. a single
-  // annual charge), add them manually with a moderate confidence so they appear in
-  // the review candidates page. Mirrors the same logic in imapScanRoutes.js.
-  const detectedMerchants = new Set(subscriptions.map((s) => s.merchant.toLowerCase()));
-  const appleBypass = [];
-  const appleBypassSeen = new Set();
-  for (const c of charges) {
-    if (!c.isAppleIAP) continue;
-    const key = c.merchant.toLowerCase();
-    if (detectedMerchants.has(key)) continue;
-    if (appleBypassSeen.has(key)) continue;
-    appleBypassSeen.add(key);
-    appleBypass.push({
-      merchant:        c.merchant,
-      amount:          c.amount,
-      currency:        c.currency,
-      billingInterval: c.billingInterval ?? "monthly",
-      renewalDate:     c.renewalDate ?? null,
-      confidence:      0.75,
-      isActive:        true,
-      isSuggested:     true,
-      source:          "gmail",
-    });
-  }
+  let insertedBypass = [];
   if (appleBypass.length) {
-    console.log(`[scan] apple_iap_bypass: ${appleBypass.map(s => s.merchant).join(", ")}`);
+    logger.info({ merchants: appleBypass.map(s => s.merchant) }, "apple_iap_bypass");
+    ({ inserted: insertedBypass } = await batchUpsertSubscriptions(userId, appleBypass));
   }
 
-  await batchUpsertSubscriptions(userId, [...confident, ...appleBypass]);
-
-  // Upsert + collect cancelled subscriptions from expiry/cancellation emails.
-  // Returned in scan response so they appear as candidates in the review page.
-  let cancelledForReview = [];
-  if (cancelledCharges.length) {
-    const activeMerchants = new Set(confident.map((s) => s.merchant.toLowerCase()));
-    const newlyCancelled = cancelledCharges
-      .filter((c) => !activeMerchants.has(c.merchant.toLowerCase()))
-      .map((c) => ({ ...c, source: "gmail" }));
-    if (newlyCancelled.length) {
-      console.log(`[scan] upserting_cancelled: ${newlyCancelled.map(c => c.merchant).join(", ")}`);
-      await upsertCancelledSubscriptions(userId, newlyCancelled);
-      cancelledForReview = newlyCancelled.map((c) => ({
-        merchant:        c.merchant,
-        renewalAmount:   c.renewalAmount,
-        currency:        c.currency,
-        renewalDate:     c.renewalDate ?? null,
-        billingInterval: null,
-        confidence:      0.6,
-        isActive:        false,
-        isSuggested:     true,
-        source:          "gmail",
-      }));
-    }
+  // Fire "new subscription detected" push for genuinely-new rows (best-effort,
+  // non-blocking so it never delays the scan response).
+  const newlyInserted = [...insertedConfident, ...insertedBypass];
+  if (newlyInserted.length) {
+    notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
   }
 
-  // ── Step 7: Lifecycle events ──────────────────────────────────────────────
-  // Apply cancellations detected during scan (cancellation emails auto-mark
-  // the matching subscription inactive without the user needing to do it manually).
-  if (cancellations.length) {
-    console.log(`[scan] lifecycle_cancellations: ${cancellations.join(", ")}`);
-    await Promise.allSettled(
-      cancellations.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
-    );
-  }
+  await applyExpiryRenewalUpdates(userId, expiryUpdates, logger);
+
+  // ── Step 7: Cancellations + lifecycle ─────────────────────────────────────
+  const activeMerchants = new Set([
+    ...confident.map((s) => s.merchant.toLowerCase()),
+    ...appleBypass.map((s) => s.merchant.toLowerCase()),
+  ]);
+
+  const cancelledForReview = await processCancellations(userId, {
+    cancelledCharges,
+    activeMerchants,
+    source: "gmail",
+  });
+
+  // Filter cancellations against active merchants so a re-subscribed service
+  // doesn't get cancelled by a historical cancellation email.
+  await applyLifecycleCancellations(userId, cancellations, activeMerchants);
 
   await saveScanMetadata(userId, {
     scannedMessages: allIds.length,
@@ -431,7 +460,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   // This ensures that emails filtered by tight thresholds can be re-evaluated on the
   // next scan (e.g. after filters are loosened or more charges accumulate).
   const allDetectedMerchants = new Set([
-    ...subscriptions.map((s) => s.merchant),
+    ...allSubscriptions.map((s) => s.merchant),
     ...appleBypass.map((s) => s.merchant),
   ]);
   const processedIds = charges
@@ -445,7 +474,7 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
   return {
     // Return active + cancelled + Apple IAP bypass subscriptions for the review/candidates page.
     subscriptions: [...confident, ...cancelledForReview, ...appleBypass],
-    detectedSubscriptions: subscriptions.length + appleBypass.length,
+    detectedSubscriptions: allSubscriptions.length + appleBypass.length,
     scannedMessages: allIds.length,
     newMessages: newIds.length,
     detectedCharges: charges.length,
@@ -458,5 +487,9 @@ export async function runGmailScan({ userId, daysBack = 180, onProgress, force =
       noAmount: filtered_no_amount,
       noMerchant: filtered_no_merchant,
     },
+    // Checkpoint data for incremental scanning — saved by the route handler.
+    checkpoint: newestMessageDate
+      ? { lastMessageDate: newestMessageDate, lastMessageId: newestMessageId }
+      : null,
   };
 }
