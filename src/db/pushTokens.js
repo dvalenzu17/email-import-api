@@ -3,8 +3,10 @@ import { pool } from "./pool.js";
 /**
  * Returns the Expo push tokens registered for a user.
  * The `push_tokens` table is written by the mobile app (lib/push.js):
- *   columns: user_id (uuid), token (text), device (text).
- * Scoped by user_id — never returns another user's tokens.
+ *   columns: user_id (uuid), token (text), device (text), new_sub_alerts (bool).
+ * Scoped by user_id — never returns another user's tokens. Respects the user's
+ * "New subscription alerts" toggle: tokens with new_sub_alerts = false are
+ * excluded (IS NOT FALSE keeps true/null rows so the default is opted-in).
  *
  * @param {string} userId
  * @returns {Promise<string[]>} list of Expo push tokens
@@ -13,7 +15,8 @@ export async function getPushTokensForUser(userId) {
   if (!userId) return [];
   try {
     const result = await pool.query(
-      `SELECT token FROM push_tokens WHERE user_id = $1 AND token IS NOT NULL`,
+      `SELECT token FROM push_tokens
+       WHERE user_id = $1 AND token IS NOT NULL AND new_sub_alerts IS NOT FALSE`,
       [userId]
     );
     return result.rows.map((r) => r.token).filter(Boolean);
