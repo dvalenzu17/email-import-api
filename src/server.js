@@ -24,6 +24,7 @@ if (process.env.SENTRY_DSN) {
 }
 
 const QUEUE_ENABLED = process.env.QUEUE_ENABLED === "true";
+const BACKGROUND_SCAN_ENABLED = process.env.BACKGROUND_SCAN_ENABLED === "true";
 
 const server = Fastify({ logger: true });
 
@@ -81,6 +82,14 @@ const start = async () => {
       const { startWorker } = await import("./services/scanQueue.js");
       startWorker(server.log);
       server.log.info("BullMQ Worker started (gmail-scan queue)");
+    }
+
+    // Start the background (cron) scanner if enabled. Re-scans connected
+    // accounts periodically so new-subscription pushes fire even when the app
+    // is closed.
+    if (BACKGROUND_SCAN_ENABLED) {
+      const { startBackgroundScanner } = await import("./services/backgroundScanner.js");
+      startBackgroundScanner(server.log);
     }
 
     const port = parseInt(process.env.PORT, 10) || 8787;

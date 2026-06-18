@@ -29,6 +29,9 @@ export { saveImapCredentials, getImapCredentials } from "./imapCredentials.js";
 // Push tokens (Expo) — written by the mobile app, read here to send pushes
 export { getPushTokensForUser } from "./pushTokens.js";
 
+// Background scan scheduling (cron)
+export { getUsersDueForScan } from "./scanScheduling.js";
+
 // ML feedback + merchant confirmations
 export { getFeedbackMerchantMap, saveFeedback, saveMerchantConfirmation } from "./feedback.js";
 
