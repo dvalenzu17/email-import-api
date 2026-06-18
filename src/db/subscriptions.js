@@ -18,6 +18,10 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
   // subscription detected" push notifications. Detected via Postgres `xmax = 0`,
   // which is true for an INSERT and false for an ON CONFLICT update.
   let inserted = [];
+  // Re-detected charges on a subscription the user marked cancelled ("zombie"
+  // charges), and significant upward price changes — both surfaced for pushes.
+  let zombieCharges = [];
+  let priceIncreases = [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -27,6 +31,15 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
       [userId]
     );
     const inactiveMerchants = new Set(inactiveRes.rows.map((r) => r.merchant));
+
+    // Merchants the user explicitly cancelled — re-detecting a charge here is a
+    // "zombie charge" worth alerting on. Compared case-insensitively.
+    const cancelledRes = await client.query(
+      `SELECT LOWER(merchant) AS merchant_key FROM subscriptions
+       WHERE user_id = $1 AND user_status = 'cancelled'`,
+      [userId]
+    );
+    const cancelledMerchants = new Set(cancelledRes.rows.map((r) => r.merchant_key));
 
     const upsertRes = await client.query(
       `INSERT INTO subscriptions
@@ -114,6 +127,37 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
         return detectAmountAnomaly(newAmount, historical).anomalous;
       });
 
+      // Surface alert-worthy changes (histMap holds amounts from PRIOR scans
+      // only — this scan's events are inserted just below).
+      upsertRes.rows.forEach((r, i) => {
+        const s = subMap[r.merchant];
+        const newAmount = s?.renewalAmount;
+        if (newAmount == null) return;
+
+        // Zombie charge: a charge re-detected for a subscription the user cancelled.
+        if (cancelledMerchants.has(r.merchant.toLowerCase())) {
+          zombieCharges.push({
+            merchant: r.merchant,
+            amount: newAmount,
+            currency: s?.currency ?? "USD",
+            billingInterval: s?.billingInterval ?? null,
+          });
+        }
+
+        // Price hike: anomalous change AND the new amount is meaningfully higher
+        // than the most recent prior amount (ignore drops and rounding noise).
+        const prevAmount = histMap[r.id]?.[0];
+        if (anomalyFlags[i] && prevAmount != null && newAmount > prevAmount * 1.05) {
+          priceIncreases.push({
+            merchant: r.merchant,
+            oldAmount: prevAmount,
+            newAmount,
+            currency: s?.currency ?? "USD",
+            billingInterval: s?.billingInterval ?? null,
+          });
+        }
+      });
+
       await client.query(
         `INSERT INTO subscription_events
            (user_id, subscription_id, event_type, amount, source, is_anomalous)
@@ -160,7 +204,7 @@ export async function batchUpsertSubscriptions(userId, subscriptions) {
   } finally {
     client.release();
   }
-  return { writtenMerchants, inserted };
+  return { writtenMerchants, inserted, zombieCharges, priceIncreases };
 }
 
 export async function getActiveSubscriptionConfidences(userId) {

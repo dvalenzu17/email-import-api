@@ -17,7 +17,7 @@ import {
   applyExpiryRenewalUpdates,
   finalizeScan,
 } from "./postDetection.js";
-import { notifyNewSubscriptions } from "./newSubscriptionNotifier.js";
+import { notifyNewSubscriptions, notifyZombieCharges, notifyPriceIncreases } from "./newSubscriptionNotifier.js";
 import logger from "../lib/logger.js";
 
 const APPLE_IAP_THRESHOLD = 0.35;
@@ -67,7 +67,7 @@ export async function runImapScan({ userId, provider, user, pass, daysBack = 730
     return true;
   });
 
-  const { inserted: insertedConfident } = await batchUpsertSubscriptions(userId, confident);
+  const upsertConfident = await batchUpsertSubscriptions(userId, confident);
 
   // ── Step 4: Bypass loop ─────────────────────────────────────────────────────
   const existingConfidences = await getActiveSubscriptionConfidences(userId);
@@ -82,16 +82,19 @@ export async function runImapScan({ userId, provider, user, pass, daysBack = 730
     logger,
   });
 
-  let insertedBypass = [];
+  let upsertBypass = { inserted: [], zombieCharges: [], priceIncreases: [] };
   if (appleBypass.length) {
-    ({ inserted: insertedBypass } = await batchUpsertSubscriptions(userId, appleBypass));
+    upsertBypass = await batchUpsertSubscriptions(userId, appleBypass);
   }
 
-  // Fire "new subscription detected" push for genuinely-new rows (best-effort, non-blocking).
-  const newlyInserted = [...insertedConfident, ...insertedBypass];
-  if (newlyInserted.length) {
-    notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
-  }
+  // Fire scan-driven pushes (best-effort, non-blocking). All respect the user's
+  // new-subscription-alerts preference.
+  const newlyInserted = [...(upsertConfident.inserted || []), ...(upsertBypass.inserted || [])];
+  const zombieCharges = [...(upsertConfident.zombieCharges || []), ...(upsertBypass.zombieCharges || [])];
+  const priceIncreases = [...(upsertConfident.priceIncreases || []), ...(upsertBypass.priceIncreases || [])];
+  if (newlyInserted.length) notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
+  if (zombieCharges.length) notifyZombieCharges(userId, zombieCharges, logger).catch(() => {});
+  if (priceIncreases.length) notifyPriceIncreases(userId, priceIncreases, logger).catch(() => {});
 
   // Patch renewal_date for expiry notices where merchant="Apple"
   await applyExpiryRenewalUpdates(userId, expiryUpdates, logger);

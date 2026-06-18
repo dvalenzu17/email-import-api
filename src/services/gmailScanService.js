@@ -37,7 +37,7 @@ import {
   applyExpiryRenewalUpdates,
 } from "./postDetection.js";
 import { CONFIDENCE_THRESHOLD } from "../config.js";
-import { notifyNewSubscriptions } from "./newSubscriptionNotifier.js";
+import { notifyNewSubscriptions, notifyZombieCharges, notifyPriceIncreases } from "./newSubscriptionNotifier.js";
 import pLimit from "p-limit";
 import logger from "../lib/logger.js";
 
@@ -404,7 +404,7 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
   const confident = allSubscriptions.filter((s) => s.confidence >= CONFIDENCE_THRESHOLD);
   logger.info({ count: confident.length }, "subscriptions_above_threshold");
 
-  const { inserted: insertedConfident } = await batchUpsertSubscriptions(userId, confident);
+  const upsertConfident = await batchUpsertSubscriptions(userId, confident);
 
   // Bypass loop: charges that passed extraction but failed ML detection.
   const existingConfidences = await getActiveSubscriptionConfidences(userId);
@@ -419,18 +419,20 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     logger,
   });
 
-  let insertedBypass = [];
+  let upsertBypass = { inserted: [], zombieCharges: [], priceIncreases: [] };
   if (appleBypass.length) {
     logger.info({ merchants: appleBypass.map(s => s.merchant) }, "apple_iap_bypass");
-    ({ inserted: insertedBypass } = await batchUpsertSubscriptions(userId, appleBypass));
+    upsertBypass = await batchUpsertSubscriptions(userId, appleBypass);
   }
 
-  // Fire "new subscription detected" push for genuinely-new rows (best-effort,
-  // non-blocking so it never delays the scan response).
-  const newlyInserted = [...insertedConfident, ...insertedBypass];
-  if (newlyInserted.length) {
-    notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
-  }
+  // Fire scan-driven pushes (best-effort, non-blocking so they never delay the
+  // scan response). All respect the user's new-subscription-alerts preference.
+  const newlyInserted = [...(upsertConfident.inserted || []), ...(upsertBypass.inserted || [])];
+  const zombieCharges = [...(upsertConfident.zombieCharges || []), ...(upsertBypass.zombieCharges || [])];
+  const priceIncreases = [...(upsertConfident.priceIncreases || []), ...(upsertBypass.priceIncreases || [])];
+  if (newlyInserted.length) notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
+  if (zombieCharges.length) notifyZombieCharges(userId, zombieCharges, logger).catch(() => {});
+  if (priceIncreases.length) notifyPriceIncreases(userId, priceIncreases, logger).catch(() => {});
 
   await applyExpiryRenewalUpdates(userId, expiryUpdates, logger);
 
