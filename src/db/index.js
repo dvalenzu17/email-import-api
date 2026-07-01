@@ -18,6 +18,7 @@ export {
   upsertCancelledSubscriptions,
   updateRenewalDateByAmountAndInterval,
   cancelSubscriptionByMerchant,
+  applyTrialEnds,
 } from "./subscriptions.js";
 
 // Scan metadata

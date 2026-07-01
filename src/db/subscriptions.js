@@ -353,6 +353,35 @@ export async function updateRenewalDateByAmountAndInterval(userId, { amount, bil
  *
  * @returns {Promise<number>} rows marked cancelled
  */
+/**
+ * Writes the parsed first-bill date of a trial confirmation onto the matching
+ * subscription(s), lighting up the trial pre-emption path (frontend TrialRadar +
+ * client reminders + backend trial ladder). Never resurrects a cancelled sub.
+ *
+ * @param {string} userId
+ * @param {Array<{merchant:string, trialEnd:Date}>} signals  already deduped (selectTrialEnds)
+ * @returns {Promise<Array<{merchant:string, trialEnd:Date}>>} the signals that hit a row
+ */
+export async function applyTrialEnds(userId, signals) {
+  if (!signals?.length) return [];
+  const results = await Promise.allSettled(
+    signals.map((s) =>
+      pool.query(
+        `UPDATE subscriptions
+         SET trial_end = $3, is_trial = true, updated_at = NOW()
+         WHERE user_id = $1
+           AND LOWER(merchant) = LOWER($2)
+           AND user_status IS DISTINCT FROM 'cancelled'
+         RETURNING id`,
+        [userId, s.merchant, s.trialEnd]
+      ).then((r) => (r.rows.length ? s : null))
+    )
+  );
+  return results
+    .filter((r) => r.status === "fulfilled" && r.value)
+    .map((r) => r.value);
+}
+
 export async function cancelSubscriptionByMerchant(userId, merchant, cancelDate = null) {
   try {
     const res = await pool.query(

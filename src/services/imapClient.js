@@ -100,6 +100,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
   const charges = [];
   const cancellations = [];
   const cancelledCharges = []; // subscriptions detected from cancellation/expiry emails
+  const trialSignals = []; // { merchant, trialEnd } from trial-confirmation emails
   let scannedCount = 0;
   // Track the newest message date for incremental scan checkpoints.
   let newestMessageDate = null;
@@ -135,7 +136,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
     const relevantUids = [...uidSet].sort((a, b) => a - b);
     scannedCount = relevantUids.length;
 
-    if (!relevantUids.length) return { charges, cancellations, cancelledCharges, scannedCount };
+    if (!relevantUids.length) return { charges, cancellations, cancelledCharges, trialSignals, scannedCount };
 
     // Pass 2 — full source, UID mode
     // mailparser decodes MIME structure and base64 parts correctly — cheerio
@@ -422,7 +423,8 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
         if (text.includes("billing"))                    intentScore += 1;
 
         // TASK 3/7: use WithLog versions to capture extraction strategies
-        const { value: renewalDate, strategy: renewalDateStrategy } = extractRenewalDateWithLog(text);
+        const isTrialEmail = emailType === EMAIL_TYPES.TRIAL_START || emailType === EMAIL_TYPES.TRIAL_ENDING;
+        const { value: renewalDate, strategy: renewalDateStrategy } = extractRenewalDateWithLog(text, { isTrial: isTrialEmail });
         const { value: billingInterval, strategy: intervalStrategy } = extractBillingIntervalWithLog(text);
         // For Apple IAP emails the sender domain is always apple.com, which would
         // cause BrandAvatar to show the Apple logo for every app. Leave it null so
@@ -480,6 +482,10 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
           subscriptionIntent: intentScore >= 2,
           extractionLog,
         });
+        // Trial confirmation with a parsed first-bill date → drives pre-emption.
+        if (isTrialEmail && renewalDate && merchant && merchant.toLowerCase() !== "unknown") {
+          trialSignals.push({ merchant, trialEnd: renewalDate });
+        }
       } catch {
         continue;
       }
@@ -498,6 +504,7 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
     charges,
     cancellations,
     cancelledCharges,
+    trialSignals,
     scannedCount,
     // Checkpoint data for incremental scanning — saved by the route handler.
     checkpoint: newestMessageDate

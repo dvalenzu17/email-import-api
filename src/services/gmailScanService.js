@@ -22,7 +22,8 @@ import {
 } from "../gmailClient.js";
 import { extractCurrencyCode, extractBillingInterval, extractAppleAppNameFromHtml } from "./emailParser.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
-import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens, getActiveSubscriptionConfidences, getFeedbackMerchantMap } from "../db/index.js";
+import { getOAuthToken, batchUpsertSubscriptions, saveScanMetadata, saveOAuthTokens, getActiveSubscriptionConfidences, getFeedbackMerchantMap, applyTrialEnds } from "../db/index.js";
+import { selectTrialEnds } from "./trialUtil.js";
 import { classifyEmail, EMAIL_TYPES } from "./emailClassifier.js";
 import { decryptCredential } from "./crypto.js";
 import { refreshAccessToken } from "../googleOAuth.js";
@@ -235,6 +236,7 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
   const charges = [];
   const cancellations = []; // merchants whose cancellation emails were detected
   const cancelledCharges = []; // subscriptions detected from cancellation/expiry emails
+  const trialSignals = []; // { merchant, trialEnd } from trial-confirmation emails
 
   // Diagnostic counters — returned alongside scan results for visibility.
   let filtered_no_payload = 0, filtered_no_text = 0, filtered_negative = 0,
@@ -362,6 +364,8 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     // general renewal patterns miss; pass the hint so the parser tries them.
     const isTrialEmail = emailType === EMAIL_TYPES.TRIAL_START || emailType === EMAIL_TYPES.TRIAL_ENDING;
     const renewalDate = extractRenewalDate(text, { isTrial: isTrialEmail });
+    // Trial confirmation with a parsed first-bill date → drives pre-emption.
+    if (isTrialEmail && renewalDate) trialSignals.push({ merchant, trialEnd: renewalDate });
 
     let intentScore = 0;
     if (text.includes("subscription"))              intentScore += 2;
@@ -438,6 +442,20 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
   const newlyInserted = [...(upsertConfident.inserted || []), ...(upsertBypass.inserted || [])];
   const zombieCharges = [...(upsertConfident.zombieCharges || []), ...(upsertBypass.zombieCharges || [])];
   const priceIncreases = [...(upsertConfident.priceIncreases || []), ...(upsertBypass.priceIncreases || [])];
+
+  // ── Trial pre-emption: stamp trial_end onto the matching subs, then flag the
+  // newly-inserted ones as trials so the "new subscription" push becomes the
+  // pre-emptive "trial → bills $X on <date>, want a cancel reminder?" hook.
+  const appliedTrials = await applyTrialEnds(userId, selectTrialEnds(trialSignals));
+  if (appliedTrials.length) {
+    const trialByMerchant = new Map(appliedTrials.map((t) => [t.merchant.toLowerCase(), t.trialEnd]));
+    for (const s of newlyInserted) {
+      const te = trialByMerchant.get(String(s.merchant).toLowerCase());
+      if (te) { s.isTrial = true; s.trialEnd = te; }
+    }
+    logger.info({ trials: appliedTrials.length }, "trial_ends_applied");
+  }
+
   if (newlyInserted.length) notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
   if (zombieCharges.length) notifyZombieCharges(userId, zombieCharges, logger).catch(() => {});
   if (priceIncreases.length) notifyPriceIncreases(userId, priceIncreases, logger).catch(() => {});

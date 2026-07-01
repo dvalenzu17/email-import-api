@@ -7,7 +7,8 @@ import { scanImapInbox } from "./imapClient.js";
 import { detectRecurringSubscriptions } from "./subscriptionEngine.js";
 import { CONFIDENCE_THRESHOLD } from "../config.js";
 import { getFeedbackMerchantMap } from "../db/index.js";
-import { getActiveSubscriptionConfidences, batchUpsertSubscriptions } from "../db/index.js";
+import { getActiveSubscriptionConfidences, batchUpsertSubscriptions, applyTrialEnds } from "../db/index.js";
+import { selectTrialEnds } from "./trialUtil.js";
 import {
   buildChargeDataMap,
   enrichSubscriptions,
@@ -41,7 +42,7 @@ export async function runImapScan({ userId, provider, user, pass, daysBack = 730
   const started = Date.now();
 
   // ── Step 1: Scan inbox ──────────────────────────────────────────────────────
-  const { charges, cancellations, cancelledCharges, scannedCount, checkpoint } = await scanImapInbox({
+  const { charges, cancellations, cancelledCharges, trialSignals = [], scannedCount, checkpoint } = await scanImapInbox({
     provider, user, pass, daysBack, sinceDate: force ? undefined : sinceDate,
   });
 
@@ -92,6 +93,18 @@ export async function runImapScan({ userId, provider, user, pass, daysBack = 730
   const newlyInserted = [...(upsertConfident.inserted || []), ...(upsertBypass.inserted || [])];
   const zombieCharges = [...(upsertConfident.zombieCharges || []), ...(upsertBypass.zombieCharges || [])];
   const priceIncreases = [...(upsertConfident.priceIncreases || []), ...(upsertBypass.priceIncreases || [])];
+
+  // Trial pre-emption: stamp trial_end and flag newly-inserted trials so the push
+  // becomes the pre-emptive "trial → bills $X on <date>" hook.
+  const appliedTrials = await applyTrialEnds(userId, selectTrialEnds(trialSignals));
+  if (appliedTrials.length) {
+    const trialByMerchant = new Map(appliedTrials.map((t) => [t.merchant.toLowerCase(), t.trialEnd]));
+    for (const s of newlyInserted) {
+      const te = trialByMerchant.get(String(s.merchant).toLowerCase());
+      if (te) { s.isTrial = true; s.trialEnd = te; }
+    }
+  }
+
   if (newlyInserted.length) notifyNewSubscriptions(userId, newlyInserted, logger).catch(() => {});
   if (zombieCharges.length) notifyZombieCharges(userId, zombieCharges, logger).catch(() => {});
   if (priceIncreases.length) notifyPriceIncreases(userId, priceIncreases, logger).catch(() => {});

@@ -34,6 +34,17 @@ function formatAmount(amount, currency = "USD") {
   return `${sym}${n.toFixed(2)}`;
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// " on Jan 22 (in 5 days)" — the pre-emption framing: name the charge that
+// hasn't happened yet and how long until it does.
+function friendlyTrialDate(d) {
+  const dt = d instanceof Date ? d : new Date(d);
+  if (Number.isNaN(dt.getTime())) return "";
+  const when = ` on ${MONTHS[dt.getMonth()]} ${dt.getDate()}`;
+  const days = Math.ceil((dt.getTime() - Date.now()) / 86400000);
+  return days >= 1 ? `${when} (in ${days} ${days === 1 ? "day" : "days"})` : when;
+}
+
 /**
  * @param {string} userId
  * @param {Array<{ merchant: string, renewalAmount?: number, currency?: string, billingInterval?: string, isActive?: boolean }>} insertedSubs
@@ -48,10 +59,32 @@ export async function notifyNewSubscriptions(userId, insertedSubs, logger = cons
     const tokens = await getPushTokensForUser(userId);
     if (!tokens.length) return { sent: 0, failed: 0, skipped: "no_tokens" };
 
-    const data = { app: "sublytics", kind: "new_subscription", type: "new_subscription" };
+    // Trials are the pre-emption moment — lead with them, framed around the bill
+    // that hasn't happened yet, with the exit (cancel reminder) as the action.
+    const trials = fresh.filter((s) => s.isTrial && s.trialEnd);
 
     let payload;
-    if (fresh.length === 1) {
+    if (trials.length) {
+      const data = { app: "sublytics", kind: "trial_ending", type: "trial_ending" };
+      if (trials.length === 1) {
+        const s = trials[0];
+        const amt = formatAmount(s.renewalAmount, s.currency);
+        const price = amt ? `${amt}${cadenceSuffix(s.billingInterval)}` : "the first charge";
+        const when = friendlyTrialDate(s.trialEnd);
+        payload = {
+          title: `Free trial started: ${s.merchant}`,
+          body: `Bills ${price}${when}. Tap to set a cancel reminder.`,
+          data: { ...data, id: s.id != null ? String(s.id) : undefined },
+        };
+      } else {
+        payload = {
+          title: `${trials.length} free trials will start billing`,
+          body: `Tap to set cancel reminders before you're charged.`,
+          data,
+        };
+      }
+    } else if (fresh.length === 1) {
+      const data = { app: "sublytics", kind: "new_subscription", type: "new_subscription" };
       const s = fresh[0];
       const amt = formatAmount(s.renewalAmount, s.currency);
       const price = amt ? `${amt}${cadenceSuffix(s.billingInterval)}` : "";
@@ -63,6 +96,7 @@ export async function notifyNewSubscriptions(userId, insertedSubs, logger = cons
         data,
       };
     } else {
+      const data = { app: "sublytics", kind: "new_subscription", type: "new_subscription" };
       payload = {
         title: `${fresh.length} new potential subscriptions`,
         body: `We spotted ${fresh.length} new charges that look like subscriptions. Tap to review.`,
