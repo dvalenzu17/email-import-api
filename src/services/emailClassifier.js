@@ -41,11 +41,15 @@ const CANCEL_BODY_RE = /subscription has been cancell?ed|successfully cancell?ed
 const FAILED_SUBJECT_RE = /payment (?:failed|declined|unsuccessful)|failed payment|action required.*(?:payment|subscription)/;
 const FAILED_BODY_RE = /payment was declined|unable to process your payment|couldn't charge your|we were unable to charge|payment method failed|your card was declined|your payment did not go through|renewal failed|billing attempt failed/;
 
-const TRIAL_ENDING_SUBJECT_RE = /trial.*(?:end|expir|over|finish)/;
-const TRIAL_ENDING_BODY_RE = /trial (?:ends in|period ends|is ending|expires|will end)|free trial is over/;
+const TRIAL_ENDING_SUBJECT_RE = /trial.*(?:end|expir|over|finish)|won'?t be charged/;
+// Broadened to catch how real trial-confirmation emails state the first charge:
+// "trial ends on <date>", "won't be charged until", "cancel before … to avoid",
+// "billing begins/starts", "first payment", "after your free trial". Kept
+// forward-looking so ordinary past-charge receipts are not misrouted here.
+const TRIAL_ENDING_BODY_RE = /trial (?:ends?|period ends|is ending|expires|will end)|free trial is over|won'?t be charged until|cancel before [^.]{0,40}(?:to avoid|being charged)|billing (?:begins|starts)|billed starting|first (?:payment|charge)|after your (?:free )?trial/;
 
-const TRIAL_START_SUBJECT_RE = /free trial.*(?:start|begin|activat)/;
-const TRIAL_START_BODY_RE = /your free trial has started|your trial has begun|trial has been activated|free trial is now active/;
+const TRIAL_START_SUBJECT_RE = /free trial.*(?:start|begin|activat)|welcome to your .{0,20}trial/;
+const TRIAL_START_BODY_RE = /your free trial has started|your trial has begun|trial has been activated|free trial is now active|welcome to your .{0,20}trial|started your (?:free )?trial/;
 
 const UPGRADE_SUBJECT_RE = /plan (?:upgrade|change)|upgrade(?!.*receipt)/;
 const UPGRADE_BODY_RE = /you've been upgraded|your plan has been upgraded|successfully upgraded to|you've switched to the|your subscription has been upgraded/;

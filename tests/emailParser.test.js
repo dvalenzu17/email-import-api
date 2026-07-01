@@ -279,6 +279,56 @@ describe("extractRenewalDateWithLog", () => {
   });
 });
 
+// ── Trial-confirmation bill-date extraction (isTrial-gated) ──────────────────
+describe("trial bill-date extraction", () => {
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+  it("extracts 'trial ends on <date>'", () => {
+    const r = extractRenewalDateWithLog("Your free trial ends on January 22, 2026.", { isTrial: true });
+    expect(r.strategy).toBe("trial_ends_on");
+    expect(ymd(r.value)).toBe("2026-01-22");
+  });
+
+  it("extracts \"won't be charged until <date>\" (day-first)", () => {
+    const r = extractRenewalDateWithLog("You won't be charged until 22 January 2026.", { isTrial: true });
+    expect(r.strategy).toBe("trial_wont_charge_until");
+    expect(ymd(r.value)).toBe("2026-01-22");
+  });
+
+  it("extracts \"you'll be charged $X on <date>\"", () => {
+    const r = extractRenewalDateWithLog("After your trial, you'll be charged $10.99 on Feb 3, 2026.", { isTrial: true });
+    expect(r.strategy).toBe("trial_will_charge_on");
+    expect(ymd(r.value)).toBe("2026-02-03");
+  });
+
+  it("extracts 'first payment ... on <date>' across a decimal amount", () => {
+    const r = extractRenewalDateWithLog("Your first payment of $20.00 will be on January 25, 2026.", { isTrial: true });
+    expect(r.strategy).toBe("trial_first_payment_on");
+    expect(ymd(r.value)).toBe("2026-01-25");
+  });
+
+  it("extracts 'cancel before <date> to avoid being charged'", () => {
+    const r = extractRenewalDateWithLog("Cancel before January 28, 2026 to avoid being charged $7.99.", { isTrial: true });
+    expect(r.strategy).toBe("trial_cancel_before");
+    expect(ymd(r.value)).toBe("2026-01-28");
+  });
+
+  it("parses an ISO trial-end date in LOCAL time (no UTC off-by-one)", () => {
+    const r = extractRenewalDateWithLog("Your 30-day free trial ends 2026-02-10.", { isTrial: true });
+    expect(ymd(r.value)).toBe("2026-02-10"); // not 2026-02-09 in UTC-negative offsets
+  });
+
+  it("does NOT apply trial patterns without the isTrial hint (precision)", () => {
+    // Same trial phrasing, but not classified as a trial — must stay null so a
+    // misclassified receipt can never produce a bogus future bill date.
+    expect(extractRenewalDate("You won't be charged until January 22, 2026.")).toBe(null);
+  });
+
+  it("does NOT invent a date from a past-charge receipt even when isTrial", () => {
+    expect(extractRenewalDate("You were charged $9.99 on January 3, 2026.", { isTrial: true })).toBe(null);
+  });
+});
+
 // ── extractMerchant ──────────────────────────────────────────────────────────
 
 describe("extractMerchant", () => {

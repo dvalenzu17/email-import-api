@@ -356,7 +356,10 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     if (merchant === "unknown") { filtered_no_merchant++; continue; }
 
     const date = new Date(Number(full.internalDate));
-    const renewalDate = extractRenewalDate(text);
+    // Trial emails state the first-charge date in trial-native phrasings the
+    // general renewal patterns miss; pass the hint so the parser tries them.
+    const isTrialEmail = emailType === EMAIL_TYPES.TRIAL_START || emailType === EMAIL_TYPES.TRIAL_ENDING;
+    const renewalDate = extractRenewalDate(text, { isTrial: isTrialEmail });
 
     let intentScore = 0;
     if (text.includes("subscription"))              intentScore += 2;
