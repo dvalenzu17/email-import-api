@@ -30,6 +30,7 @@ import {
 import { runGmailScan } from "./gmailScanService.js";
 import { runImapScan } from "./imapScanService.js";
 import { runTimeBasedAlertCycle } from "./timeBasedAlerts.js";
+import { renewExpiringWatches } from "./gmailPush.js";
 import { decryptCredential } from "./crypto.js";
 
 function num(envVal, fallback) {
@@ -190,6 +191,9 @@ async function runAlertsSafely(logger) {
   alertRunning = true;
   try {
     await runTimeBasedAlertCycle(logger);
+    // Renew Gmail push watches before they expire (~7 day lifetime). No-op
+    // unless real-time push is configured.
+    await renewExpiringWatches(logger);
   } catch (err) {
     logger?.warn?.({ err: err?.message }, "alert_cycle_failed");
   } finally {

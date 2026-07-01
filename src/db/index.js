@@ -35,6 +35,9 @@ export { getUsersDueForScan } from "./scanScheduling.js";
 // Time-based alerts (big-renewal heads-up, trial-ending) — cron-driven
 export { getDueRenewalAlerts, getDueTrialAlerts, reserveAlert } from "./timeBasedAlerts.js";
 
+// Gmail real-time push (users.watch + Pub/Sub)
+export { upsertGmailWatch, getWatchByEmail, updateWatchHistoryId, getExpiringWatches } from "./gmailWatch.js";
+
 // ML feedback + merchant confirmations
 export { getFeedbackMerchantMap, saveFeedback, saveMerchantConfirmation } from "./feedback.js";
 
