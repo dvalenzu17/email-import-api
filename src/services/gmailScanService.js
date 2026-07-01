@@ -299,10 +299,12 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
         ? appleAppNameC.toLowerCase().trim()
         : extractMerchant(fromHeader, text, subject);
       if (cancelMerchant && cancelMerchant !== "unknown") {
-        cancellations.push(cancelMerchant);
+        const cancelDate = new Date(Number(full.internalDate));
+        // Carry the cancellation email's date so the temporal safeguard in
+        // cancelSubscriptionByMerchant can skip subs with a newer charge.
+        cancellations.push({ merchant: cancelMerchant, date: cancelDate });
         const cancelAmount = extractAmount(text);
         if (cancelAmount) {
-          const cancelDate = new Date(Number(full.internalDate));
           cancelledCharges.push({
             merchant:      cancelMerchant,
             renewalAmount: cancelAmount,
@@ -356,7 +358,10 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     if (merchant === "unknown") { filtered_no_merchant++; continue; }
 
     const date = new Date(Number(full.internalDate));
-    const renewalDate = extractRenewalDate(text);
+    // Trial emails state the first-charge date in trial-native phrasings the
+    // general renewal patterns miss; pass the hint so the parser tries them.
+    const isTrialEmail = emailType === EMAIL_TYPES.TRIAL_START || emailType === EMAIL_TYPES.TRIAL_ENDING;
+    const renewalDate = extractRenewalDate(text, { isTrial: isTrialEmail });
 
     let intentScore = 0;
     if (text.includes("subscription"))              intentScore += 2;
@@ -376,7 +381,10 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     // Threshold lowered from 4 → 2: a single mention of "subscription" or
     // "membership" is enough intent signal when paired with a valid amount.
     const isAppleIAP = fromHeader.toLowerCase().includes("apple.com");
-    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), isAppleIAP, _msgId: full.id });
+    // `subject` + `cleanText` are passed through so the engine's subject-intent
+    // scoring (TASK 6) and cancellation early-exit (TASK 8) actually fire in
+    // production — without them those features default to inert / 0.1.
+    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), subject, cleanText: text, isAppleIAP, _msgId: full.id });
   }
 
   logger.info({ charges: charges.length, filtered_no_payload, filtered_no_text, filtered_negative, filtered_not_transactional, filtered_no_amount, filtered_no_merchant, filtered_lifecycle, cancellations: cancellations.length }, "charges_extracted");

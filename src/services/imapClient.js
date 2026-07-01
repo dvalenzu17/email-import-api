@@ -257,10 +257,11 @@ async function _scanImapInbox({ provider, user, pass, daysBack = 730, sinceDate 
             ? normaliseMerchant(appleAppNameC)
             : normaliseMerchant(extractMerchant(fromHeader, text, subject));
           if (cancelMerchant && cancelMerchant !== "unknown") {
-            cancellations.push(cancelMerchant);
+            const cancelDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
+            // Carry the cancellation email's date for the temporal safeguard.
+            cancellations.push({ merchant: cancelMerchant, date: cancelDate });
             const cancelAmount = extractAmount(text);
             if (cancelAmount) {
-              const cancelDate = parsedDate && !isNaN(parsedDate.getTime()) ? parsedDate : new Date();
               cancelledCharges.push({
                 merchant:        cancelMerchant,
                 renewalAmount:   cancelAmount,

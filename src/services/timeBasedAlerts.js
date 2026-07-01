@@ -2,12 +2,13 @@
  * Cron-driven time-based alerts: big-renewal heads-up and trial-ending.
  *
  * Unlike the scan-driven pushes (new sub / price hike / zombie), these are not
- * tied to a scan — they fire when a renewal or trial date approaches, even if
- * nothing new was detected. Run once per background cron cycle.
+ * tied to a scan — they fire as a renewal/trial date approaches. Run on the
+ * dedicated alert scheduler (default hourly) so the escalating ladder
+ * (2 days → tomorrow → today) lands close to each day boundary.
  *
- * Dedup is atomic via reserveAlert(): we reserve the occurrence first and only
- * push if the reservation was new, so overlapping cycles never double-send.
- * Best-effort throughout: never throws into the cron.
+ * Dedup is atomic via reserveAlert() with a per-rung period_key ("<date>#<rung>"):
+ * each rung fires exactly once even though the cron runs hourly, and overlapping
+ * cycles never double-send. Best-effort throughout: never throws into the cron.
  */
 
 import {
@@ -17,6 +18,7 @@ import {
   getPushTokensForUser,
 } from "../db/index.js";
 import { sendExpoPush } from "./pushService.js";
+import { rungFromDays, LADDER_MAX_DAYS } from "./alertLadder.js";
 
 function num(envVal, fallback) {
   const n = Number(envVal);
@@ -24,9 +26,7 @@ function num(envVal, fallback) {
 }
 
 const CONFIG = {
-  renewalLeadDays: () => num(process.env.RENEWAL_ALERT_LEAD_DAYS, 3),
   bigRenewalMinAmount: () => num(process.env.BIG_RENEWAL_MIN_AMOUNT, 30),
-  trialLeadDays: () => num(process.env.TRIAL_ALERT_LEAD_DAYS, 2),
 };
 
 function cadenceSuffix(interval) {
@@ -51,34 +51,25 @@ function formatAmount(amount, currency = "USD") {
   return `${sym}${n.toFixed(2)}`;
 }
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-function friendlyDate(d) {
-  const dt = d instanceof Date ? d : new Date(d);
-  if (Number.isNaN(dt.getTime())) return "";
-  return `${MONTHS[dt.getUTCMonth()]} ${dt.getUTCDate()}`;
-}
-
-function buildRenewalPush(row) {
+function buildRenewalPush(row, rung) {
   const amt = formatAmount(row.renewal_amount, row.currency);
-  const when = friendlyDate(row.renewal_date);
   const price = amt ? `${amt}${cadenceSuffix(row.billing_interval)}` : "";
-  const parts = [price, when ? `renews ${when}` : ""].filter(Boolean);
+  const parts = [price, `renews ${rung.lead}`].filter(Boolean);
   return {
-    title: `Renewing soon: ${row.merchant}`,
-    body: parts.length ? `${parts.join(" · ")}. Tap to review.` : `Tap to review.`,
+    title: `Renewing ${rung.lead}: ${row.merchant}`,
+    body: `${parts.join(" · ")}. Tap to review.`,
     // kind 'renewal' + id reuses the app's existing /sub/:id tap routing.
-    data: { app: "sublytics", kind: "renewal", id: String(row.id) },
+    data: { app: "sublytics", kind: "renewal", id: String(row.id), rung: rung.key },
   };
 }
 
-function buildTrialPush(row) {
+function buildTrialPush(row, rung) {
   const amt = formatAmount(row.renewal_amount, row.currency);
-  const when = friendlyDate(row.trial_end);
   const tail = amt ? ` before you're charged ${amt}${cadenceSuffix(row.billing_interval)}` : " before you're charged";
   return {
-    title: `Trial ending: ${row.merchant}`,
-    body: `Your trial ends ${when}. Cancel${tail}.`,
-    data: { app: "sublytics", kind: "trial_ending", id: String(row.id) },
+    title: `Trial ends ${rung.lead}: ${row.merchant}`,
+    body: `Your free trial ends ${rung.lead}. Cancel${tail}.`,
+    data: { app: "sublytics", kind: "trial_ending", id: String(row.id), rung: rung.key },
   };
 }
 
@@ -93,10 +84,10 @@ export async function runTimeBasedAlertCycle(logger = console) {
   try {
     const [renewals, trials] = await Promise.all([
       getDueRenewalAlerts({
-        withinDays: CONFIG.renewalLeadDays(),
+        withinDays: LADDER_MAX_DAYS,
         minAmount: CONFIG.bigRenewalMinAmount(),
       }),
-      getDueTrialAlerts({ withinDays: CONFIG.trialLeadDays() }),
+      getDueTrialAlerts({ withinDays: LADDER_MAX_DAYS }),
     ]);
 
     // Cache tokens per user so we don't refetch for every row.
@@ -106,13 +97,18 @@ export async function runTimeBasedAlertCycle(logger = console) {
       return tokenCache.get(userId);
     }
 
+    // Escalating ladder: days_until maps to exactly one rung (2day/1day/day_of),
+    // so a row emits one rung per day. The period_key carries the rung, so each
+    // rung fires once even though the cron runs hourly.
     for (const row of renewals) {
       try {
-        const reserved = await reserveAlert(row.user_id, row.id, "renewal", row.period_key);
+        const rung = rungFromDays(Number(row.days_until));
+        if (!rung) continue;
+        const reserved = await reserveAlert(row.user_id, row.id, "renewal", `${row.period_key}#${rung.key}`);
         if (!reserved) continue;
         const tokens = await tokensFor(row.user_id);
         if (!tokens.length) continue;
-        const r = await sendExpoPush(tokens, buildRenewalPush(row), logger);
+        const r = await sendExpoPush(tokens, buildRenewalPush(row, rung), logger);
         renewalsSent += r.sent;
       } catch (err) {
         logger?.warn?.({ subId: row.id, err: err?.message }, "renewal_alert_failed");
@@ -121,11 +117,13 @@ export async function runTimeBasedAlertCycle(logger = console) {
 
     for (const row of trials) {
       try {
-        const reserved = await reserveAlert(row.user_id, row.id, "trial_ending", row.period_key);
+        const rung = rungFromDays(Number(row.days_until));
+        if (!rung) continue;
+        const reserved = await reserveAlert(row.user_id, row.id, "trial_ending", `${row.period_key}#${rung.key}`);
         if (!reserved) continue;
         const tokens = await tokensFor(row.user_id);
         if (!tokens.length) continue;
-        const r = await sendExpoPush(tokens, buildTrialPush(row), logger);
+        const r = await sendExpoPush(tokens, buildTrialPush(row, rung), logger);
         trialsSent += r.sent;
       } catch (err) {
         logger?.warn?.({ subId: row.id, err: err?.message }, "trial_alert_failed");

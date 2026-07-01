@@ -232,7 +232,36 @@ const RENEWAL_DATE_PATTERNS = [
   { name: "iso_date_near_renew",     re: /(?:renew|next billing|renewal)[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i },
 ];
 
-export function extractRenewalDateWithLog(text) {
+// ── Trial-confirmation bill-date patterns ───────────────────────────────────
+// Trial emails phrase the first-charge date very differently from receipts
+// ("won't be charged until", "your trial ends on", "cancel before"). These are
+// only tried when the caller has classified the email as a trial (isTrial), and
+// every pattern is forward-looking ("will be charged", never "was charged") as
+// defense-in-depth so a receipt can never yield a bogus future bill date.
+const TRIAL_BILL_DATE_PATTERNS = [
+  { name: "trial_wont_charge_until", re: new RegExp(String.raw`(?:won'?t|will not)\s+be\s+charged\s+until\s+` + _DATE_PAT, "i") },
+  { name: "trial_will_charge_on",    re: new RegExp(String.raw`(?:will\s+be|you'?ll\s+be)\s+charged\s+(?:\$?[\d.,]+\s+)?on\s+` + _DATE_PAT, "i") },
+  { name: "trial_ends_on",           re: new RegExp(String.raw`trial\s+ends?\s+(?:on\s+)?` + _DATE_PAT, "i") },
+  { name: "trial_billing_begins",    re: new RegExp(String.raw`billing\s+(?:begins|starts)\s+(?:on\s+)?` + _DATE_PAT, "i") },
+  { name: "trial_billed_starting",   re: new RegExp(String.raw`billed\s+starting\s+(?:on\s+)?` + _DATE_PAT, "i") },
+  { name: "trial_first_payment_on",  re: new RegExp(String.raw`first\s+(?:payment|charge|bill)[^\n]{0,30}?\bon\s+` + _DATE_PAT, "i") },
+  { name: "trial_cancel_before",     re: new RegExp(String.raw`cancel\s+(?:before|by)\s+` + _DATE_PAT + String.raw`[^.]{0,40}(?:to avoid|being charged|charge)`, "i") },
+  { name: "trial_ends_iso",          re: /trial[^\n]{0,40}(\d{4}-\d{2}-\d{2})/i },
+];
+
+export function extractRenewalDateWithLog(text, { isTrial = false } = {}) {
+  // Trial-native phrasings first (only when the email is a trial), then the
+  // general receipt/renewal patterns as a fallback.
+  if (isTrial) {
+    for (const { name, re } of TRIAL_BILL_DATE_PATTERNS) {
+      const m = text.match(re);
+      if (m) {
+        const d = parseFlexDate(m[1]);
+        if (d) return { value: d, strategy: name };
+      }
+    }
+  }
+
   const trialMatch = text.match(TRIAL_DATE_RE);
   if (trialMatch) {
     const qty  = parseInt(trialMatch[1], 10);
@@ -271,6 +300,16 @@ function parseFlexDate(raw) {
   if (!raw) return null;
   const s = raw.trim();
 
+  // ISO "2026-02-10" — construct in LOCAL time. `new Date("2026-02-10")` parses
+  // as UTC midnight, which renders as the previous calendar day in any negative
+  // UTC offset (e.g. UTC-5) — an off-by-one on the exact date the product exists
+  // to get right. Building from parts pins it to the intended local day.
+  const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const d = new Date(Number(isoMatch[1]), Number(isoMatch[2]) - 1, Number(isoMatch[3]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
   // UK/Apple day-first: "11 July 2025" or "11 July, 2025"
   const ukMatch = s.match(/^(\d{1,2})\s+(\w+),?\s+(\d{4})$/);
   if (ukMatch) {
@@ -284,8 +323,8 @@ function parseFlexDate(raw) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-export function extractRenewalDate(text) {
-  return extractRenewalDateWithLog(text).value;
+export function extractRenewalDate(text, opts) {
+  return extractRenewalDateWithLog(text, opts).value;
 }
 
 // ── Pre-allocated merchant extraction constants (called per-message) ─────────

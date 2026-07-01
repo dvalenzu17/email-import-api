@@ -5,21 +5,22 @@ import { pool } from "./pool.js";
  *   - big-renewal heads-up: large/annual charges renewing soon
  *   - trial-ending: free trials about to convert
  *
- * Dedup is handled by the subscription_alerts ledger via reserveAlert():
- * an alert fires once per occurrence (period_key = the date being alerted).
- * Queries already exclude rows that have been alerted for the current period,
- * and reserveAlert() is the atomic gate before sending.
+ * These queries return every due row within the ladder window (each row
+ * carries days_until so the caller can pick the escalating rung); dedup is
+ * handled entirely by the caller via reserveAlert() with a per-rung period_key
+ * ("<date>#<rung>"), the atomic gate that fires each rung exactly once.
  */
 
 /**
  * Subscriptions with a large or annual renewal coming up that haven't been
  * alerted yet for that renewal date. Only users with an opted-in push token.
  */
-export async function getDueRenewalAlerts({ withinDays = 3, minAmount = 30, limit = 500 } = {}) {
+export async function getDueRenewalAlerts({ withinDays = 2, minAmount = 30, limit = 500 } = {}) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.merchant, s.renewal_amount, s.currency,
             s.billing_interval, s.renewal_date,
-            to_char(s.renewal_date, 'YYYY-MM-DD') AS period_key
+            to_char(s.renewal_date, 'YYYY-MM-DD') AS period_key,
+            (s.renewal_date::date - CURRENT_DATE) AS days_until
      FROM subscriptions s
      WHERE s.is_active = true
        AND (s.user_status IS NULL OR s.user_status NOT IN ('cancelled', 'ignored'))
@@ -30,12 +31,6 @@ export async function getDueRenewalAlerts({ withinDays = 3, minAmount = 30, limi
        AND EXISTS (
          SELECT 1 FROM push_tokens p
          WHERE p.user_id = s.user_id AND p.new_sub_alerts IS NOT FALSE
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM subscription_alerts a
-         WHERE a.subscription_id = s.id
-           AND a.alert_type = 'renewal'
-           AND a.period_key = to_char(s.renewal_date, 'YYYY-MM-DD')
        )
      LIMIT $3`,
     [withinDays, minAmount, limit]
@@ -50,7 +45,8 @@ export async function getDueTrialAlerts({ withinDays = 2, limit = 500 } = {}) {
   const result = await pool.query(
     `SELECT s.id, s.user_id, s.merchant, s.renewal_amount, s.currency,
             s.billing_interval, s.trial_end,
-            to_char(s.trial_end, 'YYYY-MM-DD') AS period_key
+            to_char(s.trial_end, 'YYYY-MM-DD') AS period_key,
+            (s.trial_end::date - CURRENT_DATE) AS days_until
      FROM subscriptions s
      WHERE s.trial_end IS NOT NULL
        AND (s.user_status IS NULL OR s.user_status NOT IN ('cancelled', 'ignored'))
@@ -59,12 +55,6 @@ export async function getDueTrialAlerts({ withinDays = 2, limit = 500 } = {}) {
        AND EXISTS (
          SELECT 1 FROM push_tokens p
          WHERE p.user_id = s.user_id AND p.new_sub_alerts IS NOT FALSE
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM subscription_alerts a
-         WHERE a.subscription_id = s.id
-           AND a.alert_type = 'trial_ending'
-           AND a.period_key = to_char(s.trial_end, 'YYYY-MM-DD')
        )
      LIMIT $2`,
     [withinDays, limit]

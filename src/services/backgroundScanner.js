@@ -30,6 +30,7 @@ import {
 import { runGmailScan } from "./gmailScanService.js";
 import { runImapScan } from "./imapScanService.js";
 import { runTimeBasedAlertCycle } from "./timeBasedAlerts.js";
+import { renewExpiringWatches } from "./gmailPush.js";
 import { decryptCredential } from "./crypto.js";
 
 function num(envVal, fallback) {
@@ -43,6 +44,10 @@ const CONFIG = {
   concurrency: () => num(process.env.BACKGROUND_SCAN_CONCURRENCY, 3),
   maxUsers: () => num(process.env.BACKGROUND_SCAN_MAX_USERS, 200),
   daysBack: () => num(process.env.BACKGROUND_SCAN_DAYS_BACK, 30),
+  // Time-based alerts run on their own tighter cadence (default hourly) so the
+  // escalating 2day/1day/day_of ladder fires close to each bucket boundary
+  // instead of being smeared across the 6h scan interval.
+  alertIntervalMin: () => num(process.env.ALERT_CYCLE_INTERVAL_MIN, 60),
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -105,10 +110,9 @@ export async function runBackgroundScanCycle(logger = console) {
     });
 
     if (!due.length) {
-      // No accounts to re-scan, but renewals/trials may still be coming due.
+      // No accounts to re-scan. Time-based alerts run on their own scheduler.
       logger?.info?.("bg_scan_cycle_no_scan_users");
-      const alertResult = await runTimeBasedAlertCycle(logger);
-      return { users: 0, scanned: 0, failed: 0, ...alertResult };
+      return { users: 0, scanned: 0, failed: 0 };
     }
 
     logger?.info?.({ users: due.length, daysBack }, "bg_scan_cycle_start");
@@ -145,13 +149,9 @@ export async function runBackgroundScanCycle(logger = console) {
       )
     );
 
-    // Time-based alerts (big-renewal heads-up, trial-ending) run every cycle,
-    // independent of scan recency, so they fire close to the due date.
-    const alertResult = await runTimeBasedAlertCycle(logger);
-
     const elapsedMs = Date.now() - startedAt;
-    logger?.info?.({ users: due.length, scanned, failed, ...alertResult, elapsedMs }, "bg_scan_cycle_done");
-    return { users: due.length, scanned, failed, ...alertResult, elapsedMs };
+    logger?.info?.({ users: due.length, scanned, failed, elapsedMs }, "bg_scan_cycle_done");
+    return { users: due.length, scanned, failed, elapsedMs };
   } catch (err) {
     logger?.error?.({ err: err?.message }, "bg_scan_cycle_error");
     return { error: err?.message };
@@ -181,5 +181,39 @@ export function startBackgroundScanner(logger = console) {
   if (typeof handle.unref === "function") handle.unref();
 
   logger?.info?.({ intervalMin: CONFIG.intervalMin() }, "background_scanner_started");
+  return handle;
+}
+
+// Guard against overlapping alert cycles (a slow cycle vs the next tick).
+let alertRunning = false;
+async function runAlertsSafely(logger) {
+  if (alertRunning) return;
+  alertRunning = true;
+  try {
+    await runTimeBasedAlertCycle(logger);
+    // Renew Gmail push watches before they expire (~7 day lifetime). No-op
+    // unless real-time push is configured.
+    await renewExpiringWatches(logger);
+  } catch (err) {
+    logger?.warn?.({ err: err?.message }, "alert_cycle_failed");
+  } finally {
+    alertRunning = false;
+  }
+}
+
+/**
+ * Starts the time-based alert scheduler on its own tighter cadence (default
+ * hourly) so the escalating renewal/trial ladder fires close to each day
+ * boundary. Separate from the 6h scan loop. Returns the interval handle.
+ */
+export function startAlertScheduler(logger = console) {
+  const intervalMs = CONFIG.alertIntervalMin() * 60 * 1000;
+
+  setTimeout(() => { runAlertsSafely(logger); }, 90_000);
+
+  const handle = setInterval(() => { runAlertsSafely(logger); }, intervalMs);
+  if (typeof handle.unref === "function") handle.unref();
+
+  logger?.info?.({ alertIntervalMin: CONFIG.alertIntervalMin() }, "alert_scheduler_started");
   return handle;
 }

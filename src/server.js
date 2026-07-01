@@ -10,6 +10,7 @@ import { registerOAuthRoutes } from "./routes/oauthRoutes.js";
 import { registerImapScanRoutes } from "./routes/imapScanRoutes.js";
 import { registerAdminRoutes } from "./routes/adminRoutes.js";
 import { registerAccountRoutes } from "./routes/accountRoutes.js";
+import { registerGmailPushRoutes } from "./routes/gmailPushRoutes.js";
 import { pool } from "./db/index.js";
 // TASK 3: Load merchant alias cache from DB on startup so extractMerchant()
 // can resolve domain → canonical_name mappings without a per-email DB query.
@@ -64,6 +65,7 @@ registerOAuthRoutes(server);
 registerImapScanRoutes(server);
 registerAdminRoutes(server);
 registerAccountRoutes(server);
+registerGmailPushRoutes(server);
 
 server.get("/", async () => {
   return { status: "ok" };
@@ -88,8 +90,10 @@ const start = async () => {
     // accounts periodically so new-subscription pushes fire even when the app
     // is closed.
     if (BACKGROUND_SCAN_ENABLED) {
-      const { startBackgroundScanner } = await import("./services/backgroundScanner.js");
+      const { startBackgroundScanner, startAlertScheduler } = await import("./services/backgroundScanner.js");
       startBackgroundScanner(server.log);
+      // Escalating renewal/trial reminders run on their own tighter cadence.
+      startAlertScheduler(server.log);
     }
 
     const port = parseInt(process.env.PORT, 10) || 8787;

@@ -10,6 +10,7 @@ import {
 import {
   saveOAuthTokens,
 } from "../db/index.js";
+import { registerGmailWatch } from "../services/gmailPush.js";
 
 function signState(payload) {
   const data = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -110,6 +111,8 @@ export function registerOAuthRoutes(server) {
 
       if (!email) return reply.code(400).send({ error: "email_not_found" });
       await saveOAuthTokens(supabaseUserId, tokens);
+      // Best-effort: start real-time push for this mailbox (no-op if unconfigured).
+      registerGmailWatch(supabaseUserId, req.log).catch(() => {});
 
       const deepLink = process.env.GOOGLE_APP_DEEP_LINK || "beforeitbills://oauth-success";
       const baseUrl = redirectAfter || deepLink;
@@ -178,6 +181,8 @@ export function registerOAuthRoutes(server) {
         refreshToken: tokenData.refresh_token || null,
         expiresIn: tokenData.expires_in || 3600,
       });
+      // Best-effort: start real-time push for this mailbox (no-op if unconfigured).
+      registerGmailWatch(userId, req.log).catch(() => {});
 
       return reply.send({ ok: true, connected: true, provider: "google", email });
     } catch (err) {
