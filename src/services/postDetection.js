@@ -7,6 +7,7 @@
  */
 
 import { validateMerchantName } from "./emailParser.js";
+import { selectStaleCancellations } from "./cancellationUtil.js";
 import {
   batchUpsertSubscriptions,
   upsertCancelledSubscriptions,
@@ -181,11 +182,12 @@ export async function processCancellations(userId, { cancelledCharges, activeMer
  * also detected as active in the same scan.
  */
 export async function applyLifecycleCancellations(userId, cancellations, activeMerchants) {
-  if (!cancellations.length) return;
-  const stale = cancellations.filter((m) => !activeMerchants.has(m.toLowerCase()));
-  await Promise.allSettled(
-    stale.map((merchant) => cancelSubscriptionByMerchant(userId, merchant))
+  if (!cancellations.length) return 0;
+  const stale = selectStaleCancellations(cancellations, activeMerchants);
+  const results = await Promise.allSettled(
+    stale.map((c) => cancelSubscriptionByMerchant(userId, c.merchant, c.date))
   );
+  return results.reduce((n, r) => n + (r.status === "fulfilled" ? (r.value ?? 0) : 0), 0);
 }
 
 /**

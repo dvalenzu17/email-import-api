@@ -299,10 +299,12 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
         ? appleAppNameC.toLowerCase().trim()
         : extractMerchant(fromHeader, text, subject);
       if (cancelMerchant && cancelMerchant !== "unknown") {
-        cancellations.push(cancelMerchant);
+        const cancelDate = new Date(Number(full.internalDate));
+        // Carry the cancellation email's date so the temporal safeguard in
+        // cancelSubscriptionByMerchant can skip subs with a newer charge.
+        cancellations.push({ merchant: cancelMerchant, date: cancelDate });
         const cancelAmount = extractAmount(text);
         if (cancelAmount) {
-          const cancelDate = new Date(Number(full.internalDate));
           cancelledCharges.push({
             merchant:      cancelMerchant,
             renewalAmount: cancelAmount,

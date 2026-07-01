@@ -339,18 +339,35 @@ export async function updateRenewalDateByAmountAndInterval(userId, { amount, bil
   }
 }
 
-export async function cancelSubscriptionByMerchant(userId, merchant) {
+/**
+ * Marks a subscription dead in response to a detected cancellation email.
+ *
+ * A cancellation email is authoritative — it marks the sub dead even if the
+ * user had manually confirmed it (you confirm a sub, then later cancel it;
+ * BIB must stop nudging). Two safeguards keep that from wiping a live sub:
+ *   1. The caller only passes merchants NOT seen active in the same scan
+ *      (re-subscribe guard in applyLifecycleCancellations).
+ *   2. Temporal guard here: skip if a charge is newer than the cancellation
+ *      (last_seen_at > cancelDate) — covers annual subs that won't have a
+ *      charge in the scan window. A null cancelDate falls back to permissive.
+ *
+ * @returns {Promise<number>} rows marked cancelled
+ */
+export async function cancelSubscriptionByMerchant(userId, merchant, cancelDate = null) {
   try {
-    await pool.query(
+    const res = await pool.query(
       `UPDATE subscriptions
        SET user_status = 'cancelled',
            is_active   = false,
            updated_at  = NOW()
        WHERE user_id = $1
          AND LOWER(merchant) = LOWER($2)
-         AND (user_status IS NULL OR user_status NOT IN ('confirmed'))`,
-      [userId, merchant]
+         AND user_status IS DISTINCT FROM 'cancelled'
+         AND ($3::timestamptz IS NULL OR last_seen_at IS NULL OR last_seen_at <= $3::timestamptz)
+       RETURNING id`,
+      [userId, merchant, cancelDate]
     );
+    return res.rows.length;
   } catch (err) {
     throw new Error(`db_cancel_subscription_failed: ${err.message}`);
   }
