@@ -24,7 +24,7 @@ import { DETECTION } from "../config/detectionConstants.js";
 import { predictConfidence } from "./subscriptionModel.js";
 import { extractFeatures } from "./modelFeatures.js";
 
-const { CONFIDENCE_THRESHOLD, RECENCY_DECAY } = DETECTION;
+const { CONFIDENCE_THRESHOLD, RECENCY_DECAY, MULTI_CHARGE_OVERRIDE } = DETECTION;
 
 // ─── TASK 6: Subject line intent scoring ─────────────────────────────────────
 //
@@ -254,12 +254,24 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
       if (!single.subscriptionIntent) continue;
 
       const amount = single.amount;
-      const looksLikeSubscription =
-        amount === Math.round(amount) ||
-        [4.99, 5.99, 6.99, 7.99, 9.99, 10.99, 12.99, 14.99, 15.99,
-         19.99, 24.99, 29.99, 39.99, 49.99, 59.99, 79.99, 99.99].includes(amount);
 
-      if (!looksLikeSubscription) continue;
+      // ── Recurring-signal gate (generalizes beyond the known-brand list) ──────
+      // A single charge from an UNKNOWN brand is accepted as a *suggested*
+      // subscription when it shows at least one explicit recurring signal —
+      // regardless of whether the amount is a "pretty" tier. This is what makes
+      // detection work for the long tail of services (gyms, insurance, niche SaaS,
+      // taxed/localized amounts like $13.47) that aren't in KNOWN_BRANDS.
+      // Results stay isSuggested:true so the user confirms them in onboarding —
+      // recall over precision is the right tradeoff for a review-and-confirm flow.
+      if (!(amount >= 0.99 && amount <= 2000)) continue;   // sanity band
+      const hasInterval   = !!single.billingInterval;                  // "monthly", "/year", …
+      const hasRenewal    = !!single.renewalDate;                      // explicit next-billing date
+      const nearPriceTier = scorePriceTier(amount) > 0;                // complete tier list
+      const strongSubject = subjectIntent.score >= 0.9;                // "your receipt"/"invoice"/…
+      const roundAmount   = amount === Math.round(amount);
+      const recurringSignal =
+        hasInterval || hasRenewal || nearPriceTier || strongSubject || roundAmount;
+      if (!recurringSignal) continue;
 
       let confidence = Math.round(0.7 * calcRecencyDecay(daysSince) * 1000) / 1000;
       confidence = applyFeedback(confidence, merchant, feedbackMap);
@@ -338,7 +350,25 @@ export function detectRecurringSubscriptions(charges, { feedbackMap = {} } = {})
       knownPriceTierScore: priceTierScore,           // TASK 7
     });
 
-    if (confidence < CONFIDENCE_THRESHOLD) continue;
+    // ── Multi-charge recurring-signal override ───────────────────────────────
+    // Two or more charges at a *detected* cadence with consistent amounts is the
+    // strongest recurring signal there is — stronger than any single-charge case
+    // that already passes. The model under-scores these for unknown brands, so we
+    // floor the confidence when the cadence and amounts are tight. Guardrails keep
+    // precision: a real interval band must be detected (not "unknown"), the gap
+    // spread must be tight, amounts must be consistent, and the amount must sit in
+    // the sanity band. Result stays isSuggested for the user to confirm.
+    const consistentCadence = detectedInterval !== "unknown" &&
+      intervalVariance <= MULTI_CHARGE_OVERRIDE.MAX_INTERVAL_VARIANCE_DAYS;
+    const consistentAmount  = amountCV <= MULTI_CHARGE_OVERRIDE.MAX_AMOUNT_CV;
+    const withinSanityBand  = last.amount >= 0.99 && last.amount <= 2000;
+    const recurringOverride =
+      consistentCadence && consistentAmount && withinSanityBand;
+
+    if (confidence < CONFIDENCE_THRESHOLD) {
+      if (!recurringOverride) continue;
+      confidence = Math.max(confidence, MULTI_CHARGE_OVERRIDE.CONFIDENCE_FLOOR);
+    }
 
     confidence = applyFeedback(confidence, merchant, feedbackMap);
     if (confidence <= 0) continue;

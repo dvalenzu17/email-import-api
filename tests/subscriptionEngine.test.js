@@ -211,3 +211,112 @@ describe("CANCELLATION_SIGNALS", () => {
     expect(CANCELLATION_SIGNALS).toContain("subscription canceled");
   });
 });
+
+// ── Generalization: unknown brands (the long tail beyond KNOWN_BRANDS) ────────
+// These lock in the recurring-signal gate so detection keeps working for
+// services NOT in the hardcoded brand list (gyms, insurance, niche SaaS) and
+// for taxed/localized amounts. Regressions here = "works for me, not for mom".
+
+describe("unknown-brand generalization (single charge)", () => {
+  const neutralSubject = "Account statement"; // no high/medium intent keywords
+
+  it("detects a taxed odd-amount sub when a renewal date is present", () => {
+    const charges = [makeCharge({
+      merchant: "linear", amount: 13.47, daysAgo: 20, subject: neutralSubject,
+      renewalDate: new Date(Date.now() + 11 * 86400000),
+    })];
+    const results = detectRecurringSubscriptions(charges);
+    expect(results.find((r) => r.merchant.toLowerCase().includes("linear"))).toBeTruthy();
+  });
+
+  it("detects an odd-amount sub when an explicit billing interval is present", () => {
+    const charges = [{
+      ...makeCharge({ merchant: "lemonade", amount: 34.20, daysAgo: 18, subject: neutralSubject }),
+      billingInterval: "monthly",
+    }];
+    const results = detectRecurringSubscriptions(charges);
+    expect(results.find((r) => r.merchant.toLowerCase().includes("lemonade"))).toBeTruthy();
+  });
+
+  it("detects a standard-tier price (e.g. $11.99) even with a neutral subject", () => {
+    const charges = [makeCharge({
+      merchant: "theathletic", amount: 11.99, daysAgo: 12, subject: neutralSubject,
+    })];
+    const results = detectRecurringSubscriptions(charges);
+    expect(results.find((r) => r.merchant.toLowerCase().includes("theathletic"))).toBeTruthy();
+  });
+
+  it("does NOT detect a charge with no recurring signal at all", () => {
+    // Odd amount far from any tier, neutral subject, no interval, no renewal date.
+    const charges = [makeCharge({
+      merchant: "randomvendor", amount: 47.30, daysAgo: 10, subject: neutralSubject,
+    })];
+    const results = detectRecurringSubscriptions(charges);
+    expect(results.find((r) => r.merchant.toLowerCase().includes("randomvendor"))).toBeFalsy();
+  });
+
+  it("does NOT detect when subscription intent is absent", () => {
+    const charges = [makeCharge({
+      merchant: "randomvendor", amount: 12.99, daysAgo: 10, subject: neutralSubject,
+      subscriptionIntent: false,
+    })];
+    const results = detectRecurringSubscriptions(charges);
+    expect(results.find((r) => r.merchant.toLowerCase().includes("randomvendor"))).toBeFalsy();
+  });
+
+  it("flags unknown-brand single-charge detections as suggested (user confirms)", () => {
+    const charges = [makeCharge({
+      merchant: "linear", amount: 13.47, daysAgo: 20, subject: neutralSubject,
+      renewalDate: new Date(Date.now() + 11 * 86400000),
+    })];
+    const r = detectRecurringSubscriptions(charges).find((x) => x.merchant.toLowerCase().includes("linear"));
+    expect(r.isSuggested).toBe(true);
+  });
+});
+
+describe("unknown-brand generalization (multi-charge recurring override)", () => {
+  const neutralSubject = "Account statement"; // no high/medium intent keywords
+
+  // These cases use an OLD last charge (~2 months) on purpose: recency decay pulls
+  // the model score below CONFIDENCE_THRESHOLD, so the model alone will not detect
+  // them. That isolates the override — a detection here can ONLY come from the
+  // recurring-signal override, and its confidence is the fixed 0.65 floor.
+  const OVERRIDE_FLOOR = 0.65;
+
+  it("rescues an unknown brand with a consistent monthly cadence via the override", () => {
+    // Crunch gym: odd amount ($43.50, not a known tier), unknown brand, 2 charges
+    // one month apart, last charge ~2 months old. conf === floor proves it was the
+    // override (not the model) that surfaced it.
+    const charges = [
+      makeCharge({ merchant: "crunch", amount: 43.50, daysAgo: 92, subject: neutralSubject }),
+      makeCharge({ merchant: "crunch", amount: 43.50, daysAgo: 61, subject: neutralSubject }),
+    ];
+    const r = detectRecurringSubscriptions(charges).find((x) => x.merchant.toLowerCase().includes("crunch"));
+    expect(r).toBeTruthy();
+    expect(r.billingInterval).toBe("monthly");
+    expect(r.confidence).toBe(OVERRIDE_FLOOR); // floored by the override, not the model
+    expect(r.isSuggested).toBe(true);          // stays suggested for user confirmation
+  });
+
+  it("does NOT let the override rescue wildly inconsistent amounts", () => {
+    // Same merchant a month apart but amounts vary far beyond the CV guardrail —
+    // looks like variable spend (a marketplace), not a fixed subscription.
+    const charges = [
+      makeCharge({ merchant: "variablevendor", amount: 20.00, daysAgo: 92, subject: neutralSubject }),
+      makeCharge({ merchant: "variablevendor", amount: 90.00, daysAgo: 61, subject: neutralSubject }),
+    ];
+    const r = detectRecurringSubscriptions(charges).find((x) => x.merchant.toLowerCase().includes("variablevendor"));
+    expect(r).toBeFalsy();
+  });
+
+  it("does NOT let the override rescue two charges with no detectable cadence", () => {
+    // Two old charges only 3 days apart — no monthly/weekly/etc. band, so the
+    // cadence guardrail blocks the override and the model is below threshold.
+    const charges = [
+      makeCharge({ merchant: "randomvendor", amount: 43.50, daysAgo: 64, subject: neutralSubject }),
+      makeCharge({ merchant: "randomvendor", amount: 43.50, daysAgo: 61, subject: neutralSubject }),
+    ];
+    const r = detectRecurringSubscriptions(charges).find((x) => x.merchant.toLowerCase().includes("randomvendor"));
+    expect(r).toBeFalsy();
+  });
+});

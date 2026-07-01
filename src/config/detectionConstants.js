@@ -19,6 +19,17 @@
 export const DETECTION = {
   CONFIDENCE_THRESHOLD: 0.60,
   CONFIDENCE_BOOST_KNOWN_BRAND: 0.2,
+  // Multi-charge recurring-signal override: two or more charges at a *detected*
+  // cadence with consistent amounts are the strongest recurring signal there is,
+  // yet the logistic model under-scores them for unknown brands (occurrence-count
+  // and known-brand features dominate). When the guardrails below are met we floor
+  // the confidence so the detection clears both CONFIDENCE_THRESHOLD here and the
+  // production re-filter in gmailScanService. Stays isSuggested for user confirm.
+  MULTI_CHARGE_OVERRIDE: {
+    CONFIDENCE_FLOOR:           0.65,  // ≥ CONFIDENCE_THRESHOLD so it survives the re-filter
+    MAX_INTERVAL_VARIANCE_DAYS: 14,    // trimmed spread of gaps must be tight
+    MAX_AMOUNT_CV:              0.15,  // amounts consistent (≤15% coefficient of variation)
+  },
   RECENCY_DECAY: {
     DAYS_45:  1.0,
     DAYS_90:  0.9,

@@ -376,7 +376,10 @@ export async function runGmailScan({ userId, daysBack = 180, afterDate, onProgre
     // Threshold lowered from 4 → 2: a single mention of "subscription" or
     // "membership" is enough intent signal when paired with a valid amount.
     const isAppleIAP = fromHeader.toLowerCase().includes("apple.com");
-    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), isAppleIAP, _msgId: full.id });
+    // `subject` + `cleanText` are passed through so the engine's subject-intent
+    // scoring (TASK 6) and cancellation early-exit (TASK 8) actually fire in
+    // production — without them those features default to inert / 0.1.
+    charges.push({ merchant, amount, currency: extractCurrencyCode(text), date, subscriptionIntent: intentScore >= 2, renewalDate, billingInterval: extractBillingInterval(text), subject, cleanText: text, isAppleIAP, _msgId: full.id });
   }
 
   logger.info({ charges: charges.length, filtered_no_payload, filtered_no_text, filtered_negative, filtered_not_transactional, filtered_no_amount, filtered_no_merchant, filtered_lifecycle, cancellations: cancellations.length }, "charges_extracted");
