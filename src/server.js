@@ -88,8 +88,10 @@ const start = async () => {
     // accounts periodically so new-subscription pushes fire even when the app
     // is closed.
     if (BACKGROUND_SCAN_ENABLED) {
-      const { startBackgroundScanner } = await import("./services/backgroundScanner.js");
+      const { startBackgroundScanner, startAlertScheduler } = await import("./services/backgroundScanner.js");
       startBackgroundScanner(server.log);
+      // Escalating renewal/trial reminders run on their own tighter cadence.
+      startAlertScheduler(server.log);
     }
 
     const port = parseInt(process.env.PORT, 10) || 8787;
