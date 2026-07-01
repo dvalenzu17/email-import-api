@@ -1,0 +1,21 @@
+name: Keep Alive
+
+# Pings the Render service on a schedule so the free-tier instance doesn't
+# spin down after ~15 min of inactivity (cold starts add ~30-60s latency).
+on:
+  schedule:
+    # Every 10 minutes. GitHub cron is best-effort and can be delayed a few
+    # minutes under load, so 10m keeps us comfortably under Render's 15m window.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+            https://email-import-api.onrender.com/)
+          echo "HTTP $code"
+          test "$code" = "200"
