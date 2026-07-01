@@ -15,7 +15,10 @@ jobs:
     steps:
       - name: Ping health endpoint
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+          # --max-time 90 gives Render's free-tier cold start (can be 40-60s)
+          # room to wake; --retry rides out a slow first response.
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            --max-time 90 --retry 3 --retry-delay 15 --retry-all-errors \
             https://email-import-api.onrender.com/)
           echo "HTTP $code"
           test "$code" = "200"
